@@ -174,6 +174,41 @@ def test_codex_chat_payload_strips_assistant_reasoning_extra():
     assert all("reasoning_content" not in item for item in payload["input"])
 
 
+def test_codex_chat_payload_maps_reasoning_effort_to_responses_reasoning():
+    request = RequestModel(
+        model="gpt-5.5",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=True,
+        reasoning_effort="high",
+    )
+    provider = {
+        "provider": "codex",
+        "base_url": "https://chatgpt.com/backend-api/codex/responses",
+        "model": ["gpt-5.5"],
+    }
+
+    _, _, payload = asyncio.run(get_codex_payload(request, "codex", provider, api_key="access-token"))
+
+    assert payload["reasoning"] == {"effort": "high", "summary": "auto"}
+
+
+def test_codex_chat_payload_defaults_to_medium_reasoning_effort():
+    request = RequestModel(
+        model="gpt-5.5",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=True,
+    )
+    provider = {
+        "provider": "codex",
+        "base_url": "https://chatgpt.com/backend-api/codex/responses",
+        "model": ["gpt-5.5"],
+    }
+
+    _, _, payload = asyncio.run(get_codex_payload(request, "codex", provider, api_key="access-token"))
+
+    assert payload["reasoning"] == {"effort": "medium", "summary": "auto"}
+
+
 def test_responses_route_overrides_stale_client_codex_version_header():
     main_source = (Path(__file__).resolve().parents[1] / "uni_api" / "runtime.py").read_text()
 

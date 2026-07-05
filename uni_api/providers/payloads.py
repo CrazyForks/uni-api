@@ -166,8 +166,14 @@ def _format_to_mime(format_value: str | None) -> str | None:
     return mapping.get(fmt, f"audio/{fmt}")
 
 def _request_reasoning_effort(request: RequestModel) -> str | None:
-    reasoning = getattr(request, "reasoning", None)
-    effort = getattr(reasoning, "effort", None) if reasoning else None
+    effort = getattr(request, "reasoning_effort", None)
+    if effort is None:
+        extra = getattr(request, "__pydantic_extra__", None)
+        if isinstance(extra, dict):
+            effort = extra.get("reasoning_effort")
+    if not effort:
+        reasoning = getattr(request, "reasoning", None)
+        effort = getattr(reasoning, "effort", None) if reasoning else None
     if not effort:
         return None
     effort = str(effort).strip().lower()
@@ -1734,13 +1740,15 @@ async def get_codex_payload(request, engine, provider, api_key=None):
 
     url = _codex_responses_url(provider.get("base_url", ""))
 
+    reasoning_effort = _request_reasoning_effort(request) or "medium"
+
     payload: dict = {
         "model": original_model,
         "instructions": _codex_system_messages_to_instructions(request),
         "input": _codex_chat_messages_to_responses_input(request, provider),
         # CLIProxyAPI defaults that Codex commonly expects.
         "parallel_tool_calls": True,
-        "reasoning": {"effort": "medium", "summary": "auto"},
+        "reasoning": {"effort": reasoning_effort, "summary": "auto"},
         "include": ["reasoning.encrypted_content"],
         "store": False,
     }

@@ -2897,15 +2897,75 @@ HOP_BY_HOP_RESPONSE_HEADERS = {
     "upgrade",
 }
 
-def _copy_upstream_response_headers(headers: Any) -> dict[str, str]:
-    copied: dict[str, str] = {}
-    if not headers:
-        return copied
+_RESPONSE_HEADER_NAME_RE = re.compile(r"[-!#$%&'*+.^_`|~0-9a-zA-Z]+\Z")
+_RESPONSE_HEADER_VALUE_RE = re.compile(r"([^\x00\s]+(?:[ \t]+[^\x00\s]+)*)?\Z")
+
+
+def _response_header_text(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("latin-1", errors="replace")
+    return str(value)
+
+
+def _iter_upstream_response_header_pairs(headers: Any):
+    raw_headers = getattr(headers, "raw", None)
+    if raw_headers:
+        for key, value in raw_headers:
+            yield _response_header_text(key), _response_header_text(value)
+        return
     for key, value in headers.items():
-        normalized_key = str(key).lower()
+        yield str(key), str(value)
+
+
+def _is_valid_downstream_response_header(name: str, value: str) -> bool:
+    if _RESPONSE_HEADER_NAME_RE.fullmatch(name) is None:
+        return False
+    if _RESPONSE_HEADER_VALUE_RE.fullmatch(value) is None:
+        return False
+    try:
+        name.encode("latin-1")
+        value.encode("latin-1")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _log_dropped_upstream_response_header(name: str, reason: str) -> None:
+    safe_name = name if _RESPONSE_HEADER_NAME_RE.fullmatch(name) else "<invalid>"
+    trace_logger.warning("dropped upstream response header name=%s reason=%s", safe_name, reason)
+
+
+def _copy_upstream_response_headers(headers: Any) -> dict[str, str]:
+    grouped: dict[str, tuple[str, list[str]]] = {}
+    if not headers:
+        return {}
+    for raw_key, raw_value in _iter_upstream_response_header_pairs(headers):
+        name = str(raw_key)
+        normalized_key = name.lower()
         if normalized_key in HOP_BY_HOP_RESPONSE_HEADERS:
             continue
-        copied[str(key)] = str(value)
+        value = str(raw_value).strip(" \t")
+        if not value:
+            _log_dropped_upstream_response_header(name, "empty_value")
+            continue
+        if value.strip(", \t") == "":
+            _log_dropped_upstream_response_header(name, "empty_comma_joined_value")
+            continue
+        if not _is_valid_downstream_response_header(name, value):
+            _log_dropped_upstream_response_header(name, "invalid_name_or_value")
+            continue
+        if normalized_key not in grouped:
+            grouped[normalized_key] = (name, [value])
+        else:
+            grouped[normalized_key][1].append(value)
+
+    copied: dict[str, str] = {}
+    for name, values in grouped.values():
+        value = ", ".join(values)
+        if not _is_valid_downstream_response_header(name, value):
+            _log_dropped_upstream_response_header(name, "invalid_joined_value")
+            continue
+        copied[name] = value
     return copied
 
 

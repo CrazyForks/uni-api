@@ -2932,6 +2932,9 @@ def _is_valid_downstream_response_header(name: str, value: str) -> bool:
 
 def _log_dropped_upstream_response_header(name: str, reason: str) -> None:
     safe_name = name if _RESPONSE_HEADER_NAME_RE.fullmatch(name) else "<invalid>"
+    if reason == "empty_value":
+        trace_logger.debug("dropped upstream response header name=%s reason=%s", safe_name, reason)
+        return
     trace_logger.warning("dropped upstream response header name=%s reason=%s", safe_name, reason)
 
 

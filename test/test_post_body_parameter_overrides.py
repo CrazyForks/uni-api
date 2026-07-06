@@ -437,3 +437,117 @@ def test_vertex_gemini_reasoning_effort_overrides_post_body_thinking_level():
     assert payload["generationConfig"]["maxOutputTokens"] == 65535
     assert payload["generationConfig"]["thinkingConfig"]["includeThoughts"] is True
     assert payload["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "minimal"
+
+
+def _gemini_provider(model):
+    return {
+        "provider": "gemini",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+        "api": "test-key",
+        "model": [model],
+    }
+
+
+def _vertex_gemini_provider(model):
+    return {
+        "provider": "vertex-gemini",
+        "base_url": "https://google-vertex-ai.example.com",
+        "api": "test-key",
+        "project_id": "test-project",
+        "model": [model],
+    }
+
+
+def test_gemini_2_5_flash_reasoning_none_disables_thinking():
+    request = RequestModel(
+        model="gemini-2.5-flash",
+        messages=[{"role": "user", "content": "hello"}],
+        reasoning={"effort": "none"},
+        stream=False,
+    )
+
+    _, _, payload = asyncio.run(get_payload(request, "gemini", _gemini_provider("gemini-2.5-flash"), api_key="test-key"))
+
+    assert payload["generationConfig"]["thinkingConfig"] == {
+        "includeThoughts": False,
+        "thinkingBudget": 0,
+    }
+    assert "reasoning" not in payload
+    assert "reasoning_effort" not in payload
+
+
+def test_gemini_2_5_pro_reasoning_none_uses_minimum_budget():
+    request = RequestModel(
+        model="gemini-2.5-pro",
+        messages=[{"role": "user", "content": "hello"}],
+        reasoning={"effort": "none"},
+        stream=False,
+    )
+
+    _, _, payload = asyncio.run(get_payload(request, "gemini", _gemini_provider("gemini-2.5-pro"), api_key="test-key"))
+
+    assert payload["generationConfig"]["thinkingConfig"] == {
+        "includeThoughts": True,
+        "thinkingBudget": 128,
+    }
+
+
+def test_gemini_2_5_flash_lite_reasoning_none_is_explicit_zero():
+    request = RequestModel(
+        model="gemini-2.5-flash-lite",
+        messages=[{"role": "user", "content": "hello"}],
+        reasoning={"effort": "none"},
+        stream=False,
+    )
+
+    _, _, payload = asyncio.run(get_payload(request, "gemini", _gemini_provider("gemini-2.5-flash-lite"), api_key="test-key"))
+
+    assert payload["generationConfig"]["thinkingConfig"] == {
+        "includeThoughts": False,
+        "thinkingBudget": 0,
+    }
+
+
+def test_gemini_2_5_reasoning_effort_maps_to_quarter_budgets():
+    cases = [
+        ("gemini-2.5-pro", "low", 8192),
+        ("gemini-2.5-pro", "medium", 16384),
+        ("gemini-2.5-pro", "high", 24576),
+        ("gemini-2.5-pro", "extra_high", 32768),
+        ("gemini-2.5-flash", "low", 6144),
+        ("gemini-2.5-flash", "medium", 12288),
+        ("gemini-2.5-flash", "high", 18432),
+        ("gemini-2.5-flash", "xhight", 24576),
+        ("gemini-2.5-flash-lite", "low", 6144),
+        ("gemini-2.5-flash-lite", "extra-high", 24576),
+    ]
+
+    for model, effort, expected_budget in cases:
+        request = RequestModel(
+            model=model,
+            messages=[{"role": "user", "content": "hello"}],
+            reasoning_effort=effort,
+            stream=False,
+        )
+
+        _, _, payload = asyncio.run(get_payload(request, "gemini", _gemini_provider(model), api_key="test-key"))
+
+        assert payload["generationConfig"]["thinkingConfig"]["includeThoughts"] is True
+        assert payload["generationConfig"]["thinkingConfig"]["thinkingBudget"] == expected_budget
+        assert "reasoning_effort" not in payload
+
+
+def test_vertex_gemini_2_5_flash_reasoning_none_disables_thinking():
+    request = RequestModel(
+        model="gemini-2.5-flash",
+        messages=[{"role": "user", "content": "hello"}],
+        reasoning={"effort": "none"},
+        stream=False,
+    )
+
+    _, _, payload = asyncio.run(get_payload(request, "vertex-gemini", _vertex_gemini_provider("gemini-2.5-flash"), api_key="test-key"))
+
+    assert payload["generationConfig"]["thinkingConfig"] == {
+        "includeThoughts": False,
+        "thinkingBudget": 0,
+    }

@@ -179,6 +179,19 @@ def _request_reasoning_effort(request: RequestModel) -> str | None:
     effort = str(effort).strip().lower()
     return effort or None
 
+def _normalize_reasoning_effort(effort: str | None) -> str | None:
+    if not effort:
+        return None
+    effort = str(effort).strip().lower().replace("-", "_")
+    aliases = {
+        "xhigh": "extra_high",
+        "x_high": "extra_high",
+        "xhight": "extra_high",
+        "x_hight": "extra_high",
+        "extra": "extra_high",
+    }
+    return aliases.get(effort, effort)
+
 def _gemini_2_5_thinking_budget_from_request_model(request_model: str, original_model: str) -> int | None:
     match = re.match(r".*-think-(-?\d+)", request_model)
     if not match:
@@ -207,6 +220,31 @@ def _gemini_2_5_thinking_budget_from_request_model(request_model: str, original_
         return 24576
     return val if val >= 0 else 0
 
+def _gemini_2_5_thinking_budget_from_request(request: RequestModel, original_model: str) -> int | None:
+    reasoning_effort = _normalize_reasoning_effort(_request_reasoning_effort(request))
+    if not reasoning_effort:
+        return _gemini_2_5_thinking_budget_from_request_model(request.model, original_model)
+
+    if "gemini-2.5-pro" in original_model:
+        if reasoning_effort == "none":
+            return 128
+        max_budget = 32768
+    elif "gemini-2.5-flash" in original_model:
+        if reasoning_effort == "none":
+            return 0
+        max_budget = 24576
+    else:
+        return _gemini_2_5_thinking_budget_from_request_model(request.model, original_model)
+
+    effort_budget = {
+        "minimal": max_budget // 4,
+        "low": max_budget // 4,
+        "medium": max_budget // 2,
+        "high": max_budget * 3 // 4,
+        "extra_high": max_budget,
+    }
+    return effort_budget.get(reasoning_effort)
+
 def _is_gemini_3_model_name(model_name: str | None) -> bool:
     if not model_name:
         return False
@@ -231,15 +269,17 @@ def _is_gemini_3_pro_model(request_model: str, original_model: str) -> bool:
 
 def _gemini_3_thinking_level_from_request(request: RequestModel, original_model: str) -> str | None:
     is_gemini_3_pro = _is_gemini_3_pro_model(request.model, original_model)
-    reasoning_effort = _request_reasoning_effort(request)
+    reasoning_effort = _normalize_reasoning_effort(_request_reasoning_effort(request))
     if reasoning_effort:
         if is_gemini_3_pro:
-            if reasoning_effort == "high":
+            if reasoning_effort in {"high", "extra_high"}:
                 return "high"
             if reasoning_effort in {"minimal", "low", "medium"}:
                 return "low"
         elif reasoning_effort in {"minimal", "low", "medium", "high"}:
             return reasoning_effort
+        elif reasoning_effort == "extra_high":
+            return "high"
 
     match = re.match(r".*-think-(-?\d+)", request.model)
     if match:
@@ -296,7 +336,7 @@ def _apply_explicit_gemini_request_controls(
     generation_config = payload.setdefault("generationConfig", {})
 
     if "gemini-2.5" in original_model and "-image" not in original_model and "preview-tts" not in original_model.lower():
-        budget = _gemini_2_5_thinking_budget_from_request_model(request.model, original_model)
+        budget = _gemini_2_5_thinking_budget_from_request(request, original_model)
         if budget is not None:
             thinking_config = generation_config.get("thinkingConfig")
             if not isinstance(thinking_config, dict):
@@ -547,6 +587,7 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
         'modalities',
         'audio',
         'reasoning',
+        'reasoning_effort',
     ]
     generation_config = {}
 
@@ -796,6 +837,7 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
         'modalities',
         'audio',
         'reasoning',
+        'reasoning_effort',
     ]
     generation_config = {}
 
@@ -833,7 +875,7 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
     # Gemini 2.5 系列的 thinkingConfig 处理
     # Note: preview TTS models do not support thinkingConfig.
     if "gemini-2.5" in original_model and "preview-tts" not in original_model.lower():
-        budget = _gemini_2_5_thinking_budget_from_request_model(request.model, original_model)
+        budget = _gemini_2_5_thinking_budget_from_request(request, original_model)
         if budget is not None:
             payload["generationConfig"]["thinkingConfig"] = {
                 "includeThoughts": True if budget else False,

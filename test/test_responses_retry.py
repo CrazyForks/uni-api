@@ -1122,7 +1122,7 @@ def test_responses_codex_forces_current_client_headers_after_overrides(monkeypat
 
     assert response.status_code == 200
     sent_headers = client_manager.post_calls[0]["headers"]
-    assert sent_headers["Version"] == main.CODEX_CLI_VERSION
+    assert "Version" not in sent_headers
     assert sent_headers["User-Agent"] == main.CODEX_USER_AGENT
     assert "version" not in sent_headers
 

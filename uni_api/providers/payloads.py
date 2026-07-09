@@ -42,15 +42,14 @@ from core.utils import (
 from uni_api.providers.overrides import apply_post_body_parameter_overrides
 
 gemini_max_token_65k_models = ["gemini-3-pro", "gemini-2.5-pro", "gemini-2.0-pro", "gemini-2.0-flash-thinking", "gemini-2.5-flash"]
-CODEX_CLI_VERSION = "0.125.0"
-CODEX_USER_AGENT = f"codex_cli_rs/{CODEX_CLI_VERSION}"
+CODEX_CLI_VERSION = "0.144.0"
+CODEX_USER_AGENT = f"codex_cli_rs/{CODEX_CLI_VERSION} (Debian 13.0.0; x86_64) WindowsTerminal"
 _FORCED_CODEX_CLIENT_HEADER_KEYS = {"version", "user-agent"}
 
 def force_codex_client_headers(headers: dict) -> dict:
     for key in list(headers.keys()):
         if str(key).lower() in _FORCED_CODEX_CLIENT_HEADER_KEYS:
             headers.pop(key, None)
-    headers["Version"] = CODEX_CLI_VERSION
     headers["User-Agent"] = CODEX_USER_AGENT
     return headers
 
@@ -1848,7 +1847,6 @@ async def get_codex_payload(request, engine, provider, api_key=None):
     # Required / commonly expected Codex headers.
     headers.setdefault("Openai-Beta", "responses=experimental")
     headers.setdefault("Originator", "codex_cli_rs")
-    headers.setdefault("Version", CODEX_CLI_VERSION)
     session_id = str(uuid.uuid4())
     headers.setdefault("Session_id", session_id)
     headers.setdefault("Conversation_id", session_id)

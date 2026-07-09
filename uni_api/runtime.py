@@ -33,7 +33,6 @@ from fastapi import FastAPI, HTTPException, Depends, Request, Body, BackgroundTa
 
 from core.log_config import logger, trace_logger
 from uni_api.providers.payloads import (
-    CODEX_CLI_VERSION,
     CODEX_USER_AGENT,
     apply_post_body_parameter_overrides,
     force_codex_client_headers,
@@ -3843,7 +3842,6 @@ class ResponsesRequestExecution:
         if engine == "codex":
             headers.setdefault("Openai-Beta", self.http_request.headers.get("Openai-Beta") or "responses=experimental")
             headers.setdefault("Originator", self.http_request.headers.get("Originator") or "codex_cli_rs")
-            headers.setdefault("Version", CODEX_CLI_VERSION)
             headers.setdefault("Session_id", self.http_request.headers.get("Session_id") or str(uuid.uuid4()))
             headers.setdefault("User-Agent", CODEX_USER_AGENT)
             headers.setdefault("Accept", "text/event-stream" if self.request_data.stream else "application/json")

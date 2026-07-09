@@ -28,8 +28,8 @@ def test_codex_payload_uses_current_cli_version_headers():
     _, headers, _ = asyncio.run(get_codex_payload(request, "codex", provider, api_key="access-token"))
 
     assert headers["Authorization"] == "Bearer access-token"
-    assert headers["Version"] == "0.125.0"
-    assert headers["User-Agent"] == "codex_cli_rs/0.125.0"
+    assert "Version" not in headers
+    assert headers["User-Agent"] == "codex_cli_rs/0.144.0 (Debian 13.0.0; x86_64) WindowsTerminal"
 
 
 def test_force_codex_client_headers_removes_stale_case_variants():
@@ -43,8 +43,7 @@ def test_force_codex_client_headers_removes_stale_case_variants():
 
     assert headers == {
         "X-Test": "kept",
-        "Version": "0.125.0",
-        "User-Agent": "codex_cli_rs/0.125.0",
+        "User-Agent": "codex_cli_rs/0.144.0 (Debian 13.0.0; x86_64) WindowsTerminal",
     }
 
 
@@ -212,6 +211,6 @@ def test_codex_chat_payload_defaults_to_medium_reasoning_effort():
 def test_responses_route_overrides_stale_client_codex_version_header():
     main_source = (Path(__file__).resolve().parents[1] / "uni_api" / "runtime.py").read_text()
 
-    assert 'headers.setdefault("Version", CODEX_CLI_VERSION)' in main_source
+    assert 'headers.setdefault("Version", CODEX_CLI_VERSION)' not in main_source
     assert 'headers.setdefault("Version", http_request.headers.get("Version") or CODEX_CLI_VERSION)' not in main_source
     assert "force_codex_client_headers(headers)" in main_source

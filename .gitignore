@@ -9,6 +9,7 @@ node_modules
 *.jpg
 *.json
 !vercel.json
+!uni_api/api/codex_models_pro_0_144_0.json
 # *.png
 *.db
 .aider*

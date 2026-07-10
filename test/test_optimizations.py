@@ -66,6 +66,39 @@ def test_list_models_uses_cached_response(monkeypatch):
     assert [item["id"] for item in body["data"]] == ["gpt-5.4", "gpt-5.4-mini"]
 
 
+def test_list_models_returns_codex_catalog_for_client_version():
+    main.app.state.config = {"api_keys": [{"api": "sk-test"}]}
+    main.app.state.api_list = ["sk-test"]
+    main.app.state.api_keys_db = [{"api": "sk-test"}]
+    main.app.state.models_list = {
+        "sk-test": ["gpt-5.4-mini", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+    }
+    main.app.state.model_response_cache = {
+        "sk-test": [
+            {"id": "gpt-5.4-mini", "object": "model"},
+            {"id": "gpt-5.6-sol", "object": "model"},
+            {"id": "gpt-5.6-terra", "object": "model"},
+            {"id": "gpt-5.6-luna", "object": "model"},
+        ]
+    }
+
+    response = asyncio.run(main.list_models(client_version="0.144.0", api_index=0))
+    body = json.loads(response.body)
+
+    assert response.headers["x-uni-api-models-source"] == "codex-pro-snapshot"
+    assert response.headers["x-uni-api-models-snapshot-client-version"] == "0.144.0"
+    assert response.headers["x-uni-api-models-upstream-etag"] == (
+        'W/"eaaa93847c22739b392a6260ccd9af1c"'
+    )
+    assert "etag" not in response.headers
+    assert [model["slug"] for model in body["models"]] == [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.4-mini",
+    ]
+
+
 def test_get_right_order_providers_accepts_prebuilt_routing_index():
     config = {
         "providers": [

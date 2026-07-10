@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any, Callable
 
 from core.utils import get_model_dict
 
 
 MODEL_INFO_CREATED = 1720524448858
+CODEX_PRO_MODELS_SNAPSHOT_CLIENT_VERSION = "0.144.0"
+CODEX_PRO_MODELS_SNAPSHOT_UPSTREAM_ETAG = 'W/"eaaa93847c22739b392a6260ccd9af1c"'
+
+_CODEX_PRO_MODELS_SNAPSHOT = json.loads(
+    Path(__file__).with_name("codex_models_pro_0_144_0.json").read_text(encoding="utf-8")
+)
 
 
 def get_all_models(config: dict[str, Any]) -> list[dict[str, Any]]:
@@ -130,3 +138,34 @@ def list_models_payload(
     if models is None:
         models = build_models(api_index, config, api_list, models_list)
     return {"object": "list", "data": models}
+
+
+def codex_models_payload(
+    *,
+    api_index: int,
+    api_list: list[str],
+    model_response_cache: dict[str, list[dict]],
+    config: dict[str, Any],
+    models_list: dict[str, list[str]],
+    build_models: Callable[[int, dict, list[str], dict[str, list[str]]], list[dict]],
+) -> dict[str, Any]:
+    available = list_models_payload(
+        api_index=api_index,
+        api_list=api_list,
+        model_response_cache=model_response_cache,
+        config=config,
+        models_list=models_list,
+        build_models=build_models,
+    )
+    allowed_model_ids = {
+        str(model.get("id", "")).strip()
+        for model in available["data"]
+        if isinstance(model, dict) and str(model.get("id", "")).strip()
+    }
+    return {
+        "models": [
+            model
+            for model in _CODEX_PRO_MODELS_SNAPSHOT["models"]
+            if model.get("slug") in allowed_model_ids
+        ]
+    }

@@ -99,7 +99,12 @@ from uni_api.api.media import (
     image_generation_response,
     moderation_response,
 )
-from uni_api.api.models import list_models_payload
+from uni_api.api.models import (
+    CODEX_PRO_MODELS_SNAPSHOT_CLIENT_VERSION,
+    CODEX_PRO_MODELS_SNAPSHOT_UPSTREAM_ETAG,
+    codex_models_payload,
+    list_models_payload,
+)
 from uni_api.api.stats import (
     ApiKeysStatesResponse,
     ChannelKeyRankingsResponse,
@@ -5760,8 +5765,27 @@ async def messages_route(
 #     return JSONResponse(status_code=200, content={"detail": "OPTIONS allowed"})
 
 @app.get("/v1/models", dependencies=[Depends(rate_limit_dependency)])
-async def list_models(api_index: int = Depends(verify_api_key)):
+async def list_models(
+    client_version: Optional[str] = None,
+    api_index: int = Depends(verify_api_key),
+):
     runtime_api_list = get_runtime_api_list()
+    if str(client_version or "").strip():
+        return JSONResponse(
+            content=codex_models_payload(
+                api_index=api_index,
+                api_list=runtime_api_list,
+                model_response_cache=getattr(app.state, "model_response_cache", {}) or {},
+                config=app.state.config,
+                models_list=app.state.models_list,
+                build_models=post_all_models,
+            ),
+            headers={
+                "X-Uni-API-Models-Source": "codex-pro-snapshot",
+                "X-Uni-API-Models-Snapshot-Client-Version": CODEX_PRO_MODELS_SNAPSHOT_CLIENT_VERSION,
+                "X-Uni-API-Models-Upstream-ETag": CODEX_PRO_MODELS_SNAPSHOT_UPSTREAM_ETAG,
+            },
+        )
     return JSONResponse(
         content=list_models_payload(
             api_index=api_index,

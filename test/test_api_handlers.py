@@ -1,8 +1,10 @@
+import hashlib
+from pathlib import Path
 from types import SimpleNamespace
 
 from uni_api.api.admin import api_config_response, api_config_update_response
 from uni_api.api.health import healthz_response, observability_runtime_response
-from uni_api.api.models import list_models_payload
+from uni_api.api.models import codex_models_payload, list_models_payload
 from uni_api.api.stats import (
     add_credits_response,
     api_keys_states_response,
@@ -61,6 +63,72 @@ def test_list_models_payload_uses_cache_before_fallback():
     assert cached["data"] == [{"id": "cached"}]
     assert fallback["data"] == [{"id": "fallback"}]
     assert len(calls) == 1
+
+
+def test_codex_models_payload_uses_pro_metadata_and_filters_unroutable_models():
+    payload = codex_models_payload(
+        api_index=0,
+        api_list=["sk-test"],
+        model_response_cache={
+            "sk-test": [
+                {"id": "gpt-5.4"},
+                {"id": "gpt-5.5"},
+                {"id": "gpt-5.6-sol"},
+                {"id": "gpt-5.6-terra"},
+                {"id": "gpt-5.6-luna"},
+            ]
+        },
+        config={},
+        models_list={},
+        build_models=lambda *_: [],
+    )
+
+    models = {model["slug"]: model for model in payload["models"]}
+    assert list(models) == [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
+    ]
+    assert "gpt-5.3-codex-spark" not in models
+    assert "codex-auto-review" not in models
+
+    sol = models["gpt-5.6-sol"]
+    assert sol["default_reasoning_level"] == "low"
+    assert [level["effort"] for level in sol["supported_reasoning_levels"]] == [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra",
+    ]
+    assert sol["context_window"] == 372000
+    assert sol["max_context_window"] == 372000
+    assert sol["use_responses_lite"] is True
+    assert sol["tool_mode"] == "code_mode_only"
+    assert sol["multi_agent_version"] == "v2"
+    assert sol["base_instructions"]
+    assert sol["model_messages"]["instructions_template"]
+
+    luna = models["gpt-5.6-luna"]
+    assert [level["effort"] for level in luna["supported_reasoning_levels"]][-1] == "max"
+    assert luna["multi_agent_version"] == "v1"
+    assert models["gpt-5.4"]["max_context_window"] == 1000000
+    assert models["gpt-5.5"]["max_context_window"] == 272000
+
+
+def test_codex_pro_models_snapshot_matches_verified_official_response():
+    snapshot = (
+        Path(__file__).parents[1]
+        / "uni_api"
+        / "api"
+        / "codex_models_pro_0_144_0.json"
+    )
+    assert hashlib.sha256(snapshot.read_bytes()).hexdigest() == (
+        "c21a449d1a9785661087e9a6d2aaa217c4b77813a69f1190fa02728b5bd68345"
+    )
 
 
 async def test_admin_config_handlers_read_and_update_runtime_state():

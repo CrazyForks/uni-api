@@ -76,6 +76,8 @@ def test_codex_models_payload_uses_pro_metadata_and_filters_unroutable_models():
                 {"id": "gpt-5.6-sol"},
                 {"id": "gpt-5.6-terra"},
                 {"id": "gpt-5.6-luna"},
+                {"id": "gpt-default"},
+                {"id": "gpt-image-2"},
             ]
         },
         config={},
@@ -90,9 +92,11 @@ def test_codex_models_payload_uses_pro_metadata_and_filters_unroutable_models():
         "gpt-5.6-luna",
         "gpt-5.5",
         "gpt-5.4",
+        "gpt-default",
     ]
     assert "gpt-5.3-codex-spark" not in models
     assert "codex-auto-review" not in models
+    assert "gpt-image-2" not in models
 
     sol = models["gpt-5.6-sol"]
     assert sol["default_reasoning_level"] == "low"
@@ -117,6 +121,8 @@ def test_codex_models_payload_uses_pro_metadata_and_filters_unroutable_models():
     assert luna["multi_agent_version"] == "v1"
     assert models["gpt-5.4"]["max_context_window"] == 1000000
     assert models["gpt-5.5"]["max_context_window"] == 272000
+    assert models["gpt-default"]["description"] == "Available through uni-api."
+    assert models["gpt-default"]["priority"] >= 100
 
 
 def test_codex_pro_models_snapshot_matches_verified_official_response():

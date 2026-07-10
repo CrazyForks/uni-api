@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 from typing import Any, Callable
@@ -14,6 +15,12 @@ CODEX_PRO_MODELS_SNAPSHOT_UPSTREAM_ETAG = 'W/"eaaa93847c22739b392a6260ccd9af1c"'
 _CODEX_PRO_MODELS_SNAPSHOT = json.loads(
     Path(__file__).with_name("codex_models_pro_0_144_0.json").read_text(encoding="utf-8")
 )
+_CODEX_PRO_MODELS_BY_SLUG = {
+    str(model["slug"]).strip(): model
+    for model in _CODEX_PRO_MODELS_SNAPSHOT["models"]
+    if isinstance(model, dict) and str(model.get("slug", "")).strip()
+}
+_CODEX_PRO_MODEL_FAMILIES = sorted(_CODEX_PRO_MODELS_BY_SLUG, key=len, reverse=True)
 _CODEX_FALLBACK_BASE_INSTRUCTIONS = (
     "You are Codex, a coding agent. You and the user share one workspace, and your job is to collaborate "
     "with them until their goal is genuinely handled.\n\n"
@@ -211,7 +218,7 @@ def codex_models_payload(
     for model_id in available_model_ids:
         if model_id in included_model_ids or not _is_codex_catalog_model_id(model_id):
             continue
-        models.append(_codex_fallback_model(model_id, 100 + len(models)))
+        models.append(_codex_compatible_model(model_id, 100 + len(models)))
         included_model_ids.add(model_id)
     return {"models": models}
 
@@ -219,6 +226,20 @@ def codex_models_payload(
 def _is_codex_catalog_model_id(model_id: str) -> bool:
     lower = model_id.lower()
     return bool(lower) and not any(token in lower for token in _CODEX_BLOCKED_MODEL_TOKENS)
+
+
+def _codex_compatible_model(model_id: str, priority: int) -> dict[str, Any]:
+    lower = model_id.lower()
+    for family in _CODEX_PRO_MODEL_FAMILIES:
+        if lower != family.lower() and not lower.startswith(f"{family.lower()}-"):
+            continue
+        model = copy.deepcopy(_CODEX_PRO_MODELS_BY_SLUG[family])
+        model["slug"] = model_id
+        model["display_name"] = model_id
+        model["description"] = "Available through uni-api."
+        model["priority"] = priority
+        return model
+    return _codex_fallback_model(model_id, priority)
 
 
 def _codex_fallback_model(model_id: str, priority: int) -> dict[str, Any]:

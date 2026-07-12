@@ -22,11 +22,10 @@ For personal use, one/new-api is too complex with many commercial features that 
 - Simultaneously supports Anthropic, Gemini, Vertex AI, Azure, AWS, xai, Cohere, Groq, Cloudflare, [0-0.pro](https://0-0.pro/r/uniapi). Vertex simultaneously supports Claude and Gemini API.
 - Support OpenAI, Anthropic, Gemini, Vertex, Azure, AWS, xai native tool use function calls.
 - Support OpenAI, Anthropic, Gemini, Vertex, Azure, AWS, xai native image recognition API.
-- Support four types of load balancing.
+- Support three types of load balancing.
   1. Supports channel-level weighted load balancing, allowing requests to be distributed according to different channel weights. It is not enabled by default and requires configuring channel weights.
-  2. Support Vertex regional load balancing and high concurrency, which can increase Gemini and Claude concurrency by up to (number of APIs * number of regions) times. Automatically enabled without additional configuration.
-  3. Except for Vertex region-level load balancing, all APIs support channel-level sequential load balancing, enhancing the immersive translation experience. It is not enabled by default and requires configuring `SCHEDULING_ALGORITHM` as `round_robin`.
-  4. Support automatic API key-level round-robin load balancing for multiple API Keys in a single channel.
+  2. All APIs support channel-level sequential load balancing, enhancing the immersive translation experience. It is not enabled by default and requires configuring `SCHEDULING_ALGORITHM` as `round_robin`.
+  3. Support automatic API key-level round-robin load balancing for multiple API Keys in a single channel.
 - Support automatic retry, when an API channel response fails, automatically retry the next API channel.
 - Support channel cooling: When an API channel response fails, the channel will automatically be excluded and cooled for a period of time, and requests to the channel will be stopped. After the cooling period ends, the model will automatically be restored until it fails again, at which point it will be cooled again.
 - Support fine-grained model timeout settings, allowing different timeout durations for each model.

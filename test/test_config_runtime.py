@@ -52,6 +52,25 @@ def test_validate_config_data_error_message_identifies_missing_provider_field():
     assert "Field required" in message
 
 
+def test_validate_config_data_rejects_multiple_vertex_regions():
+    with pytest.raises(Exception) as exc_info:
+        validate_config_data(
+            {
+                "providers": [
+                    {
+                        "provider": "vertex",
+                        "project_id": "test-project",
+                        "region": ["global", "us-west1"],
+                        "model": ["gemini-3.1-flash-lite"],
+                    }
+                ],
+                "api_keys": [],
+            }
+        )
+
+    assert "providers.0.region" in str(exc_info.value)
+
+
 def test_compile_runtime_config_accepts_empty_config():
     config = validate_config_data({})
     runtime = compile_runtime_config(config, [], models_list={})

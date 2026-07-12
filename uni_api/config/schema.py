@@ -12,6 +12,7 @@ class ProviderConfig(BaseModel):
     base_url: str = ""
     api: Any = None
     model: Any = None
+    region: str = "global"
     preferences: dict[str, Any] = Field(default_factory=dict)
     exclude_endpoints: Any = None
 

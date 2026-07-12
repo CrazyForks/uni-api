@@ -2,6 +2,7 @@ import asyncio
 
 from core.models import RequestModel
 from uni_api.providers.payloads import get_vertex_claude_payload, get_vertex_gemini_payload
+from uni_api.routing.core import build_api_key_models_map, get_right_order_providers
 
 
 def _request(model):
@@ -56,3 +57,38 @@ def test_vertex_claude_uses_same_region_setting():
         "https://europe-west1-aiplatform.googleapis.com/v1/projects/test-project/locations/europe-west1/"
         "publishers/anthropic/models/claude-sonnet-4-5@20250929:streamRawPredict"
     )
+
+
+def test_vertex_region_survives_provider_routing_view():
+    config = {
+        "providers": [
+            {
+                "provider": "vertex",
+                "base_url": "https://aiplatform.googleapis.com",
+                "project_id": "test-project",
+                "region": "us-west1",
+                "model": ["gemini-3.1-flash-lite"],
+            }
+        ],
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["vertex/gemini-3.1-flash-lite"],
+            }
+        ],
+    }
+    api_list = ["sk-test"]
+    models_list = build_api_key_models_map(config, api_list)
+
+    providers = asyncio.run(
+        get_right_order_providers(
+            "gemini-3.1-flash-lite",
+            config,
+            0,
+            "fixed_priority",
+            api_list,
+            models_list,
+        )
+    )
+
+    assert providers[0]["region"] == "us-west1"

@@ -105,6 +105,7 @@ def _provider_view(provider: dict, model_dict: dict, model_name: str, request_mo
         "project_id": provider.get("project_id", None),
         "private_key": provider.get("private_key", None),
         "client_email": provider.get("client_email", None),
+        "region": provider.get("region", "global"),
         "cf_account_id": provider.get("cf_account_id", None),
         "aws_access_key": provider.get("aws_access_key", None),
         "aws_secret_key": provider.get("aws_secret_key", None),

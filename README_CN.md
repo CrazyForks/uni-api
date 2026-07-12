@@ -22,11 +22,10 @@
 - 同时支持 Anthropic、Gemini、Vertex AI、Azure、AWS、xai、Cohere、Groq、Cloudflare、[0-0.pro](https://0-0.pro/r/uniapi)。Vertex 同时支持 Claude 和 Gemini API。
 - 支持 OpenAI、 Anthropic、Gemini、Vertex、Azure、AWS、xai 原生 tool use 函数调用。
 - 支持 OpenAI、Anthropic、Gemini、Vertex、Azure、AWS、xai 原生识图 API。
-- 支持四种负载均衡。
+- 支持三种负载均衡。
   1. 支持渠道级加权负载均衡，可以根据不同的渠道权重分配请求。默认不开启，需要配置渠道权重。
-  2. 支持 Vertex 区域级负载均衡，支持 Vertex 高并发，最高可将 Gemini，Claude 并发提高 （API数量 * 区域数量） 倍。自动开启不需要额外配置。
-  3. 除了 Vertex 区域级负载均衡，所有 API 均支持渠道级顺序负载均衡，提高沉浸式翻译体验。默认不开启，需要配置 `SCHEDULING_ALGORITHM` 为 `round_robin`。
-  4. 支持单个渠道多个 API Key 自动开启 API key 级别的轮训负载均衡。
+  2. 所有 API 均支持渠道级顺序负载均衡，提高沉浸式翻译体验。默认不开启，需要配置 `SCHEDULING_ALGORITHM` 为 `round_robin`。
+  3. 支持单个渠道多个 API Key 自动开启 API key 级别的轮询负载均衡。
 - 支持自动重试，当一个 API 渠道响应失败时，自动重试下一个 API 渠道。
 - 支持渠道冷却，当一个 API 渠道响应失败时，会自动将该渠道排除冷却一段时间，不再请求该渠道，冷却时间结束后，会自动将该模型恢复，直到再次请求失败，会重新冷却。
 - 支持细粒度的模型超时时间设置，可以为每个模型设置不同的超时时间。

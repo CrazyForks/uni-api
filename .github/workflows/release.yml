@@ -41,7 +41,7 @@ jobs:
           version: "0.8.0"
 
       - name: Generate requirements.txt
-        run: uv pip compile pyproject.toml -o requirements.txt
+        run: uv export --frozen --no-dev --no-emit-project --output-file requirements.txt
 
       - name: Install dependencies with uv
         run: uv pip install -r requirements.txt
@@ -69,7 +69,7 @@ jobs:
         run: |
           pex -D pex-src -r requirements.txt \
           -c uvicorn \
-          --inject-args 'main:app --host 0.0.0.0 --port 8000' \
+          --inject-args 'main:app --host 0.0.0.0 --port 8000 --limit-concurrency 1100 --backlog 256' \
           --interpreter-constraint '==3.11.*' \
           --no-strip-pex-env \
           -o uni-api-linux-x86_64-${VERSION}.pex
@@ -79,7 +79,7 @@ jobs:
         run: |
           pex -D pex-src -r requirements.txt \
           -c uvicorn \
-          --inject-args 'main:app --host 0.0.0.0 --port 8000' \
+          --inject-args 'main:app --host 0.0.0.0 --port 8000 --limit-concurrency 1100 --backlog 256' \
           --interpreter-constraint '==3.11.*' \
           -o uni-api-macos-arm64-${VERSION}.pex
 

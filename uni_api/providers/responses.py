@@ -784,6 +784,7 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                     cache_read_input_tokens = cache_read_input_tokens or safe_get(resp, "message", "usage", "cache_read_input_tokens", default=0) or safe_get(resp, "usage", "cache_read_input_tokens", default=0)
                     output_tokens = safe_get(resp, "usage", "output_tokens", default=0)
                     if output_tokens:
+                        thinking_tokens = safe_get(resp, "usage", "output_tokens_details", "thinking_tokens", default=0) or 0
                         total_tokens = input_tokens + output_tokens
                         sse_string = await generate_sse_response(
                             timestamp,
@@ -797,6 +798,7 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                             input_tokens,
                             output_tokens,
                             cached_tokens=cache_read_input_tokens,
+                            reasoning_tokens=thinking_tokens,
                         )
                         yield sse_string
                         break
@@ -1087,6 +1089,7 @@ async def _yield_claude_chat_completion(response, model):
     response_json = await asyncio.to_thread(json.loads, response_bytes)
     prompt_tokens = safe_get(response_json, "usage", "input_tokens", default=0)
     output_tokens = safe_get(response_json, "usage", "output_tokens", default=0)
+    thinking_tokens = safe_get(response_json, "usage", "output_tokens_details", "thinking_tokens", default=0) or 0
     yield await generate_no_stream_response(
         int(datetime.timestamp(datetime.now())),
         model,
@@ -1099,6 +1102,7 @@ async def _yield_claude_chat_completion(response, model):
         prompt_tokens=prompt_tokens,
         completion_tokens=output_tokens,
         cached_tokens=safe_get(response_json, "usage", "cache_read_input_tokens", default=0),
+        reasoning_tokens=thinking_tokens,
     )
 
 

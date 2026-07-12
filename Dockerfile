@@ -10,4 +10,4 @@ EXPOSE 8000
 WORKDIR /home
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY . .
-ENTRYPOINT ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--limit-concurrency", "1100", "--backlog", "256"]
+ENTRYPOINT ["python", "main.py"]

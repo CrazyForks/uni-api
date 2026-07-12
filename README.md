@@ -412,6 +412,40 @@ curl -X GET 'https://xxx.xxx/v1/search?q=Jina%2BAI' \
 - STDOUT_REQUEST_SUMMARY_LOG_ENABLED: Optional switch for human-readable stdout request summary logs, default is `true`.
 - STDOUT_REQUEST_SUMMARY_LOG_SAMPLE_RATE: Optional sample rate for human-readable stdout request summary logs, default is `1.0`. Use a lower value or disable the logs during high-concurrency tests.
 
+### Startup resource sizing
+
+The production launcher computes one immutable concurrency envelope whenever a
+new process starts. It reads cgroup v2/v1 CPU and memory, CPU affinity,
+`RLIMIT_NOFILE`, the ephemeral port range/TCP occupancy, and `somaxconn`.
+There is no default 100-request ceiling. The CPU candidate scales from the
+measured Fugue baseline of 64 active requests at 465m CPU (cgroup v2 weight 55)
+and is then reduced by retained-memory, file-descriptor, and upstream-port
+bounds. The default burst target is at least 1000 total admitted requests or
+twice the active limit, subject to the same resource bounds.
+
+The accepted TCP connection limit and absolute request-header timeout are
+enforced before ASGI admission. Active work, bounded waiters, request bodies,
+buffered responses, SSE parsers, and stream queues are separately accounted.
+`GET /v1/observability/runtime` exposes the detected inputs, selected bounds,
+reservations, rejections, and connection-protocol counters.
+
+Primary overrides are `REQUEST_ADMISSION_CPU_MILLICORES` (useful when a
+standalone host's default CPU weight is not meaningful),
+`REQUEST_ADMISSION_ACTIVE_LIMIT`, `REQUEST_ADMISSION_WAITER_LIMIT`,
+`REQUEST_ADMISSION_TOTAL_LIMIT`, `REQUEST_ADMISSION_MAX_ACTIVE_LIMIT`,
+`REQUEST_ADMISSION_WAIT_TIMEOUT_SECONDS`,
+`MEMORY_SOFT_LIMIT_BYTES`, `MEMORY_GUARD_BYTES`, `MEMORY_GUARD_RATIO`,
+`UPSTREAM_POOL_SIZE`, `UVICORN_CONNECTION_LIMIT`, and
+`UVICORN_HEADER_TIMEOUT_SECONDS`. Explicit limits that exceed the detected
+startup safety envelope fail startup instead of silently overcommitting. The
+formula is a resource-safety envelope, not a throughput guarantee; validate
+large CPU shapes with workload-specific load tests.
+
+Without an override, the admission wait deadline is
+`max(5 seconds, 2 seconds * ceil(total / active))`. This gives each bounded
+burst wave time to advance instead of applying the old fixed five-second
+deadline to every Pod size.
+
 When DB_TYPE is postgres, the following environment variables need to be set:
 
 - DB_USER: Database user name, default is postgres, optional
@@ -717,8 +751,7 @@ find pex-src -name '__pycache__' -type d -prune -exec rm -rf {} +
 find pex-src -name '*.pyc' -delete
 find pex-src -name '.git' -prune -exec rm -rf {} +
 pex -D pex-src -r requirements.txt \
-    -c uvicorn \
-    --inject-args 'main:app --host 0.0.0.0 --port 8000' \
+    -m main \
     --interpreter-constraint '==3.11.*' \
     --no-strip-pex-env \
     -o uni-api-linux-x86_64-${VERSION}.pex
@@ -729,8 +762,7 @@ macOS packaging:
 ```bash
 VERSION=$(cat VERSION)
 pex -D pex-src -r requirements.txt \
-    -c uvicorn \
-    --inject-args 'main:app --host 0.0.0.0 --port 8000' \
+    -m main \
     --interpreter-constraint '==3.11.*' \
     -o uni-api-macos-arm64-${VERSION}.pex
 ```

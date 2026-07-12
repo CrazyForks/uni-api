@@ -414,6 +414,34 @@ curl -X GET 'https://xxx.xxx/v1/search?q=Jina%2BAI' \
 - STDOUT_REQUEST_SUMMARY_LOG_ENABLED: 可选人类可读 stdout 请求摘要日志开关，默认 `true`。
 - STDOUT_REQUEST_SUMMARY_LOG_SAMPLE_RATE: 可选人类可读 stdout 请求摘要日志采样率，默认 `1.0`。高并发压测时可以调低或关闭。
 
+### 启动时资源定容
+
+生产入口会在每个新进程启动时计算一次不可变的并发包络。计算会读取 cgroup
+v2/v1 CPU 与内存、CPU affinity、`RLIMIT_NOFILE`、临时端口范围与当前 TCP
+占用以及 `somaxconn`。默认路径不再存在 100 请求上限。CPU 候选值从 Fugue
+实测基线（465m CPU、cgroup v2 weight 55 对应 64 active）按比例计算，再受保留
+内存、文件描述符和上游端口预算共同约束。默认突发目标为至少 1000 个已接收请求，
+或 active 的两倍，最终仍受同一资源包络限制。
+
+TCP accepted connection 硬上限与绝对请求头超时在进入 ASGI admission 前执行。
+active、有限 waiter、request body、buffered response、SSE parser 和 stream
+queue 分别记账。`GET /v1/observability/runtime` 会暴露探测输入、最终边界、
+reservation、rejection 与连接协议计数。
+
+主要覆盖项包括：`REQUEST_ADMISSION_CPU_MILLICORES`（适合 CPU weight
+没有平台含义的独立服务器）、`REQUEST_ADMISSION_ACTIVE_LIMIT`、
+`REQUEST_ADMISSION_WAITER_LIMIT`、`REQUEST_ADMISSION_TOTAL_LIMIT`、
+`REQUEST_ADMISSION_MAX_ACTIVE_LIMIT`、`MEMORY_SOFT_LIMIT_BYTES`、
+`REQUEST_ADMISSION_WAIT_TIMEOUT_SECONDS`、
+`MEMORY_GUARD_BYTES`、`MEMORY_GUARD_RATIO`、`UPSTREAM_POOL_SIZE`、
+`UVICORN_CONNECTION_LIMIT` 和 `UVICORN_HEADER_TIMEOUT_SECONDS`。显式配置若超过
+启动时安全包络会直接阻止启动，不会静默超配。该公式是资源安全上界，不是吞吐量承诺；
+大 CPU 规格仍必须使用真实业务负载压测。
+
+未显式覆盖时，admission waiter deadline 为
+`max(5 秒, 2 秒 * ceil(total / active))`。它会给有限突发队列中的每个处理波次
+留出推进时间，不再对所有 Pod 规格一律使用原来的 5 秒。
+
 当 DB_TYPE 为 postgres 时，需要设置以下环境变量：
 
 - DB_USER: 数据库用户名，默认为 postgres，选填。
@@ -719,8 +747,7 @@ find pex-src -name '__pycache__' -type d -prune -exec rm -rf {} +
 find pex-src -name '*.pyc' -delete
 find pex-src -name '.git' -prune -exec rm -rf {} +
 pex -D pex-src -r requirements.txt \
-    -c uvicorn \
-    --inject-args 'main:app --host 0.0.0.0 --port 8000' \
+    -m main \
     --interpreter-constraint '==3.11.*' \
     --no-strip-pex-env \
     -o uni-api-linux-x86_64-${VERSION}.pex
@@ -731,8 +758,7 @@ macos 打包：
 ```bash
 VERSION=$(cat VERSION)
 pex -D pex-src -r requirements.txt \
-    -c uvicorn \
-    --inject-args 'main:app --host 0.0.0.0 --port 8000' \
+    -m main \
     --interpreter-constraint '==3.11.*' \
     -o uni-api-macos-arm64-${VERSION}.pex
 ```

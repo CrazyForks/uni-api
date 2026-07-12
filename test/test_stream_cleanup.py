@@ -11,9 +11,11 @@ from core.utils import collect_openai_chat_completion_from_streaming_sse
 from uni_api.streaming.cleanup import (
     await_stream_cleanup_safely,
     background_stream_cleanup_snapshot,
+    force_close_response_httpcore_stream_chain_safely,
     track_background_stream_cleanup_task,
     wait_background_stream_cleanup_tasks,
 )
+import uni_api.streaming.cleanup as stream_cleanup
 
 
 async def _mark_first_byte_wrapper_closes_inner_generator():
@@ -209,6 +211,39 @@ def test_logging_response_records_stats_from_nested_input_output_usage_without_n
     asyncio.run(_logging_response_records_stats_from_nested_input_output_usage_without_newline())
 
 
+def test_logging_response_bounds_detachable_stats_snapshot():
+    async def scenario():
+        recorded = []
+
+        async def body():
+            yield b"ok"
+
+        async def update_stats(info):
+            recorded.append(info)
+            return True
+
+        async def send(_message):
+            return None
+
+        response = main.LoggingStreamingResponse(
+            body(),
+            media_type="application/octet-stream",
+            current_info={
+                "start_time": 0,
+                "text": "测" * (1024 * 1024),
+                "request_owned_graph": {"payload": "x" * (1024 * 1024)},
+            },
+            update_stats=update_stats,
+        )
+        await response({}, None, send)
+
+        assert len(recorded) == 1
+        assert len(recorded[0]["text"].encode("utf-8")) <= 64 * 1024
+        assert "request_owned_graph" not in recorded[0]
+
+    asyncio.run(scenario())
+
+
 async def _fetch_response_stream_closes_selected_provider_stream(monkeypatch):
     closed = False
 
@@ -265,7 +300,7 @@ async def _await_stream_cleanup_logs_cancel_without_traceback(caplog):
     cancellation_records = [
         record
         for record in caplog.records
-        if "test cleanup cleanup was cancelled" in record.message
+        if "test cleanup cleanup owner was cancelled" in record.message
     ]
     assert cancellation_records
     assert all(record.exc_info is None for record in cancellation_records)
@@ -358,6 +393,70 @@ def test_core_force_release_closes_assigned_connection():
         )
 
     asyncio.run(_force_release_closes_assigned_connection(force_release))
+
+
+def test_force_close_evicts_transport_before_waiting_on_stuck_response(
+    monkeypatch,
+):
+    async def scenario():
+        monkeypatch.setattr(
+            stream_cleanup,
+            "STREAM_CLEANUP_TIMEOUT_SECONDS",
+            0.01,
+        )
+        transport_released = asyncio.Event()
+
+        class Connection(_FakeConnection):
+            async def aclose(self):
+                self.closed = True
+                transport_released.set()
+
+        connection = Connection()
+        request = _FakePoolRequest(connection)
+        pool = _FakePool(request, connection)
+        pool_stream = _FakePoolStream(pool, request)
+        pool_stream._closed = False
+
+        class BoundClose:
+            def __init__(self):
+                self.aborted = False
+                self.close_finished = False
+
+            async def aclose(self):
+                try:
+                    await transport_released.wait()
+                except asyncio.CancelledError:
+                    await transport_released.wait()
+                self.close_finished = True
+
+            async def abort_transport(self):
+                assert request not in pool._requests
+                assert connection not in pool._connections
+                self.aborted = True
+
+        bound = BoundClose()
+        response = type(
+            "Response",
+            (),
+            {"stream": pool_stream, "aclose": bound.aclose},
+        )()
+
+        result = await asyncio.wait_for(
+            force_close_response_httpcore_stream_chain_safely(
+                response,
+                label="stuck response",
+            ),
+            timeout=1,
+        )
+
+        assert result is True
+        assert bound.aborted is True
+        assert bound.close_finished is True
+        assert connection.closed is True
+        assert request not in pool._requests
+        assert connection not in pool._connections
+
+    asyncio.run(scenario())
 
 
 class _FakeSweepSocket:

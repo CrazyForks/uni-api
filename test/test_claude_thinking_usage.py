@@ -24,6 +24,10 @@ class _StreamingResponse:
             '"output_tokens_details":{"thinking_tokens":312}}}\n\n'
         )
 
+    async def aiter_bytes(self):
+        async for chunk in self.aiter_text():
+            yield chunk.encode("utf-8")
+
 
 class _StreamContext:
     async def __aenter__(self):

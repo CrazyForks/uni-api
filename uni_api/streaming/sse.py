@@ -1,38 +1,1064 @@
 from __future__ import annotations
 
+import asyncio
+import codecs
+import os
+import threading
+from collections.abc import AsyncIterable, AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
+from uni_api.admission import AdmissionRejected, get_request_admission_lease
+from uni_api.admission.json_memory import JSONMemoryComplexityError
+from uni_api.admission.json_parsing import (
+    OwnedJSONValue,
+    parse_owned_json_value,
+)
 from uni_api.serialization import json
 
 
-class IncrementalSSEParser:
-    """Incrementally split SSE text into complete raw event frames."""
+# Image-generation Responses events can legitimately carry multi-megabyte
+# base64 payloads.  Eight MiB preserves that documented path while remaining
+# finite under the 64-request admission envelope.
+DEFAULT_MAX_PENDING_BYTES = 8 * 1024 * 1024
+DEFAULT_MAX_EVENT_BYTES = 8 * 1024 * 1024
+DEFAULT_MAX_EVENTS_PER_FEED = 4096
+DEFAULT_MAX_LINES_PER_FEED = 4096
+DEFAULT_MAX_FIELDS_PER_EVENT = 4096
+DEFAULT_MAX_FEED_BYTES = DEFAULT_MAX_EVENT_BYTES + 64 * 1024
+_INTERNAL_FEED_CHUNK_UNITS = 256 * 1024
+_JSON_PARSE_OFFLOAD_THRESHOLD_BYTES = 64 * 1024
+_SSE_JSON_MAX_ESTIMATED_BYTES = 64 * 1024 * 1024
+try:
+    _STREAM_PARSER_RETAINED_BUDGET_BYTES = max(
+        1,
+        int(os.getenv("STREAM_PARSER_RETAINED_BUDGET_BYTES", str(64 * 1024 * 1024))),
+    )
+except (TypeError, ValueError):
+    _STREAM_PARSER_RETAINED_BUDGET_BYTES = 64 * 1024 * 1024
 
-    def __init__(self):
-        self._buffer = ""
+
+class StreamParserBufferBudgetExhausted(AdmissionRejected):
+    local_admission_rejection = True
+
+    def __init__(self) -> None:
+        super().__init__("stream_parser_buffer_budget_exhausted", status_code=503)
+
+
+class _StreamParserRetainedBudget:
+    def __init__(self, capacity_bytes: int) -> None:
+        self.capacity_bytes = int(capacity_bytes)
+        self.used_bytes = 0
+        self.peak_bytes = 0
+        self.rejected = 0
+        self._lock = threading.Lock()
+
+    def reserve(self, size: int) -> None:
+        if size <= 0:
+            return
+        with self._lock:
+            if self.used_bytes + size > self.capacity_bytes:
+                self.rejected += 1
+                raise StreamParserBufferBudgetExhausted()
+            self.used_bytes += size
+            self.peak_bytes = max(self.peak_bytes, self.used_bytes)
+
+    def release(self, size: int) -> None:
+        if size <= 0:
+            return
+        with self._lock:
+            if size > self.used_bytes:
+                raise RuntimeError("stream parser retained-byte budget underflow")
+            self.used_bytes -= size
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "used_bytes": self.used_bytes,
+                "peak_bytes": self.peak_bytes,
+                "capacity_bytes": self.capacity_bytes,
+                "rejected": self.rejected,
+            }
+
+
+_STREAM_PARSER_RETAINED_BUDGET = _StreamParserRetainedBudget(
+    _STREAM_PARSER_RETAINED_BUDGET_BYTES
+)
+
+
+def stream_parser_retained_budget_snapshot() -> dict[str, int]:
+    return _STREAM_PARSER_RETAINED_BUDGET.snapshot()
+
+
+class StreamParserRetainedLease:
+    """Explicit ownership for custom protocol accumulators."""
+
+    def __init__(self) -> None:
+        self.size = 0
+        self._released = False
+
+    def grow(self, additional_bytes: int) -> None:
+        additional_bytes = int(additional_bytes)
+        if additional_bytes < 0:
+            raise ValueError("parser reservation cannot grow by a negative size")
+        if self._released:
+            raise RuntimeError("parser reservation is released")
+        _STREAM_PARSER_RETAINED_BUDGET.reserve(additional_bytes)
+        self.size += additional_bytes
+
+    def shrink(self, released_bytes: int) -> None:
+        released_bytes = int(released_bytes)
+        if released_bytes < 0 or released_bytes > self.size:
+            raise ValueError("invalid parser reservation shrink")
+        if self._released:
+            raise RuntimeError("parser reservation is released")
+        self.size -= released_bytes
+        _STREAM_PARSER_RETAINED_BUDGET.release(released_bytes)
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        retained = self.size
+        self.size = 0
+        _STREAM_PARSER_RETAINED_BUDGET.release(retained)
+
+    def __del__(self) -> None:
+        try:
+            self.release()
+        except Exception:
+            pass
+
+
+async def _finish_sse_cleanup_despite_cancellation(task: asyncio.Task[Any]) -> None:
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    task.result()
+
+
+async def _release_sse_owned_resources(
+    json_owner: OwnedJSONValue | None,
+    workspace_reservation: Any | None,
+    raw_event: str | None,
+) -> None:
+    try:
+        if json_owner is not None:
+            await json_owner.aclose()
+    finally:
+        if workspace_reservation is not None:
+            await workspace_reservation.release()
+        # Raw parser ownership follows the actual str object's lifetime.  A
+        # producer generator or feed-result list may still alias the frame
+        # after this consumer closes; explicit counter release here would make
+        # the global budget under-report live memory.  Clearing this owner's
+        # reference lets _RetainedTextFrame.__del__ release exactly when the
+        # final alias disappears.
+
+
+async def _release_sse_owned_resources_safely(
+    json_owner: OwnedJSONValue | None,
+    workspace_reservation: Any | None,
+    raw_event: str | None,
+) -> None:
+    cleanup_task = asyncio.create_task(
+        _release_sse_owned_resources(
+            json_owner,
+            workspace_reservation,
+            raw_event,
+        )
+    )
+    try:
+        await asyncio.shield(cleanup_task)
+    except asyncio.CancelledError:
+        await _finish_sse_cleanup_despite_cancellation(cleanup_task)
+        raise
+
+
+class _RetainedTextFrame(str):
+    """A parsed frame keeps its process-wide raw-byte ownership until GC."""
+
+    def __new__(cls, value: str, retained_bytes: int):
+        instance = str.__new__(cls, value)
+        instance._retained_bytes = int(retained_bytes)
+        instance._released = False
+        return instance
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        _STREAM_PARSER_RETAINED_BUDGET.release(self._retained_bytes)
+        self._retained_bytes = 0
+
+    def __del__(self) -> None:
+        try:
+            self.release()
+        except Exception:
+            pass
+
+
+def retain_joined_parser_text(
+    parts: list[str],
+    *,
+    retained_bytes: int,
+) -> str:
+    """Reserve the joined copy before materializing it."""
+
+    retained_bytes = int(retained_bytes)
+    _STREAM_PARSER_RETAINED_BUDGET.reserve(retained_bytes)
+    try:
+        return _RetainedTextFrame("".join(parts), retained_bytes)
+    except BaseException:
+        _STREAM_PARSER_RETAINED_BUDGET.release(retained_bytes)
+        raise
+
+
+class OwnedSSEEvent:
+    """One SSE frame whose raw and materialized bytes have explicit owners."""
+
+    def __init__(
+        self,
+        *,
+        raw_event: str,
+        event_name: str,
+        payload: Any,
+        json_owner: OwnedJSONValue | None,
+        workspace_reservation: Any | None,
+        is_comment: bool,
+    ) -> None:
+        self._raw_event: str | None = raw_event
+        self._event_name: str | None = event_name
+        self._payload = payload
+        self._json_owner = json_owner
+        self._workspace_reservation = workspace_reservation
+        self._is_comment = bool(is_comment)
+        self._payload_reservation_transferred = False
+        self._closed = False
+        self._closing = False
+        self._lock = asyncio.Lock()
+        self._close_task: asyncio.Task[None] | None = None
+
+    @property
+    def raw_event(self) -> str:
+        if self._closed or self._closing or self._raw_event is None:
+            raise RuntimeError("owned SSE event is closed")
+        return self._raw_event
+
+    @property
+    def event_name(self) -> str:
+        if self._closed or self._closing or self._event_name is None:
+            raise RuntimeError("owned SSE event is closed")
+        return self._event_name
+
+    @property
+    def payload(self) -> Any:
+        if self._closed or self._closing:
+            raise RuntimeError("owned SSE event is closed")
+        if self._json_owner is not None:
+            return self._json_owner.value
+        return self._payload
+
+    @property
+    def is_comment(self) -> bool:
+        return self._is_comment
+
+    def take_payload_reservation(self):
+        """Transfer parsed-graph ownership to a persistent consumer once."""
+
+        if self._closed or self._closing:
+            raise RuntimeError("owned SSE event is closed")
+        if self._payload_reservation_transferred:
+            raise RuntimeError("owned SSE payload reservation was already transferred")
+        self._payload_reservation_transferred = True
+        if self._json_owner is None:
+            return None
+        return self._json_owner.take_reservation()
+
+    async def aclose(self) -> None:
+        if self._close_task is None:
+            self._closing = True
+            self._close_task = asyncio.create_task(self._close_once())
+        close_task = self._close_task
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError:
+            await _finish_sse_cleanup_despite_cancellation(close_task)
+            raise
+
+    async def _close_once(self) -> None:
+        async with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            raw_event = self._raw_event
+            json_owner = self._json_owner
+            workspace_reservation = self._workspace_reservation
+            # Clear graph/raw aliases owned by this object before returning
+            # either budget.  Callers follow the same rule for local aliases.
+            self._payload = None
+            self._event_name = None
+            self._raw_event = None
+            self._json_owner = None
+            self._workspace_reservation = None
+        await _release_sse_owned_resources(
+            json_owner,
+            workspace_reservation,
+            raw_event,
+        )
+
+    async def __aenter__(self) -> OwnedSSEEvent:
+        if self._closed or self._closing:
+            raise RuntimeError("owned SSE event is closed")
+        return self
+
+    async def __aexit__(self, *_exc_info: object) -> None:
+        await self.aclose()
+
+
+def _bounded_utf8_size(text: str, *, limit_bytes: int) -> int:
+    """Measure only until a byte limit is known to be exceeded."""
+
+    observed = 0
+    for offset in range(0, len(text), _INTERNAL_FEED_CHUNK_UNITS):
+        observed += len(
+            text[offset : offset + _INTERNAL_FEED_CHUNK_UNITS].encode("utf-8")
+        )
+        if observed > limit_bytes:
+            break
+    return observed
+
+
+class SSEProtocolError(ValueError):
+    """The upstream byte stream cannot be parsed as a valid SSE stream."""
+
+
+class SSEBufferOverflowError(SSEProtocolError):
+    """An SSE frame exceeded one of the parser's configured byte limits."""
+
+    def __init__(
+        self,
+        *,
+        buffer_name: str,
+        limit_bytes: int,
+        observed_bytes: int,
+    ) -> None:
+        self.buffer_name = buffer_name
+        self.limit_bytes = limit_bytes
+        self.observed_bytes = observed_bytes
+        super().__init__(
+            f"SSE {buffer_name} exceeded {limit_bytes} bytes "
+            f"(observed {observed_bytes} bytes)"
+        )
+
+
+class SSEOutputLimitError(SSEProtocolError):
+    """One input chunk would produce an unbounded number of records."""
+
+    def __init__(
+        self,
+        *,
+        output_name: str,
+        limit: int,
+        observed: int,
+    ) -> None:
+        self.output_name = output_name
+        self.limit = limit
+        self.observed = observed
+        super().__init__(
+            f"SSE {output_name} per feed exceeded {limit} "
+            f"(observed at least {observed})"
+        )
+
+
+class SSEIncompleteEventError(SSEProtocolError):
+    """The SSE stream ended before its trailing event was terminated."""
+
+    def __init__(self, *, pending_bytes: int) -> None:
+        self.pending_bytes = pending_bytes
+        super().__init__(
+            f"SSE stream ended with an incomplete trailing event "
+            f"({pending_bytes} pending bytes)"
+        )
+
+
+class IncrementalSSEParser:
+    """Incrementally split a bounded UTF-8 SSE stream into raw event frames."""
+
+    def __init__(
+        self,
+        *,
+        max_pending_bytes: int = DEFAULT_MAX_PENDING_BYTES,
+        max_event_bytes: int = DEFAULT_MAX_EVENT_BYTES,
+        max_events_per_feed: int = DEFAULT_MAX_EVENTS_PER_FEED,
+        max_feed_bytes: int = DEFAULT_MAX_FEED_BYTES,
+    ) -> None:
+        if max_pending_bytes <= 0:
+            raise ValueError("max_pending_bytes must be greater than zero")
+        if max_event_bytes <= 0:
+            raise ValueError("max_event_bytes must be greater than zero")
+        if max_events_per_feed <= 0:
+            raise ValueError("max_events_per_feed must be greater than zero")
+        if max_feed_bytes <= 0:
+            raise ValueError("max_feed_bytes must be greater than zero")
+
+        self.max_pending_bytes = max_pending_bytes
+        self.max_event_bytes = max_event_bytes
+        self.max_events_per_feed = max_events_per_feed
+        self.max_feed_bytes = max_feed_bytes
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+        # Retain only the current event.  A bytearray lets feed() append each
+        # decoded fragment once instead of repeatedly copying/rescanning the
+        # entire partial event when upstream sends very small chunks.
+        self._event = bytearray()
+        self._pending_budget_bytes = 0
+        self._trailing_cr = False
+        self._finished = False
+        self._failed = False
+        self._at_stream_start = True
+
+    def __del__(self) -> None:
+        try:
+            self._release_pending_budget()
+        except Exception:
+            pass
+
+    def discard(self) -> None:
+        """Drop an abandoned partial frame and release its global budget."""
+
+        self._failed = True
+        self._finished = True
+        self._clear_pending_event()
 
     @property
     def pending_text(self) -> str:
-        return self._buffer
+        return self._event.decode("utf-8")
+
+    @property
+    def pending_bytes(self) -> int:
+        return self._pending_size_bytes()
+
+    @property
+    def pending_data(self) -> bytes:
+        """Return the normalized partial event plus undecoded UTF-8 bytes.
+
+        This is intended for transparent proxies which commit after parsing a
+        complete event but have already received the start of the next event.
+        """
+
+        undecoded_bytes, _ = self._decoder.getstate()
+        pending = bytes(self._event)
+        if self._trailing_cr and pending.endswith(b"\n"):
+            # Newline normalization records a trailing CR as LF immediately,
+            # while retaining enough state to swallow a following LF.  A
+            # proxy which hands this partial frame to a fresh parser must keep
+            # the raw CR; otherwise a split CRLF becomes two line endings and
+            # can prematurely terminate the event.
+            pending = pending[:-1] + b"\r"
+        return pending + bytes(undecoded_bytes)
 
     def feed(self, chunk: str | bytes | bytearray) -> list[str]:
-        if isinstance(chunk, (bytes, bytearray)):
-            chunk = bytes(chunk).decode("utf-8", errors="replace")
-        self._buffer += str(chunk).replace("\r\n", "\n").replace("\r", "\n")
+        if self._finished:
+            raise SSEProtocolError("cannot feed an SSE parser after finish()")
+        if self._failed:
+            raise SSEProtocolError("cannot feed an SSE parser after a parse failure")
 
-        events = []
+        try:
+            self._validate_feed_size(chunk)
+            events: list[str] = []
+            for piece in self._feed_pieces(chunk):
+                decoded_chunk = self._strip_initial_bom(self._decode_chunk(piece))
+                normalized_chunk = self._normalize_newlines(decoded_chunk, final=False)
+                extracted = self._extract_events(normalized_chunk)
+                if len(events) + len(extracted) > self.max_events_per_feed:
+                    self._failed = True
+                    raise SSEOutputLimitError(
+                        output_name="events",
+                        limit=self.max_events_per_feed,
+                        observed=len(events) + len(extracted),
+                    )
+                events.extend(extracted)
+                self._validate_pending_size()
+            return events
+        except BaseException:
+            self._failed = True
+            self._clear_pending_event()
+            raise
+
+    def _validate_feed_size(self, chunk: str | bytes | bytearray) -> None:
+        if not isinstance(chunk, (str, bytes, bytearray)):
+            raise TypeError("SSE chunks must be str, bytes, or bytearray")
+        try:
+            observed = (
+                _bounded_utf8_size(chunk, limit_bytes=self.max_feed_bytes)
+                if isinstance(chunk, str)
+                else len(chunk)
+            )
+        except UnicodeEncodeError as exc:
+            self._failed = True
+            raise SSEProtocolError(
+                "SSE text contains an invalid Unicode scalar"
+            ) from exc
+        if observed > self.max_feed_bytes:
+            self._failed = True
+            raise SSEBufferOverflowError(
+                buffer_name="input chunk",
+                limit_bytes=self.max_feed_bytes,
+                observed_bytes=observed,
+            )
+
+    @staticmethod
+    def _feed_pieces(chunk: str | bytes | bytearray):
+        for offset in range(0, len(chunk), _INTERNAL_FEED_CHUNK_UNITS):
+            yield chunk[offset : offset + _INTERNAL_FEED_CHUNK_UNITS]
+
+    def finish(self) -> list[str]:
+        """Finish the byte stream and reject any unterminated trailing event."""
+        if self._failed:
+            raise SSEProtocolError("cannot finish an SSE parser after a parse failure")
+        if self._finished:
+            return []
+
+        self._finished = True
+        try:
+            decoded_tail = self._decoder.decode(b"", final=True)
+            normalized_tail = self._normalize_newlines(
+                self._strip_initial_bom(decoded_tail, final=True),
+                final=True,
+            )
+            events = self._extract_events(normalized_tail)
+            self._validate_pending_size()
+            if self._event:
+                self._failed = True
+                raise SSEIncompleteEventError(pending_bytes=self._pending_size_bytes())
+            return events
+        except UnicodeDecodeError as exc:
+            self._failed = True
+            self._clear_pending_event()
+            raise SSEProtocolError(
+                "SSE stream ended with an incomplete UTF-8 sequence"
+            ) from exc
+        except BaseException:
+            self._failed = True
+            self._clear_pending_event()
+            raise
+
+    def _decode_chunk(self, chunk: str | bytes | bytearray) -> str:
+        if isinstance(chunk, str):
+            undecoded_bytes, _ = self._decoder.getstate()
+            if undecoded_bytes:
+                self._failed = True
+                raise SSEProtocolError(
+                    "cannot feed text while a UTF-8 byte sequence is incomplete"
+                )
+            return chunk
+        if not isinstance(chunk, (bytes, bytearray)):
+            raise TypeError("SSE chunks must be str, bytes, or bytearray")
+
+        try:
+            return self._decoder.decode(bytes(chunk), final=False)
+        except UnicodeDecodeError as exc:
+            self._failed = True
+            raise SSEProtocolError("SSE stream contains invalid UTF-8") from exc
+
+    def _normalize_newlines(self, text: str, *, final: bool) -> str:
+        # A CR is a complete SSE line ending on its own, so it is normalized
+        # immediately. If the next chunk begins with LF, swallow that LF as
+        # the second half of the already-emitted CRLF line ending.
+        if self._trailing_cr and (text or final):
+            self._trailing_cr = False
+            if text.startswith("\n"):
+                text = text[1:]
+
+        if not final and text.endswith("\r"):
+            self._trailing_cr = True
+
+        # These replacements scan only this newly decoded chunk.  They avoid
+        # a per-character temporary list while preserving CR, LF, and CRLF as
+        # the three protocol-defined SSE line endings.
+        return text.replace("\r\n", "\n").replace("\r", "\n")
+
+    def _strip_initial_bom(self, text: str, *, final: bool = False) -> str:
+        if not self._at_stream_start:
+            return text
+        if not text and not final:
+            return text
+        self._at_stream_start = False
+        return text.removeprefix("\ufeff")
+
+    def _extract_events(self, normalized_chunk: str) -> list[str]:
+        events: list[str] = []
+        cursor = 0
+
+        # Search only normalized_chunk.  The one pending newline needed to
+        # recognize a separator across chunk boundaries is already the last
+        # byte in _event, so old input is never concatenated or scanned again.
         while True:
-            separator_index = self._buffer.find("\n\n")
-            if separator_index < 0:
+            newline_index = normalized_chunk.find("\n", cursor)
+            if newline_index < 0:
+                self._append_event_text(normalized_chunk[cursor:])
                 break
-            events.append(self._buffer[:separator_index])
-            self._buffer = self._buffer[separator_index + 2 :]
+
+            self._append_event_text(normalized_chunk[cursor:newline_index])
+            cursor = newline_index + 1
+
+            if self._event.endswith(b"\n"):
+                # The previous LF and this LF are the SSE blank-line
+                # separator.  Neither belongs to the raw event frame.
+                self._event.pop()
+                self._release_pending_bytes(1)
+                self._validate_complete_event()
+                if len(events) >= self.max_events_per_feed:
+                    self._failed = True
+                    raise SSEOutputLimitError(
+                        output_name="events",
+                        limit=self.max_events_per_feed,
+                        observed=self.max_events_per_feed + 1,
+                    )
+                retained_bytes = self._pending_budget_bytes
+                try:
+                    frame = _RetainedTextFrame(
+                        self._event.decode("utf-8"),
+                        retained_bytes,
+                    )
+                except BaseException:
+                    self._clear_pending_event()
+                    raise
+                self._pending_budget_bytes = 0
+                self._event = bytearray()
+                events.append(frame)
+            else:
+                self._reserve_pending_bytes(1)
+                try:
+                    self._event.append(0x0A)
+                except BaseException:
+                    self._release_pending_bytes(1)
+                    raise
+
         return events
+
+    def _append_event_text(self, text: str) -> None:
+        if not text:
+            return
+        try:
+            encoded = text.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            self._failed = True
+            raise SSEProtocolError(
+                "SSE text contains an invalid Unicode scalar"
+            ) from exc
+        self._reserve_pending_bytes(len(encoded))
+        try:
+            self._event.extend(encoded)
+        except BaseException:
+            self._release_pending_bytes(len(encoded))
+            raise
+
+        # A delimiter cannot remove non-newline event data, so enforcing the
+        # event bound here prevents a single incomplete frame from growing
+        # past the limit even within one large feed().  max_pending_bytes is a
+        # retained-across-feeds limit and is checked once the feed completes.
+        if len(self._event) > self.max_event_bytes:
+            self._failed = True
+            raise SSEBufferOverflowError(
+                buffer_name="event",
+                limit_bytes=self.max_event_bytes,
+                observed_bytes=len(self._event),
+            )
+
+    def _validate_complete_event(self) -> None:
+        event_bytes = len(self._event)
+        if event_bytes > self.max_event_bytes:
+            self._failed = True
+            raise SSEBufferOverflowError(
+                buffer_name="event",
+                limit_bytes=self.max_event_bytes,
+                observed_bytes=event_bytes,
+            )
+
+    def _validate_pending_size(self) -> None:
+        pending_bytes = self._pending_size_bytes()
+        if pending_bytes > self.max_pending_bytes:
+            self._failed = True
+            raise SSEBufferOverflowError(
+                buffer_name="pending buffer",
+                limit_bytes=self.max_pending_bytes,
+                observed_bytes=pending_bytes,
+            )
+
+        if pending_bytes > self.max_event_bytes:
+            self._failed = True
+            raise SSEBufferOverflowError(
+                buffer_name="event",
+                limit_bytes=self.max_event_bytes,
+                observed_bytes=pending_bytes,
+            )
+
+    def _pending_size_bytes(self) -> int:
+        undecoded_bytes, _ = self._decoder.getstate()
+        return len(self._event) + len(undecoded_bytes)
+
+    def _reserve_pending_bytes(self, size: int) -> None:
+        _STREAM_PARSER_RETAINED_BUDGET.reserve(size)
+        self._pending_budget_bytes += size
+
+    def _release_pending_bytes(self, size: int) -> None:
+        if size > self._pending_budget_bytes:
+            raise RuntimeError("SSE parser pending-byte budget underflow")
+        self._pending_budget_bytes -= size
+        _STREAM_PARSER_RETAINED_BUDGET.release(size)
+
+    def _release_pending_budget(self) -> None:
+        retained = self._pending_budget_bytes
+        self._pending_budget_bytes = 0
+        if retained:
+            _STREAM_PARSER_RETAINED_BUDGET.release(retained)
+
+    def _clear_pending_event(self) -> None:
+        self._event = bytearray()
+        self._release_pending_budget()
+
+
+class IncrementalLineParser:
+    """Strict UTF-8 line framing with a hard retained-byte limit."""
+
+    def __init__(
+        self,
+        *,
+        max_line_bytes: int = DEFAULT_MAX_EVENT_BYTES,
+        max_lines_per_feed: int = DEFAULT_MAX_LINES_PER_FEED,
+        max_feed_bytes: int = DEFAULT_MAX_FEED_BYTES,
+    ) -> None:
+        if max_line_bytes <= 0:
+            raise ValueError("max_line_bytes must be greater than zero")
+        if max_lines_per_feed <= 0:
+            raise ValueError("max_lines_per_feed must be greater than zero")
+        if max_feed_bytes <= 0:
+            raise ValueError("max_feed_bytes must be greater than zero")
+        self.max_line_bytes = max_line_bytes
+        self.max_lines_per_feed = max_lines_per_feed
+        self.max_feed_bytes = max_feed_bytes
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+        self._line = bytearray()
+        self._pending_budget_bytes = 0
+        self._pending_cr = False
+        self._finished = False
+        self._failed = False
+        self._at_stream_start = True
+
+    def __del__(self) -> None:
+        try:
+            self._release_line_budget()
+        except Exception:
+            pass
+
+    def discard(self) -> None:
+        """Drop an abandoned partial line and release its global budget."""
+
+        self._failed = True
+        self._finished = True
+        self._clear_pending_line()
+
+    @property
+    def pending_bytes(self) -> int:
+        undecoded, _ = self._decoder.getstate()
+        return (
+            len(self._line)
+            + (1 if self._pending_cr else 0)
+            + len(undecoded)
+        )
+
+    def feed(self, chunk: str | bytes | bytearray) -> list[str]:
+        if self._finished:
+            raise SSEProtocolError("cannot feed a line parser after finish()")
+        if self._failed:
+            raise SSEProtocolError("cannot feed a line parser after a parse failure")
+        try:
+            if not isinstance(chunk, (str, bytes, bytearray)):
+                raise TypeError("line chunks must be str, bytes, or bytearray")
+            observed_feed_bytes = (
+                _bounded_utf8_size(chunk, limit_bytes=self.max_feed_bytes)
+                if isinstance(chunk, str)
+                else len(chunk)
+            )
+            if observed_feed_bytes > self.max_feed_bytes:
+                self._failed = True
+                raise SSEBufferOverflowError(
+                    buffer_name="line input chunk",
+                    limit_bytes=self.max_feed_bytes,
+                    observed_bytes=observed_feed_bytes,
+                )
+            lines: list[str] = []
+            for offset in range(0, len(chunk), _INTERNAL_FEED_CHUNK_UNITS):
+                piece = chunk[offset : offset + _INTERNAL_FEED_CHUNK_UNITS]
+                text = self._strip_initial_bom(self._decode(piece, final=False))
+                normalized = self._normalize_newlines(text, final=False)
+                extracted = self._extract_lines(normalized)
+                if len(lines) + len(extracted) > self.max_lines_per_feed:
+                    self._failed = True
+                    raise SSEOutputLimitError(
+                        output_name="lines",
+                        limit=self.max_lines_per_feed,
+                        observed=len(lines) + len(extracted),
+                    )
+                lines.extend(extracted)
+                self._validate_pending()
+            return lines
+        except UnicodeEncodeError as exc:
+            self._failed = True
+            self._clear_pending_line()
+            raise SSEProtocolError(
+                "line text contains an invalid Unicode scalar"
+            ) from exc
+        except BaseException:
+            self._failed = True
+            self._clear_pending_line()
+            raise
+
+    def finish(self) -> list[str]:
+        if self._failed:
+            raise SSEProtocolError("cannot finish a line parser after a parse failure")
+        if self._finished:
+            return []
+        self._finished = True
+        try:
+            text = self._strip_initial_bom(self._decode(b"", final=True), final=True)
+            normalized = self._normalize_newlines(text, final=True)
+            lines = self._extract_lines(normalized)
+            if self._line:
+                self._validate_complete_line()
+                lines.append(self._transfer_line_frame())
+            return lines
+        except BaseException:
+            self._failed = True
+            self._clear_pending_line()
+            raise
+
+    def _decode(self, chunk: str | bytes | bytearray, *, final: bool) -> str:
+        if isinstance(chunk, str):
+            undecoded, _ = self._decoder.getstate()
+            if undecoded:
+                self._failed = True
+                raise SSEProtocolError(
+                    "cannot feed text while a UTF-8 byte sequence is incomplete"
+                )
+            return chunk
+        if not isinstance(chunk, (bytes, bytearray)):
+            raise TypeError("line chunks must be str, bytes, or bytearray")
+        try:
+            return self._decoder.decode(bytes(chunk), final=final)
+        except UnicodeDecodeError as exc:
+            self._failed = True
+            raise SSEProtocolError("line stream contains invalid UTF-8") from exc
+
+    def _normalize_newlines(self, text: str, *, final: bool) -> str:
+        prefix = ""
+        if self._pending_cr and (text or final):
+            prefix = "\n"
+            self._pending_cr = False
+            if text.startswith("\n"):
+                text = text[1:]
+
+        # Unlike the SSE event parser, the generic line parser delays a final
+        # CR until the next feed so CRLF split across chunks emits one line.
+        if not final and text.endswith("\r"):
+            text = text[:-1]
+            self._pending_cr = True
+
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        return prefix + normalized
+
+    def _strip_initial_bom(self, text: str, *, final: bool = False) -> str:
+        if not self._at_stream_start:
+            return text
+        if not text and not final:
+            return text
+        self._at_stream_start = False
+        return text.removeprefix("\ufeff")
+
+    def _extract_lines(self, text: str) -> list[str]:
+        lines: list[str] = []
+        cursor = 0
+        while True:
+            newline_index = text.find("\n", cursor)
+            if newline_index < 0:
+                self._append_line_text(text[cursor:])
+                break
+
+            self._append_line_text(text[cursor:newline_index])
+            cursor = newline_index + 1
+            self._validate_complete_line()
+            if len(lines) >= self.max_lines_per_feed:
+                self._failed = True
+                raise SSEOutputLimitError(
+                    output_name="lines",
+                    limit=self.max_lines_per_feed,
+                    observed=self.max_lines_per_feed + 1,
+                )
+            lines.append(self._transfer_line_frame())
+        return lines
+
+    def _append_line_text(self, text: str) -> None:
+        if not text:
+            return
+        try:
+            encoded = text.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            self._failed = True
+            raise SSEProtocolError(
+                "line text contains an invalid Unicode scalar"
+            ) from exc
+        _STREAM_PARSER_RETAINED_BUDGET.reserve(len(encoded))
+        self._pending_budget_bytes += len(encoded)
+        try:
+            self._line.extend(encoded)
+        except BaseException:
+            self._pending_budget_bytes -= len(encoded)
+            _STREAM_PARSER_RETAINED_BUDGET.release(len(encoded))
+            raise
+        self._validate_complete_line()
+
+    def _validate_pending(self) -> None:
+        observed = self.pending_bytes
+        if observed > self.max_line_bytes:
+            self._failed = True
+            raise SSEBufferOverflowError(
+                buffer_name="line",
+                limit_bytes=self.max_line_bytes,
+                observed_bytes=observed,
+            )
+
+    def _validate_complete_line(self) -> None:
+        observed = len(self._line)
+        if observed > self.max_line_bytes:
+            self._failed = True
+            raise SSEBufferOverflowError(
+                buffer_name="line",
+                limit_bytes=self.max_line_bytes,
+                observed_bytes=observed,
+            )
+
+    def _transfer_line_frame(self) -> str:
+        retained = self._pending_budget_bytes
+        try:
+            frame = _RetainedTextFrame(self._line.decode("utf-8"), retained)
+        except BaseException:
+            self._clear_pending_line()
+            raise
+        self._pending_budget_bytes = 0
+        self._line = bytearray()
+        return frame
+
+    def _release_line_budget(self) -> None:
+        retained = self._pending_budget_bytes
+        self._pending_budget_bytes = 0
+        if retained:
+            _STREAM_PARSER_RETAINED_BUDGET.release(retained)
+
+    def _clear_pending_line(self) -> None:
+        self._line = bytearray()
+        self._release_line_budget()
+
+
+async def iter_sse_events(
+    chunks: AsyncIterable[str | bytes | bytearray],
+    *,
+    max_pending_bytes: int = DEFAULT_MAX_PENDING_BYTES,
+    max_event_bytes: int = DEFAULT_MAX_EVENT_BYTES,
+    max_events_per_feed: int = DEFAULT_MAX_EVENTS_PER_FEED,
+    max_feed_bytes: int = DEFAULT_MAX_FEED_BYTES,
+) -> AsyncIterator[str]:
+    """Yield validated SSE frames and validate the final EOF exactly once."""
+
+    parser = IncrementalSSEParser(
+        max_pending_bytes=max_pending_bytes,
+        max_event_bytes=max_event_bytes,
+        max_events_per_feed=max_events_per_feed,
+        max_feed_bytes=max_feed_bytes,
+    )
+    try:
+        async for chunk in chunks:
+            try:
+                raw_events = parser.feed(chunk)
+            finally:
+                chunk = None
+            try:
+                for index in range(len(raw_events)):
+                    raw_event = raw_events[index]
+                    try:
+                        yield raw_event
+                    finally:
+                        raw_events[index] = ""
+                        raw_event = None
+            finally:
+                raw_events.clear()
+                raw_events = None
+        raw_events = parser.finish()
+        try:
+            for index in range(len(raw_events)):
+                raw_event = raw_events[index]
+                try:
+                    yield raw_event
+                finally:
+                    raw_events[index] = ""
+                    raw_event = None
+        finally:
+            raw_events.clear()
+            raw_events = None
+    finally:
+        parser.discard()
+
+
+async def iter_lines(
+    chunks: AsyncIterable[str | bytes | bytearray],
+    *,
+    max_line_bytes: int = DEFAULT_MAX_EVENT_BYTES,
+    max_lines_per_feed: int = DEFAULT_MAX_LINES_PER_FEED,
+    max_feed_bytes: int = DEFAULT_MAX_FEED_BYTES,
+) -> AsyncIterator[str]:
+    parser = IncrementalLineParser(
+        max_line_bytes=max_line_bytes,
+        max_lines_per_feed=max_lines_per_feed,
+        max_feed_bytes=max_feed_bytes,
+    )
+    try:
+        async for chunk in chunks:
+            try:
+                lines = parser.feed(chunk)
+            finally:
+                chunk = None
+            try:
+                for index in range(len(lines)):
+                    line = lines[index]
+                    try:
+                        yield line
+                    finally:
+                        lines[index] = ""
+                        line = None
+            finally:
+                lines.clear()
+                lines = None
+        lines = parser.finish()
+        try:
+            for index in range(len(lines)):
+                line = lines[index]
+                try:
+                    yield line
+                finally:
+                    lines[index] = ""
+                    line = None
+        finally:
+            lines.clear()
+            lines = None
+    finally:
+        parser.discard()
 
 
 def is_sse_comment_frame(raw_event: str) -> bool:
     has_line = False
-    for line in raw_event.splitlines():
+    for line in _iter_bounded_event_lines(raw_event):
         if not line:
             continue
         has_line = True
@@ -42,15 +1068,29 @@ def is_sse_comment_frame(raw_event: str) -> bool:
 
 
 def parse_sse_event(raw_event: str) -> tuple[str, Any]:
+    event_name, data_str = _extract_sse_event_fields(raw_event)
+    return _parse_sse_event_data(event_name, data_str)
+
+
+def _extract_sse_event_fields(raw_event: str) -> tuple[str, str]:
     event_name = ""
     data_lines: list[str] = []
-    for line in raw_event.splitlines():
-        if line.startswith("event:"):
-            event_name = line[6:].strip()
-        elif line.startswith("data:"):
-            data_lines.append(line[5:].strip())
+    for line in _iter_bounded_event_lines(raw_event):
+        if ":" in line:
+            field, value = line.split(":", 1)
+            if value.startswith(" "):
+                value = value[1:]
+        else:
+            field, value = line, ""
+        if field == "event":
+            event_name = value
+        elif field == "data":
+            data_lines.append(value)
 
-    data_str = "\n".join(data_lines).strip()
+    return event_name, "\n".join(data_lines)
+
+
+def _parse_sse_event_data(event_name: str, data_str: str) -> tuple[str, Any]:
     if data_str == "[DONE]":
         return "[DONE]", "[DONE]"
 
@@ -65,3 +1105,139 @@ def parse_sse_event(raw_event: str) -> tuple[str, Any]:
         event_name = str(parsed_payload.get("type") or "").strip()
 
     return event_name, parsed_payload
+
+
+def _iter_bounded_event_lines(raw_event: str):
+    """Iterate SSE fields without materializing an attacker-sized split list."""
+
+    start = 0
+    observed = 0
+    while True:
+        newline = raw_event.find("\n", start)
+        if newline < 0:
+            line = raw_event[start:]
+        else:
+            line = raw_event[start:newline]
+        observed += 1
+        if observed > DEFAULT_MAX_FIELDS_PER_EVENT:
+            raise SSEOutputLimitError(
+                output_name="fields per event",
+                limit=DEFAULT_MAX_FIELDS_PER_EVENT,
+                observed=observed,
+            )
+        yield line
+        if newline < 0:
+            break
+        start = newline + 1
+
+
+async def parse_owned_sse_event(raw_event: str) -> OwnedSSEEvent:
+    """Parse one bounded event and return explicit transferable ownership."""
+
+    request_lease = get_request_admission_lease()
+    # Field splitting can temporarily retain line/value slices plus the joined
+    # data string.  Reserve a conservative copy workspace before performing
+    # those allocations.  The fixed component covers the bounded field list.
+    workspace_bytes = len(raw_event) * 8 + 64 * 1024
+    workspace_reservation = None
+    json_owner: OwnedJSONValue | None = None
+    try:
+        if len(raw_event) > DEFAULT_MAX_EVENT_BYTES:
+            raise SSEBufferOverflowError(
+                buffer_name="event",
+                limit_bytes=DEFAULT_MAX_EVENT_BYTES,
+                observed_bytes=len(raw_event),
+            )
+        if request_lease is not None:
+            workspace_reservation = (
+                await request_lease.reserve_temporary_response_bytes(
+                    workspace_bytes
+                )
+            )
+        observed_bytes = _bounded_utf8_size(
+            raw_event,
+            limit_bytes=DEFAULT_MAX_EVENT_BYTES,
+        )
+        if observed_bytes > DEFAULT_MAX_EVENT_BYTES:
+            raise SSEBufferOverflowError(
+                buffer_name="event",
+                limit_bytes=DEFAULT_MAX_EVENT_BYTES,
+                observed_bytes=observed_bytes,
+            )
+        if is_sse_comment_frame(raw_event):
+            return OwnedSSEEvent(
+                raw_event=raw_event,
+                event_name="",
+                payload=None,
+                json_owner=None,
+                workspace_reservation=workspace_reservation,
+                is_comment=True,
+            )
+
+        event_name, data_str = _extract_sse_event_fields(raw_event)
+        if data_str == "[DONE]":
+            return OwnedSSEEvent(
+                raw_event=raw_event,
+                event_name="[DONE]",
+                payload="[DONE]",
+                json_owner=None,
+                workspace_reservation=workspace_reservation,
+                is_comment=False,
+            )
+        if not data_str:
+            return OwnedSSEEvent(
+                raw_event=raw_event,
+                event_name=event_name,
+                payload=data_str,
+                json_owner=None,
+                workspace_reservation=workspace_reservation,
+                is_comment=False,
+            )
+
+        json_owner = await parse_owned_json_value(
+            data_str,
+            max_estimated_bytes=_SSE_JSON_MAX_ESTIMATED_BYTES,
+            allow_invalid=True,
+        )
+        parsed_payload = json_owner.value
+        if not event_name and isinstance(parsed_payload, dict):
+            event_name = str(parsed_payload.get("type") or "").strip()
+        return OwnedSSEEvent(
+            raw_event=raw_event,
+            event_name=event_name,
+            payload=None,
+            json_owner=json_owner,
+            workspace_reservation=workspace_reservation,
+            is_comment=False,
+        )
+    except JSONMemoryComplexityError as exc:
+        await _release_sse_owned_resources_safely(
+            json_owner,
+            workspace_reservation,
+            raw_event,
+        )
+        raise SSEProtocolError(
+            f"SSE JSON materialization exceeds local limit: {exc}"
+        ) from exc
+    except BaseException:
+        await _release_sse_owned_resources_safely(
+            json_owner,
+            workspace_reservation,
+            raw_event,
+        )
+        raise
+
+
+async def parse_sse_event_async(raw_event: str) -> OwnedSSEEvent:
+    """Return an owned event; callers must use it as an async context manager."""
+
+    return await parse_owned_sse_event(raw_event)
+
+
+@asynccontextmanager
+async def parsed_sse_event(raw_event: str):
+    """Parse one event while its materialized object remains memory-accounted."""
+
+    owner = await parse_owned_sse_event(raw_event)
+    async with owner:
+        yield owner.event_name, owner.payload

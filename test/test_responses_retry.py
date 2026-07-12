@@ -7,13 +7,27 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import httpx
+import pytest
 from fastapi import BackgroundTasks
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import main
+import uni_api.runtime as runtime
 from core.models import ResponsesRequest
 from upstream import should_retry_provider
+
+
+def test_oaix_keepalive_classifier_rejects_large_frames_before_sync_parse(monkeypatch):
+    monkeypatch.setattr(
+        runtime,
+        "_extract_responses_stream_event",
+        lambda _raw: (_ for _ in ()).throw(
+            AssertionError("large frame must not be parsed")
+        ),
+    )
+
+    assert not runtime._is_oaix_precommit_keepalive(b"x" * 1025)
 
 
 class DummyCircularList:
@@ -171,12 +185,32 @@ class BlockingStreamingUpstreamResponse(DummyStreamingUpstreamResponse):
         await asyncio.Event().wait()
 
 
+class TerminalReadTrapResponse(DummyStreamingUpstreamResponse):
+    async def aiter_raw(self):
+        for chunk in self._chunks:
+            yield chunk
+        raise AssertionError("proxy read upstream after semantic terminal")
+
+
 class YieldingStreamingUpstreamResponse(DummyStreamingUpstreamResponse):
     async def aiter_raw(self):
         for index, chunk in enumerate(self._chunks):
             yield chunk
             if index == 0:
                 await asyncio.sleep(0)
+
+
+class DisconnectingLiveStreamingUpstreamResponse(DummyStreamingUpstreamResponse):
+    def __init__(self, *, disconnect_event, disconnect_before_index, **kwargs):
+        super().__init__(**kwargs)
+        self._disconnect_event = disconnect_event
+        self._disconnect_before_index = disconnect_before_index
+
+    async def aiter_raw(self):
+        for index, chunk in enumerate(self._chunks):
+            if index == self._disconnect_before_index:
+                self._disconnect_event.set()
+            yield chunk
 
 
 class DelayedFirstChunkStreamingUpstreamResponse(DummyStreamingUpstreamResponse):
@@ -1308,6 +1342,215 @@ def test_responses_stream_parses_decoded_upstream_bytes(monkeypatch):
     assert len(main.app.state.client_manager.stream_calls) == 1
 
 
+def test_responses_stream_records_channel_success_only_after_protocol_terminal(
+    monkeypatch,
+):
+    _configure_responses_test(monkeypatch, engine="codex")
+    channel_results = []
+
+    def record(*_args, success, **_kwargs):
+        channel_results.append(success)
+
+    monkeypatch.setattr(main, "_schedule_channel_stats_bounded", record)
+    main.app.state.client_manager = DummyClientManager(
+        DummyStreamingUpstreamResponse(
+            chunks=[
+                _responses_sse("response.created", {"type": "response.created"}),
+                _responses_sse(
+                    "response.output_text.delta",
+                    {"type": "response.output_text.delta", "delta": "ok"},
+                ),
+                _responses_sse(
+                    "response.completed",
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "usage": {
+                                "input_tokens": 1,
+                                "output_tokens": 1,
+                                "total_tokens": 2,
+                            }
+                        },
+                    },
+                ),
+                _responses_sse(None, "[DONE]"),
+            ]
+        )
+    )
+    current_info = {
+        "request_id": "terminal-success",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+
+    _response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info=current_info,
+    )
+
+    assert "response.completed" in body
+    assert channel_results == [True]
+    assert current_info["success"] is True
+    assert current_info["upstream_attempts"][-1]["success"] is True
+
+
+@pytest.mark.parametrize(
+    ("terminal_type", "status"),
+    [
+        ("response.completed", "completed"),
+        ("response.incomplete", "incomplete"),
+    ],
+)
+def test_responses_semantic_terminal_closes_without_waiting_for_eof(
+    monkeypatch,
+    terminal_type,
+    status,
+):
+    _configure_responses_test(monkeypatch, engine="codex")
+    main.app.state.client_manager = DummyClientManager(
+        TerminalReadTrapResponse(
+            chunks=[
+                _responses_sse(
+                    terminal_type,
+                    {
+                        "type": terminal_type,
+                        "response": {"status": status, "output": []},
+                    },
+                )
+            ]
+        )
+    )
+
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True)
+    )
+
+    assert response.status_code == 200
+    assert terminal_type in body
+    assert "proxy read upstream after semantic terminal" not in body
+
+
+@pytest.mark.parametrize("coalesced", [False, True])
+def test_responses_failure_terminal_is_forwarded_at_event_boundaries(
+    monkeypatch,
+    coalesced,
+):
+    _configure_responses_test(monkeypatch, engine="codex")
+    delta0 = _responses_sse(
+        "response.output_text.delta",
+        {"type": "response.output_text.delta", "delta": "zero"},
+    )
+    delta1 = _responses_sse(
+        "response.output_text.delta",
+        {"type": "response.output_text.delta", "delta": "one"},
+    )
+    failed = _responses_sse(
+        "response.failed",
+        {
+            "type": "response.failed",
+            "response": {
+                "status": "failed",
+                "error": {
+                    "code": "rate_limit_exceeded",
+                    "message": "provider terminal failure",
+                },
+            },
+        },
+    )
+    tail = [delta1 + failed] if coalesced else [delta1, failed]
+    main.app.state.client_manager = DummyClientManager(
+        TerminalReadTrapResponse(chunks=[delta0, *tail])
+    )
+    current_info = {
+        "request_id": f"failed-boundary-{coalesced}",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info=current_info,
+    )
+
+    assert response.status_code == 200
+    assert '"delta": "zero"' in body or '"delta":"zero"' in body
+    assert '"delta": "one"' in body or '"delta":"one"' in body
+    assert "response.failed" in body
+    assert "provider terminal failure" in body
+    assert "event: error" not in body
+    assert current_info["success"] is False
+    assert current_info["stream_outcome"] == "upstream_failure_terminal"
+
+
+def test_responses_malformed_terminal_payload_is_protocol_failure(monkeypatch):
+    _configure_responses_test(monkeypatch, engine="codex")
+    main.app.state.client_manager = DummyClientManager(
+        DummyStreamingUpstreamResponse(
+            chunks=[
+                b"event: response.completed\ndata: not-json\n\n",
+            ]
+        )
+    )
+
+    response, _body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True)
+    )
+
+    assert response.status_code == 502
+
+
+@pytest.mark.parametrize(
+    "stream_error",
+    [
+        None,
+        httpx.ReadError(
+            "upstream aborted",
+            request=httpx.Request("POST", "https://example.com/v1/responses"),
+        ),
+    ],
+)
+def test_responses_postcommit_abort_records_only_channel_failure(
+    monkeypatch,
+    stream_error,
+):
+    _configure_responses_test(monkeypatch, engine="codex")
+    channel_results = []
+
+    def record(*_args, success, **_kwargs):
+        channel_results.append(success)
+
+    monkeypatch.setattr(main, "_schedule_channel_stats_bounded", record)
+    main.app.state.client_manager = DummyClientManager(
+        DummyStreamingUpstreamResponse(
+            chunks=[
+                _responses_sse("response.created", {"type": "response.created"}),
+                _responses_sse(
+                    "response.output_text.delta",
+                    {"type": "response.output_text.delta", "delta": "partial"},
+                ),
+            ],
+            stream_error=stream_error,
+        )
+    )
+    current_info = {
+        "request_id": "terminal-failure",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+
+    _response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info=current_info,
+    )
+
+    assert "partial" in body
+    assert "event: error" in body
+    assert channel_results == [False]
+    assert current_info["success"] is False
+    assert current_info["stream_outcome"] == "upstream_stream_abort"
+    assert current_info["upstream_attempts"][-1]["success"] is False
+
+
 def test_responses_stream_closes_entered_upstream_response_before_context(monkeypatch):
     provider_name = "provider-a"
     monkeypatch.setitem(main.provider_api_circular_list, provider_name, DummyCircularList(["key-a"]))
@@ -2230,6 +2473,57 @@ def test_responses_stream_preserves_oaix_headers_after_precommit_yield(monkeypat
     assert response.headers["x-oaix-request-id"] == "req_yield"
     assert response.headers["x-oaix-token-id"] == "8685"
     assert response.headers["x-oaix-token-owner-user-id"] == "51851"
+
+
+def test_responses_live_disconnect_does_not_rewrite_client_close_as_sse_502(
+    monkeypatch,
+):
+    _configure_responses_test(monkeypatch, engine="codex")
+    channel_results = []
+
+    def record(*_args, success, **_kwargs):
+        channel_results.append(success)
+
+    monkeypatch.setattr(main, "_schedule_channel_stats_bounded", record)
+    disconnect_event = asyncio.Event()
+    upstream_response = DisconnectingLiveStreamingUpstreamResponse(
+        disconnect_event=disconnect_event,
+        disconnect_before_index=2,
+        chunks=[
+            _responses_sse("response.created", {"type": "response.created"}),
+            _responses_sse(
+                "response.output_text.delta",
+                {"type": "response.output_text.delta", "delta": "first"},
+            ),
+            _responses_sse(
+                "response.output_text.delta",
+                {"type": "response.output_text.delta", "delta": "after-close"},
+            ),
+        ],
+    )
+    main.app.state.client_manager = DummyClientManager(upstream_response)
+    current_info = {
+        "request_id": "req-live-disconnect",
+        "api_key": "sk-test",
+        "disconnect_event": disconnect_event,
+    }
+
+    _response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info=current_info,
+    )
+
+    assert "first" in body
+    assert "after-close" not in body
+    assert "event: error" not in body
+    assert current_info.get("stream_outcome") != "upstream_stream_abort"
+    assert current_info.get("status_code") != 502
+    assert current_info["stream_outcome"] == "downstream_disconnected"
+    assert current_info["downstream_disconnected"] is True
+    assert current_info["success"] is False
+    assert channel_results == []
+    assert current_info["upstream_attempts"][-1]["status_code"] == 499
+    assert upstream_response.close_calls >= 1
 
 
 def test_responses_stream_emits_oaix_keepalive_before_real_output(monkeypatch):

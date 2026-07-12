@@ -33,4 +33,6 @@ if __name__ == "__main__":
         "uni_api.runtime:app",
         host="0.0.0.0",
         port=int(_os.getenv("PORT", "8000")),
+        limit_concurrency=1100,
+        backlog=256,
     )

@@ -2,7 +2,6 @@ import os
 import re
 import json
 import uuid
-import codecs
 import functools
 from dataclasses import dataclass, field
 import httpx
@@ -47,7 +46,6 @@ from core.utils import (
     parse_rate_limit,
     IncrementalSSEParser,
     parse_sse_event,
-    collect_openai_chat_completion_from_streaming_sse,
     ThreadSafeCircularList,
     provider_api_circular_list,
 )
@@ -127,6 +125,7 @@ from uni_api.app_state import AppRuntimeSnapshot
 import uni_api.config.legacy_loader as legacy_config_loader
 from uni_api.config.compiler import compile_runtime_config
 from uni_api.config.timeout_policy import apply_timeout_policy, init_timeout_policy
+from uni_api.http_content import is_json_media_type
 from uni_api.observability.paid_keys import compute_paid_api_key_state
 from uni_api.observability.request_context import (
     get_request_info,
@@ -138,6 +137,13 @@ from uni_api.observability.middleware import (
     StatsMiddleware,
     StatsMiddlewareDependencies,
 )
+from uni_api.admission import (
+    AdmissionRejected,
+    RequestAdmissionController,
+    get_request_admission_lease,
+)
+from uni_api.admission.json_parsing import run_json_cpu
+from uni_api.middleware.admission import RequestAdmissionMiddleware
 from uni_api.middleware.request_decompression import RequestBodyDecompressionMiddleware
 from uni_api.persistence.repositories import StatsRepository
 from uni_api.providers import ProviderRegistry
@@ -151,8 +157,36 @@ from uni_api.streaming.cleanup import (
     force_release_httpcore_pool_request_safely,
     wait_background_stream_cleanup_tasks,
 )
-from uni_api.streaming.logging_response import LoggingStreamingResponse
+from uni_api.streaming.logging_response import (
+    LoggingStreamingResponse,
+    timed_out_io_task_snapshot,
+)
+from uni_api.streaming.error_text import bounded_stream_error_text
+from uni_api.streaming.chat_completion_collector import (
+    collect_openai_chat_completion_from_streaming_sse,
+)
+from uni_api.streaming.bounded_queue import (
+    ByteBoundedQueue,
+    ReservedChunkBuffer,
+    ReservedStreamChunk,
+    RetainedByteBudget,
+    StreamBufferBudgetTimeout,
+    StreamQueueClosed,
+    StreamQueueItemLease,
+    StreamQueueItemTooLarge,
+    StreamQueuePutTimeout,
+)
+from uni_api.streaming.sse import (
+    DEFAULT_MAX_EVENT_BYTES,
+    IncrementalSSEParser,
+    SSEProtocolError,
+    is_sse_comment_frame,
+    parse_owned_sse_event,
+    parse_sse_event,
+    stream_parser_retained_budget_snapshot,
+)
 from uni_api.upstream.client_pool import ClientPool
+from uni_api.upstream.response_limits import read_limited_response_body
 from uni_api.upstream.urls import (
     lingjing_upstream_query,
     normalize_content_generation_tasks_upstream_url,
@@ -457,8 +491,57 @@ class RuntimeGauges:
         self.waiting_first_byte_untracked = 0
         self.event_loop_lag_ms = 0
         self.open_sockets: Optional[int] = None
+        self.tcp_states: dict[str, int] = {}
         self.upstream_pool_in_use = 0
         self.upstream_pool_wait_ms = 0
+        self._request_admission_snapshot: Optional[Callable[[], dict[str, Any]]] = None
+        self._upstream_client_snapshot: Optional[Callable[[], dict[str, Any]]] = None
+        self._stream_byte_budget_snapshot: Optional[Callable[[], Any]] = None
+        self._stream_parser_budget_snapshot: Optional[
+            Callable[[], dict[str, int]]
+        ] = None
+        self._stream_stats_snapshot: Optional[Callable[[], dict[str, Any]]] = None
+        self._network_sampler_task: Optional[asyncio.Task[None]] = None
+        self._stream_queues: dict[int, ByteBoundedQueue] = {}
+        self._retired_stream_queue_blocked_puts = 0
+        self._retired_stream_queue_put_wait_ms = 0.0
+        self._retired_stream_queue_put_timeouts = 0
+
+    def attach_request_admission(
+        self,
+        snapshot: Callable[[], dict[str, Any]],
+    ) -> None:
+        self._request_admission_snapshot = snapshot
+
+    def attach_upstream_client(
+        self,
+        snapshot: Callable[[], dict[str, Any]],
+    ) -> None:
+        self._upstream_client_snapshot = snapshot
+
+    def attach_stream_byte_budget(self, snapshot: Callable[[], Any]) -> None:
+        self._stream_byte_budget_snapshot = snapshot
+
+    def attach_stream_parser_budget(
+        self,
+        snapshot: Callable[[], dict[str, int]],
+    ) -> None:
+        self._stream_parser_budget_snapshot = snapshot
+
+    def attach_stream_stats(self, snapshot: Callable[[], dict[str, Any]]) -> None:
+        self._stream_stats_snapshot = snapshot
+
+    def register_stream_queue(self, queue: ByteBoundedQueue) -> None:
+        self._stream_queues[id(queue)] = queue
+
+    def unregister_stream_queue(self, queue: ByteBoundedQueue) -> None:
+        registered = self._stream_queues.pop(id(queue), None)
+        if registered is None:
+            return
+        snapshot = registered.snapshot()
+        self._retired_stream_queue_blocked_puts += snapshot.blocked_puts
+        self._retired_stream_queue_put_wait_ms += snapshot.put_wait_ms
+        self._retired_stream_queue_put_timeouts += snapshot.put_timeouts
 
     def begin_inflight(self) -> None:
         self.inflight_requests += 1
@@ -514,28 +597,238 @@ class RuntimeGauges:
     def end_upstream_pool(self) -> None:
         self.upstream_pool_in_use = max(0, self.upstream_pool_in_use - 1)
 
+    def record_upstream_pool_wait(self, wait_ms: float) -> None:
+        self.upstream_pool_wait_ms = max(0, int(round(float(wait_ms))))
+
     async def record_event_loop_lag(self) -> None:
         started_at = time()
         await asyncio.sleep(0)
         self.event_loop_lag_ms = int((time() - started_at) * 1000)
 
+    async def start_network_sampler(self, *, interval_seconds: float = 5.0) -> None:
+        if interval_seconds <= 0:
+            raise ValueError("interval_seconds must be greater than zero")
+        if self._network_sampler_task is not None:
+            return
+        await self._sample_network_state()
+        self._network_sampler_task = asyncio.create_task(
+            self._network_sampler_loop(interval_seconds),
+            name="uni-api-runtime-network-sampler",
+        )
+
+    async def stop_network_sampler(self) -> None:
+        if self._network_sampler_task is None:
+            return
+        self._network_sampler_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await self._network_sampler_task
+        self._network_sampler_task = None
+
+    async def _network_sampler_loop(self, interval_seconds: float) -> None:
+        while True:
+            await asyncio.sleep(interval_seconds)
+            await self._sample_network_state()
+
+    async def _sample_network_state(self) -> None:
+        open_sockets, tcp_states = await asyncio.to_thread(
+            lambda: (_open_socket_count(), _tcp_state_counts())
+        )
+        self.open_sockets = open_sockets
+        self.tcp_states = tcp_states
+
     def snapshot(self) -> dict[str, Any]:
-        self.open_sockets = _open_socket_count()
-        tcp_states = _tcp_state_counts()
+        admission: dict[str, Any] = {}
+        if self._request_admission_snapshot is not None:
+            admission = self._request_admission_snapshot()
+        request_active = int(admission.get("active", self.inflight_requests) or 0)
+        request_waiters = int(admission.get("waiters", 0) or 0)
+        rejected = admission.get("rejected")
+        if not isinstance(rejected, dict):
+            rejected = {}
+
+        upstream_admission: dict[str, Any] = {}
+        if self._upstream_client_snapshot is not None:
+            upstream_client = self._upstream_client_snapshot()
+            candidate = upstream_client.get("admission")
+            if isinstance(candidate, dict):
+                upstream_admission = candidate
+
+        queue_snapshots = [queue.snapshot() for queue in self._stream_queues.values()]
+        stream_budget: Any = None
+        if self._stream_byte_budget_snapshot is not None:
+            stream_budget = self._stream_byte_budget_snapshot()
+        stream_parser_budget: dict[str, int] = {}
+        if self._stream_parser_budget_snapshot is not None:
+            stream_parser_budget = self._stream_parser_budget_snapshot()
+        stream_stats: dict[str, Any] = {}
+        if self._stream_stats_snapshot is not None:
+            stream_stats = self._stream_stats_snapshot()
+        timed_out_io = timed_out_io_task_snapshot()
+        stream_queue_blocked_puts = self._retired_stream_queue_blocked_puts + sum(
+            snapshot.blocked_puts for snapshot in queue_snapshots
+        )
+        stream_queue_put_wait_ms = self._retired_stream_queue_put_wait_ms + sum(
+            snapshot.put_wait_ms for snapshot in queue_snapshots
+        )
+        stream_queue_put_timeouts = self._retired_stream_queue_put_timeouts + sum(
+            snapshot.put_timeouts for snapshot in queue_snapshots
+        )
         return {
             "service": "uni-api-ember",
-            "inflight_requests": self.inflight_requests,
+            # Keep the established name, but source it from the outer ASGI
+            # lease so streaming requests remain active until their final byte.
+            "inflight_requests": request_active,
+            "request_active": request_active,
+            "request_waiters": request_waiters,
+            "request_capacity": admission.get("capacity"),
+            "request_waiter_limit": admission.get("waiter_limit"),
+            # Admission charges conservative in-memory weights (for example
+            # JSON bytes x8), not raw wire bytes.  Keep that semantic explicit
+            # so dashboards do not mislabel the values.
+            "request_body_reserved_weighted_bytes": admission.get(
+                "reserved_body_bytes"
+            ),
+            "upstream_response_reserved_weighted_bytes": admission.get(
+                "reserved_response_bytes"
+            ),
+            "request_retained_reserved_weighted_bytes": admission.get(
+                "reserved_retained_bytes"
+            ),
+            "request_body_budget_bytes": admission.get("body_budget"),
+            "request_retained_budget_bytes": admission.get("body_budget"),
+            "request_deferred_memory_requests": admission.get(
+                "deferred_memory_requests"
+            ),
+            "request_deferred_memory_weighted_bytes": admission.get(
+                "deferred_memory_bytes"
+            ),
+            "request_admission_rejected": dict(rejected),
+            "request_admission_rejected_total": sum(
+                int(value or 0) for value in rejected.values()
+            ),
+            "middleware_inflight_requests": self.inflight_requests,
             "waiting_first_byte": len(self.waiting_first_byte_requests) + self.waiting_first_byte_untracked,
             "event_loop_lag_ms": self.event_loop_lag_ms,
             "open_sockets": self.open_sockets,
-            "tcp_states": tcp_states,
-            "tcp_close_wait": tcp_states.get("CLOSE_WAIT", 0),
-            "upstream_pool_in_use": self.upstream_pool_in_use,
+            "tcp_states": dict(self.tcp_states),
+            "tcp_close_wait": self.tcp_states.get("CLOSE_WAIT", 0),
+            "upstream_pool_in_use": int(
+                upstream_admission.get("active", self.upstream_pool_in_use) or 0
+            ),
+            "upstream_pool_waiters": int(
+                upstream_admission.get("waiters", 0) or 0
+            ),
             "upstream_pool_wait_ms": self.upstream_pool_wait_ms,
+            "upstream_pool_wait_ms_avg": upstream_admission.get("wait_ms_avg"),
+            "upstream_pool_wait_ms_max": upstream_admission.get("wait_ms_max"),
+            "upstream_pool_rejected": upstream_admission.get("rejected", {}),
+            "stream_queue_active": len(queue_snapshots),
+            "stream_queue_items": sum(snapshot.items for snapshot in queue_snapshots),
+            "stream_queue_bytes": sum(snapshot.bytes for snapshot in queue_snapshots),
+            "stream_queue_waiting_putters": sum(
+                snapshot.waiting_putters for snapshot in queue_snapshots
+            ),
+            "stream_queue_peak_items": sum(
+                snapshot.peak_items for snapshot in queue_snapshots
+            ),
+            "stream_queue_peak_bytes": sum(
+                snapshot.peak_bytes for snapshot in queue_snapshots
+            ),
+            "stream_queue_blocked_puts": stream_queue_blocked_puts,
+            "stream_queue_put_wait_ms": int(round(stream_queue_put_wait_ms)),
+            "stream_queue_put_timeouts": stream_queue_put_timeouts,
+            "stream_buffer_reserved_bytes": getattr(
+                stream_budget, "used_bytes", None
+            ),
+            "stream_buffer_budget_bytes": getattr(
+                stream_budget, "capacity_bytes", None
+            ),
+            "stream_buffer_budget_waiters": getattr(
+                stream_budget, "waiting_reservations", None
+            ),
+            "stream_buffer_budget_peak_bytes": getattr(
+                stream_budget, "peak_bytes", None
+            ),
+            "stream_buffer_budget_timeouts": getattr(
+                stream_budget, "timeouts", None
+            ),
+            "stream_parser_reserved_bytes": stream_parser_budget.get(
+                "used_bytes"
+            ),
+            "stream_parser_budget_bytes": stream_parser_budget.get(
+                "capacity_bytes"
+            ),
+            "stream_parser_peak_bytes": stream_parser_budget.get("peak_bytes"),
+            "stream_parser_rejected_total": stream_parser_budget.get("rejected"),
+            "stream_stats_queue_items": stream_stats.get("items"),
+            "stream_stats_queue_capacity": stream_stats.get("capacity"),
+            "stream_stats_workers": stream_stats.get("workers"),
+            "stream_stats_submitted": stream_stats.get("submitted"),
+            "stream_stats_completed": stream_stats.get("completed"),
+            "stream_stats_failed": stream_stats.get("failed"),
+            "stream_stats_dropped": stream_stats.get("dropped"),
+            "channel_stats_queue_items": stream_stats.get("items"),
+            "channel_stats_queue_capacity": stream_stats.get("capacity"),
+            "channel_stats_workers": stream_stats.get("workers"),
+            "channel_stats_submitted": stream_stats.get("submitted"),
+            "channel_stats_completed": stream_stats.get("completed"),
+            "channel_stats_failed": stream_stats.get("failed"),
+            "channel_stats_dropped": stream_stats.get("dropped"),
+            "timed_out_io_tasks": timed_out_io.get("pending"),
+            "timed_out_io_task_capacity": timed_out_io.get("capacity"),
         }
 
 
 runtime_gauges = RuntimeGauges()
+
+REQUEST_ADMISSION_ACTIVE_LIMIT = max(
+    1,
+    _env_int("REQUEST_ADMISSION_ACTIVE_LIMIT", 64),
+)
+REQUEST_ADMISSION_WAITER_LIMIT = max(
+    0,
+    _env_int("REQUEST_ADMISSION_WAITER_LIMIT", 936),
+)
+REQUEST_ADMISSION_WAIT_TIMEOUT_SECONDS = max(
+    0.001,
+    _env_float("REQUEST_ADMISSION_WAIT_TIMEOUT_SECONDS", 5.0),
+)
+REQUEST_BODY_RESERVATION_MAX_BYTES = max(
+    1,
+    _env_int("REQUEST_BODY_RESERVATION_MAX_BYTES", 256 * 1024 * 1024),
+)
+REQUEST_BODY_BUDGET_BYTES = max(
+    1,
+    _env_int("REQUEST_BODY_BUDGET_BYTES", 256 * 1024 * 1024),
+)
+REQUEST_RESPONSE_RESERVATION_MAX_BYTES = max(
+    1,
+    _env_int("REQUEST_RESPONSE_RESERVATION_MAX_BYTES", 256 * 1024 * 1024),
+)
+UPSTREAM_POOL_SIZE = max(1, _env_int("UPSTREAM_POOL_SIZE", 100))
+UPSTREAM_POOL_WAITER_LIMIT = max(
+    0,
+    _env_int("UPSTREAM_POOL_WAITER_LIMIT", REQUEST_ADMISSION_ACTIVE_LIMIT),
+)
+UPSTREAM_POOL_WAIT_TIMEOUT_SECONDS = max(
+    0.001,
+    _env_float("UPSTREAM_POOL_WAIT_TIMEOUT_SECONDS", 5.0),
+)
+UPSTREAM_HTTPX_POOL_TIMEOUT_SECONDS = max(
+    0.001,
+    _env_float("UPSTREAM_HTTPX_POOL_TIMEOUT_SECONDS", 1.0),
+)
+
+request_admission_controller = RequestAdmissionController(
+    capacity=REQUEST_ADMISSION_ACTIVE_LIMIT,
+    waiter_limit=REQUEST_ADMISSION_WAITER_LIMIT,
+    wait_timeout_seconds=REQUEST_ADMISSION_WAIT_TIMEOUT_SECONDS,
+    max_body_bytes=REQUEST_BODY_RESERVATION_MAX_BYTES,
+    body_budget_bytes=REQUEST_BODY_BUDGET_BYTES,
+    max_response_bytes=REQUEST_RESPONSE_RESERVATION_MAX_BYTES,
+)
+runtime_gauges.attach_request_admission(request_admission_controller.snapshot)
+runtime_gauges.attach_stream_parser_budget(stream_parser_retained_budget_snapshot)
 
 
 def _open_socket_count() -> Optional[int]:
@@ -660,16 +953,11 @@ async def _force_close_httpcore_stream_chain_safely(upstream_response: Any) -> b
 async def _close_upstream_response_safely(upstream_response: Any | None) -> bool:
     if upstream_response is None:
         return True
-
-    cleanup_ok = True
-    aclose = getattr(upstream_response, "aclose", None)
-    if callable(aclose):
-        cleanup_ok = await _call_cleanup_safely(
-            aclose,
-            label="Upstream HTTP response",
-        ) and cleanup_ok
-    cleanup_ok = await _force_close_httpcore_stream_chain_safely(upstream_response) and cleanup_ok
-    return cleanup_ok
+    # This helper owns the complete two-stage close: a short cooperative
+    # response close, followed by pool eviction/transport abort before any
+    # fail-closed wait.  Calling a generic aclose helper first would prevent
+    # the eviction phase from ever running when aclose ignores cancellation.
+    return await _force_close_httpcore_stream_chain_safely(upstream_response)
 
 
 async def _close_stream_cm_safely(stream_cm: Any | None) -> bool:
@@ -1299,8 +1587,14 @@ async def lifespan(app: FastAPI):
         }
 
         # 初始化客户端管理器
-        app.state.client_manager = ClientManager(pool_size=100)
+        app.state.client_manager = ClientManager(
+            pool_size=UPSTREAM_POOL_SIZE,
+            waiter_limit=UPSTREAM_POOL_WAITER_LIMIT,
+            wait_timeout_seconds=UPSTREAM_POOL_WAIT_TIMEOUT_SECONDS,
+            pool_timeout_seconds=UPSTREAM_HTTPX_POOL_TIMEOUT_SECONDS,
+        )
         await app.state.client_manager.init(default_config)
+        runtime_gauges.attach_upstream_client(app.state.client_manager.snapshot)
 
 
     if app and not hasattr(app.state, "channel_manager"):
@@ -1318,6 +1612,8 @@ async def lifespan(app: FastAPI):
             ERROR_TRIGGERS = []
         app.state.error_triggers = ERROR_TRIGGERS
 
+    await runtime_gauges.start_network_sampler()
+    await _start_responses_stream_stats_workers()
     await start_fugue_observability_from_env(service_version=VERSION)
 
     yield
@@ -1330,7 +1626,9 @@ async def lifespan(app: FastAPI):
         json.dumps(provider_pool_snapshot, ensure_ascii=False, default=str),
         json.dumps(stream_cleanup_snapshot, ensure_ascii=False, default=str),
     )
+    await _stop_responses_stream_stats_workers(timeout=5.0)
     await stop_fugue_observability()
+    await runtime_gauges.stop_network_sampler()
     if hasattr(app.state, 'client_manager'):
         await app.state.client_manager.close()
 
@@ -1409,13 +1707,15 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     )
 
 async def parse_request_body(request: Request):
-    if request.method == "POST" and "application/json" in request.headers.get("content-type", ""):
+    if request.method == "POST" and is_json_media_type(
+        request.headers.get("content-type", "")
+    ):
         try:
             body_bytes = await request.body()
             request.state.uni_api_request_body_bytes = len(body_bytes)
             if not body_bytes:
                 return None
-            return await asyncio.to_thread(json.loads, body_bytes)
+            return await run_json_cpu(json.loads, body_bytes)
         except json.JSONDecodeError:
             return None
     return None
@@ -1538,7 +1838,7 @@ stats_repository = StatsRepository(
 
 async def update_stats(current_info):
     if DISABLE_DATABASE:
-        return
+        return True
 
     # 在成功请求时，快照当前价格，写入数据库
     try:
@@ -1550,22 +1850,26 @@ async def update_stats(current_info):
         pass
 
     try:
-        await stats_repository.add_request_stat(current_info)
+        persisted = await stats_repository.add_request_stat(current_info)
+        if persisted is False:
+            return False
         check_key = current_info["api_key"]
         if check_key and check_key in app.state.paid_api_keys_states and current_info["total_tokens"] > 0:
             await update_paid_api_keys_states(app, check_key)
+        return True
     except Exception as e:
         logger.error(f"Error acquiring database lock: {str(e)}")
         if is_debug:
             import traceback
             traceback.print_exc()
+        return False
 
 async def update_channel_stats(request_id, provider, model, api_key, success, provider_api_key: str = None):
     if DISABLE_DATABASE:
-        return
+        return True
 
     try:
-        await stats_repository.add_channel_stat(
+        persisted = await stats_repository.add_channel_stat(
             request_id=request_id,
             provider=provider,
             model=model,
@@ -1573,11 +1877,13 @@ async def update_channel_stats(request_id, provider, model, api_key, success, pr
             provider_api_key=provider_api_key,
             success=success,
         )
+        return persisted is not False
     except Exception as e:
         logger.error(f"Error acquiring database lock: {str(e)}")
         if is_debug:
             import traceback
             traceback.print_exc()
+        return False
 
 async def get_api_key(request: Request):
     return extract_api_key_from_headers(request.headers)
@@ -1620,8 +1926,9 @@ async def monitor_disconnect(request: Request, disconnect_event: asyncio.Event) 
                 return
     except asyncio.CancelledError:
         return
-    except Exception:
-        disconnect_event.set()
+    except Exception as exc:
+        # Unknown receive errors are not equivalent to a peer disconnect.
+        logger.warning("request disconnect monitor stopped: %s", exc)
 
 
 async def _moderate_content_for_middleware(
@@ -1693,6 +2000,132 @@ async def ensure_config(request: Request, call_next):
     return await call_next(request)
 
 
+def _bypass_request_admission(scope: dict[str, Any]) -> bool:
+    return (
+        str(scope.get("method") or "").upper() in {"GET", "HEAD"}
+        and str(scope.get("path") or "")
+        in {*PUBLIC_HEALTH_PATHS, "/v1/observability/runtime"}
+    )
+
+
+def _observe_request_admission_rejection(
+    scope: dict[str, Any],
+    rejection: Any,
+    wait_ms: float,
+) -> None:
+    _observe_early_request_outcome(
+        scope,
+        status_code=int(rejection.status_code),
+        reason=str(rejection.reason),
+        wait_ms=wait_ms,
+        admission_rejected=True,
+    )
+
+
+def _observe_early_body_response(
+    scope: dict[str, Any],
+    status_code: int,
+    reason: str,
+) -> None:
+    state = scope.get("state")
+    wait_ms = 0.0
+    if isinstance(state, dict):
+        try:
+            wait_ms = float(state.get("uni_api_admission_wait_ms") or 0.0)
+        except (TypeError, ValueError):
+            wait_ms = 0.0
+    _observe_early_request_outcome(
+        scope,
+        status_code=status_code,
+        reason=reason,
+        wait_ms=max(0.0, wait_ms),
+        admission_rejected=status_code == 413,
+    )
+
+
+def _observe_early_request_outcome(
+    scope: dict[str, Any],
+    *,
+    status_code: int,
+    reason: str,
+    wait_ms: float,
+    admission_rejected: bool,
+) -> None:
+    downstream_disconnected = int(status_code) == 499 and str(reason) in {
+        "request_body_disconnected",
+        "admission_wait_disconnected",
+        "disconnected_while_queued",
+        "request_disconnected",
+    }
+    state = scope.get("state")
+    if isinstance(state, dict):
+        existing_info = state.get("uni_api_request_info")
+        if isinstance(existing_info, dict):
+            existing_info["status_code"] = int(status_code)
+            existing_info["error_type"] = str(reason)
+            existing_info["success"] = False
+            if admission_rejected:
+                existing_info["admission_rejected"] = True
+                existing_info["admission_reason"] = str(reason)
+            if downstream_disconnected:
+                existing_info["downstream_disconnected"] = True
+                existing_info["stream_outcome"] = "downstream_disconnected"
+            # Stats owns normal emission once it has created request context.
+            if not existing_info.get("_fugue_observability_emitted"):
+                _emit_request_observability(existing_info)
+            return
+
+    headers = {
+        name.decode("latin-1").lower(): value.decode("latin-1")
+        for name, value in (scope.get("headers") or [])
+    }
+    incoming = _incoming_trace_context(headers)
+    trace = RequestTrace(
+        trace_id=incoming["trace_id"],
+        parent_span_id=incoming.get("parent_span_id"),
+        trace_flags=incoming.get("trace_flags"),
+        tracestate=incoming.get("tracestate"),
+    )
+    trace.mark("request_received")
+    trace.add_ms("request_admission_wait_ms", wait_ms)
+    method = str(scope.get("method") or "").upper()
+    path = str(scope.get("path") or "/")
+    started_at = time() - max(0.0, wait_ms) / 1000.0
+    current_info = {
+        "trace_id": trace.trace_id,
+        "parent_span_id": trace.parent_span_id,
+        "request_id": incoming.get("x_request_id") or trace.trace_id,
+        "endpoint": f"{method} {path}".strip(),
+        "request_kind": path,
+        "stream": False,
+        "status_code": int(status_code),
+        "error_type": str(reason),
+        "success": False,
+        "start_time": started_at,
+        "process_time": max(0.0, time() - started_at),
+        "trace": trace,
+        "timing_spans": trace.snapshot(),
+    }
+    if admission_rejected:
+        current_info["admission_rejected"] = True
+        current_info["admission_reason"] = str(reason)
+    if downstream_disconnected:
+        current_info["downstream_disconnected"] = True
+        current_info["stream_outcome"] = "downstream_disconnected"
+    _emit_request_observability(current_info)
+
+
+# This must remain the last-added middleware so it is the outermost ASGI
+# boundary and owns the lease through the complete streaming response.
+app.add_middleware(
+    RequestAdmissionMiddleware,
+    controller=request_admission_controller,
+    bypass=_bypass_request_admission,
+    on_rejection=_observe_request_admission_rejection,
+    on_early_response=_observe_early_body_response,
+)
+
+
 @app.get("/healthz", include_in_schema=False)
 async def healthz():
     return await healthz_response(VERSION)
@@ -1709,13 +2142,24 @@ async def observability_runtime():
 
 
 class ClientManager(ClientPool):
-    def __init__(self, pool_size=100):
+    def __init__(
+        self,
+        pool_size=UPSTREAM_POOL_SIZE,
+        *,
+        waiter_limit=UPSTREAM_POOL_WAITER_LIMIT,
+        wait_timeout_seconds=UPSTREAM_POOL_WAIT_TIMEOUT_SECONDS,
+        pool_timeout_seconds=UPSTREAM_HTTPX_POOL_TIMEOUT_SECONDS,
+    ):
         super().__init__(
             pool_size=pool_size,
+            waiter_limit=waiter_limit,
+            wait_timeout_seconds=wait_timeout_seconds,
+            pool_timeout_seconds=pool_timeout_seconds,
             sweep_client=_sweep_httpx_client_idle_connections,
             current_trace=_current_trace,
             begin_upstream_pool=runtime_gauges.begin_upstream_pool,
             end_upstream_pool=runtime_gauges.end_upstream_pool,
+            record_upstream_wait=runtime_gauges.record_upstream_pool_wait,
         )
 
 rate_limiter = InMemoryRateLimiter()
@@ -1832,6 +2276,89 @@ async def _resolve_codex_upstream_auth(
     api_key = await _get_codex_access_token(provider_name, raw, proxy)
     return api_key, codex_account_id
 
+
+async def _track_legacy_stream_outcome(
+    source: Any,
+    *,
+    current_info: dict[str, Any],
+    channel_id: str,
+    model: str,
+    provider_api_key: Optional[str],
+    fallback_background_tasks: BackgroundTasks,
+):
+    """Finalize legacy channel accounting when the stream really terminates.
+
+    Returning a ``StreamingResponse`` only transfers ownership of the upstream
+    iterator; it does not prove that the provider completed successfully.  The
+    channel result therefore belongs to this iterator's terminal outcome, not
+    to ``process_request`` returning a response object.
+    """
+
+    async with aclosing(source):
+        try:
+            async for item in source:
+                yield item
+        except (asyncio.CancelledError, GeneratorExit):
+            # A downstream close is not a provider failure.  The outer ASGI
+            # lifecycle records the client disconnect separately.
+            raise
+        except BaseException as exc:
+            current_info["success"] = False
+            local_admission = _record_local_admission_rejection(
+                current_info,
+                exc,
+            )
+            current_info["stream_outcome"] = (
+                "local_backpressure_abort"
+                if local_admission
+                else "upstream_stream_abort"
+            )
+            current_info["stream_error_status_code"] = (
+                int(getattr(exc, "status_code", 503))
+                if local_admission
+                else 502
+            )
+            current_info["error_type"] = type(exc).__name__
+            if not local_admission:
+                _schedule_channel_stats_bounded(
+                    current_info["request_id"],
+                    channel_id,
+                    model,
+                    current_info["api_key"],
+                    success=False,
+                    provider_api_key=provider_api_key,
+                    fallback_background_tasks=fallback_background_tasks,
+                )
+            raise
+        else:
+            current_info["success"] = True
+            current_info["provider"] = channel_id
+            _schedule_channel_stats_bounded(
+                current_info["request_id"],
+                channel_id,
+                model,
+                current_info["api_key"],
+                success=True,
+                provider_api_key=provider_api_key,
+                fallback_background_tasks=fallback_background_tasks,
+            )
+
+
+def _record_local_admission_rejection(
+    current_info: Any,
+    exc: BaseException,
+) -> bool:
+    if not bool(getattr(exc, "local_admission_rejection", False)):
+        return False
+    if isinstance(current_info, dict):
+        reason = str(getattr(exc, "reason", type(exc).__name__))
+        current_info["admission_rejected"] = True
+        current_info["admission_reason"] = reason
+        current_info["error_type"] = reason
+        current_info["success"] = False
+    return True
+
+
 # 在 process_request 函数中更新成功和失败计数
 async def process_request(
     request: Union[RequestModel, ImageGenerationRequest, ImageEditRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest],
@@ -1892,6 +2419,7 @@ async def process_request(
         async with app.state.client_manager.get_client(url, proxy, http2=False if engine == "codex" else None) as client:
             downstream_stream = bool(getattr(request, "stream", None))
             force_collect_codex_stream = engine == "codex" and not downstream_stream and endpoint is None
+            defer_channel_result = False
             upstream_response_headers: dict[str, str] = {}
 
             def capture_upstream_response_headers(headers: Any) -> None:
@@ -1934,6 +2462,15 @@ async def process_request(
                     wrapped_generator = _mark_first_byte_on_stream(wrapped_generator, current_info, skip_keepalive=True)
                 else:
                     _mark_first_byte_observed(current_info)
+                wrapped_generator = _track_legacy_stream_outcome(
+                    wrapped_generator,
+                    current_info=current_info,
+                    channel_id=channel_id,
+                    model=request.model,
+                    provider_api_key=provider_api_key_raw,
+                    fallback_background_tasks=background_tasks,
+                )
+                defer_channel_result = True
                 response = StarletteStreamingResponse(wrapped_generator, media_type="text/event-stream", headers=upstream_response_headers)
             elif force_collect_codex_stream:
                 payload["stream"] = True
@@ -2019,20 +2556,51 @@ async def process_request(
                         first_element = await anext(wrapped_generator)
                     _mark_first_byte_observed(current_info)
                     first_element = first_element.lstrip("data: ")
-                    decoded_element = await asyncio.to_thread(json.loads, first_element)
-                    encoded_element = await asyncio.to_thread(json.dumps, decoded_element)
+                    decoded_element = await run_json_cpu(json.loads, first_element)
+                    encoded_element = await run_json_cpu(json.dumps, decoded_element)
                     response = StarletteStreamingResponse(iter([encoded_element]), media_type="application/json", headers=upstream_response_headers)
 
             # 更新成功计数和首次响应时间
-            background_tasks.add_task(update_channel_stats, current_info["request_id"], channel_id, request.model, current_info["api_key"], success=True, provider_api_key=provider_api_key_raw)
+            if not defer_channel_result:
+                _schedule_channel_stats_bounded(
+                    current_info["request_id"],
+                    channel_id,
+                    request.model,
+                    current_info["api_key"],
+                    success=True,
+                    provider_api_key=provider_api_key_raw,
+                    fallback_background_tasks=background_tasks,
+                )
             current_info["first_response_time"] = first_response_time
-            current_info["success"] = True
-            current_info["provider"] = channel_id
+            if not defer_channel_result:
+                current_info["success"] = True
+                current_info["provider"] = channel_id
             setattr(response, "current_info", current_info)
             return response
 
     except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadTimeout, httpx.ConnectError) as e:
-        background_tasks.add_task(update_channel_stats, current_info["request_id"], channel_id, request.model, current_info["api_key"], success=False, provider_api_key=provider_api_key_raw)
+        disconnect_event = current_info.get("disconnect_event")
+        local_admission_rejection = _record_local_admission_rejection(
+            current_info,
+            e,
+        )
+        if not (
+            local_admission_rejection
+            or isinstance(e, asyncio.CancelledError)
+            or (
+                isinstance(disconnect_event, asyncio.Event)
+                and disconnect_event.is_set()
+            )
+        ):
+            _schedule_channel_stats_bounded(
+                current_info["request_id"],
+                channel_id,
+                request.model,
+                current_info["api_key"],
+                success=False,
+                provider_api_key=provider_api_key_raw,
+                fallback_background_tasks=background_tasks,
+            )
         raise e
 
 class ModelRequestHandler:
@@ -2198,6 +2766,17 @@ class ModelRequestHandler:
                 )
             )
             disconnect_task: Optional[asyncio.Task] = None
+            process_result_transferred = False
+            process_cleanup_completed = False
+
+            async def cleanup_abandoned_process_result(result: Any) -> None:
+                body_iterator = getattr(result, "body_iterator", None)
+                if body_iterator is not None and hasattr(body_iterator, "aclose"):
+                    await call_cleanup_safely(
+                        body_iterator.aclose,
+                        label="Abandoned model response body iterator",
+                    )
+
             try:
                 if disconnect_event is not None:
                     disconnect_task = asyncio.create_task(disconnect_event.wait())
@@ -2205,13 +2784,28 @@ class ModelRequestHandler:
                         [process_task, disconnect_task],
                         return_when=asyncio.FIRST_COMPLETED,
                     )
+                    if process_task in done:
+                        result = process_task.result()
+                        # FIRST_COMPLETED may report both tasks in the same
+                        # event-loop turn.  The disconnect owns that race: do
+                        # not transfer a response whose client is already gone.
+                        if disconnect_event.is_set():
+                            await cleanup_abandoned_process_result(result)
+                            process_cleanup_completed = True
+                            return Response(content="", status_code=499)
+                        process_result_transferred = True
+                        return result
                     if disconnect_task in done and disconnect_event.is_set():
-                        process_task.cancel()
-                        with suppress(asyncio.CancelledError):
-                            await process_task
+                        await _cancel_awaitable_task_and_cleanup_result(
+                            process_task,
+                            cleanup_abandoned_process_result,
+                        )
+                        process_cleanup_completed = True
                         return Response(content="", status_code=499)
 
-                return await process_task
+                result = await process_task
+                process_result_transferred = True
+                return result
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -2219,6 +2813,11 @@ class ModelRequestHandler:
                     return Response(content="", status_code=499)
                 raise
             finally:
+                if not process_result_transferred and not process_cleanup_completed:
+                    await _cancel_awaitable_task_and_cleanup_result(
+                        process_task,
+                        cleanup_abandoned_process_result,
+                    )
                 if disconnect_task is not None:
                     disconnect_task.cancel()
                     with suppress(asyncio.CancelledError):
@@ -3018,6 +3617,10 @@ def _httpx_timeout_from_policy(
     )
 
 
+class DownstreamDisconnectedDuringWait(Exception):
+    """The downstream peer left while an upstream operation was pending."""
+
+
 async def _await_first_byte_deadline(
     awaitable: Awaitable[Any],
     *,
@@ -3026,18 +3629,23 @@ async def _await_first_byte_deadline(
     total_timeout_seconds: Any = None,
     total_deadline: Optional[float] = None,
     satisfied: Optional[Callable[[], bool]] = None,
+    cancel_result_cleanup: Optional[Callable[[Any], Awaitable[None]]] = None,
+    disconnect_event: Optional[asyncio.Event] = None,
 ) -> Any:
     timeout = _optional_positive_timeout(timeout_seconds)
     total_timeout = _optional_positive_timeout(total_timeout_seconds)
     if deadline is None:
         if timeout is None:
-            if total_deadline is None:
+            if total_deadline is None and disconnect_event is None:
                 return await awaitable
         else:
             deadline = asyncio.get_running_loop().time() + timeout
-    if deadline is None and total_deadline is None:
+    if deadline is None and total_deadline is None and disconnect_event is None:
         return await awaitable
     task = asyncio.create_task(awaitable)
+    disconnect_task: Optional[asyncio.Task[bool]] = None
+    if disconnect_event is not None:
+        disconnect_task = asyncio.create_task(disconnect_event.wait())
     loop = asyncio.get_running_loop()
     first_byte_timeout_for_message = timeout if timeout is not None else (
         max(0.0, deadline - loop.time()) if deadline is not None else None
@@ -3045,6 +3653,7 @@ async def _await_first_byte_deadline(
     total_timeout_for_message = total_timeout if total_timeout is not None else (
         max(0.0, total_deadline - loop.time()) if total_deadline is not None else None
     )
+    task_result_owned = True
     try:
         while True:
             first_byte_satisfied = satisfied is not None and satisfied()
@@ -3053,19 +3662,45 @@ async def _await_first_byte_deadline(
                 active_deadlines.append(("first byte", deadline, first_byte_timeout_for_message))
             if total_deadline is not None:
                 active_deadlines.append(("total response", total_deadline, total_timeout_for_message))
-            if not active_deadlines:
-                return await task
-            timeout_label, active_deadline, timeout_for_message = min(active_deadlines, key=lambda item: item[1])
-            remaining = active_deadline - loop.time()
-            if remaining <= 0:
-                task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await task
-                raise asyncio.TimeoutError(timeout_label)
-            done, _ = await asyncio.wait({task}, timeout=min(0.05, remaining))
+            if active_deadlines:
+                timeout_label, active_deadline, timeout_for_message = min(
+                    active_deadlines,
+                    key=lambda item: item[1],
+                )
+                remaining = active_deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError(timeout_label)
+                wait_timeout: Optional[float] = min(0.05, remaining)
+            else:
+                wait_timeout = None
+            wait_tasks: set[asyncio.Task[Any]] = {task}
+            if disconnect_task is not None:
+                wait_tasks.add(disconnect_task)
+            done, _ = await asyncio.wait(
+                wait_tasks,
+                timeout=wait_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            # A completed upstream operation owns the loop turn even when the
+            # peer disconnect arrives simultaneously.  Its caller performs a
+            # final disconnect check before committing the response.
             if task in done:
-                return task.result()
+                result = task.result()
+                task_result_owned = False
+                return result
+            if (
+                disconnect_task is not None
+                and disconnect_task in done
+                and disconnect_event is not None
+                and disconnect_event.is_set()
+            ):
+                raise DownstreamDisconnectedDuringWait()
     except asyncio.TimeoutError as exc:
+        if task_result_owned:
+            await _cancel_awaitable_task_and_cleanup_result(
+                task,
+                cancel_result_cleanup,
+            )
         timeout_label = exc.args[0] if exc.args else "first byte"
         timeout_for_message = (
             total_timeout_for_message if timeout_label == "total response" else first_byte_timeout_for_message
@@ -3075,6 +3710,64 @@ async def _await_first_byte_deadline(
             f"Request timed out waiting for {timeout_label} after {timeout_for_message:g} seconds",
             request=httpx.Request("POST", "https://uni-api.local/upstream-timeout"),
         ) from exc
+    except BaseException:
+        if task_result_owned:
+            await _cancel_awaitable_task_and_cleanup_result(
+                task,
+                cancel_result_cleanup,
+            )
+        raise
+    finally:
+        if disconnect_task is not None and not disconnect_task.done():
+            disconnect_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await disconnect_task
+
+
+async def _cancel_awaitable_task_and_cleanup_result(
+    task: asyncio.Task[Any],
+    cleanup_result: Optional[Callable[[Any], Awaitable[None]]],
+) -> None:
+    if not task.done():
+        task.cancel()
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    try:
+        result = task.result()
+    except (asyncio.CancelledError, Exception):
+        return
+    if cleanup_result is None:
+        return
+    cleanup_task = asyncio.create_task(cleanup_result(result))
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            continue
+    cleanup_task.result()
+
+
+async def _await_buffered_upstream_or_disconnect(
+    awaitable: Awaitable[Any],
+    disconnect_event: Optional[asyncio.Event],
+) -> Any:
+    async def close_late_response(response: Any) -> None:
+        close = getattr(response, "aclose", None)
+        if callable(close):
+            await close()
+
+    result = await _await_first_byte_deadline(
+        awaitable,
+        disconnect_event=disconnect_event,
+        cancel_result_cleanup=close_late_response,
+    )
+    if disconnect_event is not None and disconnect_event.is_set():
+        await close_late_response(result)
+        raise DownstreamDisconnectedDuringWait()
+    return result
 
 
 async def _await_stream_next_with_total_deadline(
@@ -3104,21 +3797,27 @@ async def _prime_passthrough_upstream_stream(
     *,
     disconnect_event: Optional[asyncio.Event] = None,
 ) -> list[bytes]:
-    buffered_chunks: list[bytes] = []
     while True:
         if disconnect_event is not None and disconnect_event.is_set():
-            return buffered_chunks
+            return []
 
         try:
-            chunk = await upstream_iter.__anext__()
+            chunk = await _await_first_byte_deadline(
+                upstream_iter.__anext__(),
+                disconnect_event=disconnect_event,
+            )
         except StopAsyncIteration:
-            if not buffered_chunks:
-                raise HTTPException(status_code=502, detail="Upstream closed stream without data")
-            return buffered_chunks
+            raise HTTPException(status_code=502, detail="Upstream closed stream without data")
 
-        buffered_chunks.append(chunk)
-        if chunk:
-            return buffered_chunks
+        if not chunk:
+            continue
+        chunk_bytes = bytes(chunk)
+        if len(chunk_bytes) > DEFAULT_MAX_EVENT_BYTES:
+            raise HTTPException(
+                status_code=502,
+                detail="Upstream transport chunk exceeded local stream limit",
+            )
+        return [chunk_bytes]
 
 def _log_model_names(request_model_name: Any, actual_model_name: Any = None) -> tuple[str, str]:
     request_model = str(request_model_name or "-")
@@ -3158,6 +3857,181 @@ def _log_responses_downstream_disconnect(
     )
 
 RESPONSES_STREAM_NETWORK_ERRORS = UPSTREAM_NETWORK_ERRORS
+
+RESPONSES_STREAM_QUEUE_MAX_ITEMS = max(
+    1,
+    _env_int("RESPONSES_STREAM_QUEUE_MAX_ITEMS", 64),
+)
+RESPONSES_STREAM_QUEUE_MAX_BYTES = max(
+    1,
+    _env_int("RESPONSES_STREAM_QUEUE_MAX_BYTES", 2 * 1024 * 1024),
+)
+RESPONSES_STREAM_QUEUE_PUT_TIMEOUT_SECONDS = max(
+    0.001,
+    _env_float("RESPONSES_STREAM_QUEUE_PUT_TIMEOUT_SECONDS", 30.0),
+)
+RESPONSES_STREAM_GLOBAL_BUDGET_BYTES = max(
+    1,
+    _env_int("RESPONSES_STREAM_GLOBAL_BUDGET_BYTES", 64 * 1024 * 1024),
+)
+RESPONSES_STREAM_GLOBAL_BUDGET_WAIT_TIMEOUT_SECONDS = max(
+    0.001,
+    _env_float(
+        "RESPONSES_STREAM_GLOBAL_BUDGET_WAIT_TIMEOUT_SECONDS",
+        RESPONSES_STREAM_QUEUE_PUT_TIMEOUT_SECONDS,
+    ),
+)
+RESPONSES_STREAM_PRECOMMIT_MAX_ITEMS = max(
+    1,
+    _env_int("RESPONSES_STREAM_PRECOMMIT_MAX_ITEMS", 128),
+)
+RESPONSES_STREAM_PRECOMMIT_MAX_BYTES = max(
+    1,
+    _env_int("RESPONSES_STREAM_PRECOMMIT_MAX_BYTES", DEFAULT_MAX_EVENT_BYTES),
+)
+
+responses_stream_byte_budget = RetainedByteBudget(
+    capacity_bytes=RESPONSES_STREAM_GLOBAL_BUDGET_BYTES,
+    wait_timeout_seconds=RESPONSES_STREAM_GLOBAL_BUDGET_WAIT_TIMEOUT_SECONDS,
+)
+runtime_gauges.attach_stream_byte_budget(responses_stream_byte_budget.snapshot)
+RESPONSES_STREAM_STATS_QUEUE_MAX_ITEMS = max(
+    1,
+    _env_int("RESPONSES_STREAM_STATS_QUEUE_MAX_ITEMS", 1024),
+)
+RESPONSES_STREAM_STATS_WORKERS = max(
+    1,
+    _env_int("RESPONSES_STREAM_STATS_WORKERS", 4),
+)
+responses_stream_stats_queue: Optional[
+    asyncio.Queue[tuple[tuple[Any, ...], dict[str, Any]]]
+] = None
+responses_stream_stats_workers: set[asyncio.Task[None]] = set()
+responses_stream_stats_submitted = 0
+responses_stream_stats_completed = 0
+responses_stream_stats_failed = 0
+responses_stream_stats_dropped = 0
+
+
+def _responses_stream_stats_snapshot() -> dict[str, Any]:
+    queue = responses_stream_stats_queue
+    return {
+        "items": queue.qsize() if queue is not None else 0,
+        "capacity": RESPONSES_STREAM_STATS_QUEUE_MAX_ITEMS,
+        "workers": len(responses_stream_stats_workers),
+        "submitted": responses_stream_stats_submitted,
+        "completed": responses_stream_stats_completed,
+        "failed": responses_stream_stats_failed,
+        "dropped": responses_stream_stats_dropped,
+    }
+
+
+runtime_gauges.attach_stream_stats(_responses_stream_stats_snapshot)
+
+
+async def _responses_stream_stats_worker(worker_index: int) -> None:
+    global responses_stream_stats_completed, responses_stream_stats_failed
+    queue = responses_stream_stats_queue
+    if queue is None:
+        return
+    while True:
+        args, kwargs = await queue.get()
+        try:
+            persisted = await update_channel_stats(*args, **kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            responses_stream_stats_failed += 1
+            logger.exception(
+                "Responses stream stats worker %d failed to persist update",
+                worker_index,
+            )
+        else:
+            if persisted is False:
+                responses_stream_stats_failed += 1
+                continue
+            responses_stream_stats_completed += 1
+        finally:
+            queue.task_done()
+
+
+async def _start_responses_stream_stats_workers() -> None:
+    global responses_stream_stats_queue
+    if responses_stream_stats_workers:
+        return
+    responses_stream_stats_queue = asyncio.Queue(
+        maxsize=RESPONSES_STREAM_STATS_QUEUE_MAX_ITEMS
+    )
+    for worker_index in range(RESPONSES_STREAM_STATS_WORKERS):
+        task = asyncio.create_task(
+            _responses_stream_stats_worker(worker_index),
+            name=f"uni-api-responses-stream-stats-{worker_index}",
+        )
+        responses_stream_stats_workers.add(task)
+
+
+def _enqueue_responses_stream_stats(
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> bool:
+    global responses_stream_stats_submitted, responses_stream_stats_dropped
+    queue = responses_stream_stats_queue
+    if queue is None:
+        return False
+    try:
+        queue.put_nowait((args, kwargs))
+    except asyncio.QueueFull:
+        responses_stream_stats_dropped += 1
+        if responses_stream_stats_dropped & (responses_stream_stats_dropped - 1) == 0:
+            logger.warning(
+                "Channel stats queue full; dropped_updates=%d",
+                responses_stream_stats_dropped,
+            )
+        return False
+    responses_stream_stats_submitted += 1
+    return True
+
+
+def _schedule_channel_stats_bounded(
+    *args: Any,
+    fallback_background_tasks: Optional[BackgroundTasks] = None,
+    **kwargs: Any,
+) -> None:
+    if responses_stream_stats_queue is not None:
+        _enqueue_responses_stream_stats(tuple(args), dict(kwargs))
+        return
+    # Unit-level handler tests may execute without the application lifespan.
+    # Production always has the bounded worker queue started before serving.
+    if fallback_background_tasks is not None:
+        fallback_background_tasks.add_task(update_channel_stats, *args, **kwargs)
+
+
+async def _stop_responses_stream_stats_workers(*, timeout: float) -> None:
+    global responses_stream_stats_queue
+    queue = responses_stream_stats_queue
+    if queue is None:
+        return
+    try:
+        await asyncio.wait_for(queue.join(), timeout=max(0.001, timeout))
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Timed out draining Responses stream stats queue: pending=%d",
+            queue.qsize(),
+        )
+    workers = list(responses_stream_stats_workers)
+    for task in workers:
+        task.cancel()
+    if workers:
+        await asyncio.gather(*workers, return_exceptions=True)
+    responses_stream_stats_workers.clear()
+    while True:
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        else:
+            queue.task_done()
+    responses_stream_stats_queue = None
 
 RESPONSES_FAILURE_STATUS_BY_CODE = {
     "account_deactivated": 403,
@@ -3219,6 +4093,10 @@ def _build_responses_stream_keepalive_event() -> bytes:
 
 
 def _is_oaix_precommit_keepalive(chunk: bytes) -> bool:
+    # The canonical OAIX keepalive is under 100 bytes.  Never synchronously
+    # reparse an attacker-sized upstream event merely to recognize it.
+    if len(chunk) > 1024:
+        return False
     try:
         event_type, payload = _extract_responses_stream_event(chunk.decode("utf-8", errors="replace").strip())
     except Exception:
@@ -3236,7 +4114,7 @@ def _build_responses_stream_error_event(status_code: int, error_message: Any) ->
         {
             "type": "error",
             "error": {
-                "message": str(error_message),
+                "message": bounded_stream_error_text(error_message),
                 "status_code": int(status_code),
             },
         },
@@ -3245,10 +4123,9 @@ def _build_responses_stream_error_event(status_code: int, error_message: Any) ->
 def _stream_error_event_from_response(response: Any) -> bytes:
     status_code = int(getattr(response, "status_code", 500) or 500)
     body = getattr(response, "body", b"")
-    if isinstance(body, bytes):
-        message = body.decode("utf-8", errors="replace")
-    else:
-        message = str(body or f"Upstream request failed with status {status_code}")
+    message = bounded_stream_error_text(
+        body or f"Upstream request failed with status {status_code}"
+    )
     return _build_responses_stream_error_event(status_code, message)
 
 def _responses_usage_from_payload(payload: Any) -> Optional[dict]:
@@ -3307,10 +4184,38 @@ def _responses_stream_event_commits(event_type: str, payload: Any, commit_policy
     if event_type in RESPONSES_STREAM_PREFLIGHT_EVENTS:
         return False
 
-    completed_with_usage = event_type == "response.completed" and _responses_usage_from_payload(payload) is not None
+    if event_type in {"response.completed", "response.incomplete"}:
+        return True
+
     if commit_policy == "completed_usage":
-        return completed_with_usage
-    return completed_with_usage or _responses_stream_event_has_real_output(event_type, payload)
+        return False
+    return _responses_stream_event_has_real_output(event_type, payload)
+
+
+def _validate_responses_terminal_payload(event_type: str, payload: Any) -> None:
+    """Reject terminal labels whose data is not a Responses object."""
+
+    if event_type not in {
+        "error",
+        "response.completed",
+        "response.failed",
+        "response.incomplete",
+    }:
+        return
+    if not isinstance(payload, dict):
+        raise SSEProtocolError(
+            f"Responses upstream {event_type} payload must be a JSON object"
+        )
+    if event_type.startswith("response.") and not isinstance(
+        payload.get("response"), dict
+    ):
+        raise SSEProtocolError(
+            f"Responses upstream {event_type} payload is missing response"
+        )
+    if event_type == "error" and payload.get("error") is None:
+        raise SSEProtocolError(
+            "Responses upstream error payload is missing error"
+        )
 
 def _responses_error_status_code(error_obj: Any) -> int:
     if isinstance(error_obj, dict):
@@ -3382,69 +4287,158 @@ async def _prime_responses_upstream_stream(
     disconnect_event: Optional[asyncio.Event] = None,
     commit_policy: str = "real_output",
     precommit_keepalive_callback: Optional[Callable[[Optional[bytes]], Awaitable[bool]]] = None,
-) -> tuple[list[bytes], bool]:
+    retained_byte_budget: RetainedByteBudget | None = None,
+) -> tuple[ReservedChunkBuffer, bool]:
     """
     Buffer structural Responses events until we see substantive output or a
     completed response with usage. Optional precommit keepalive emission does
     not commit the real Responses stream.
     """
-    buffered_chunks: list[bytes] = []
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    buffered_chunks = ReservedChunkBuffer(
+        max_items=RESPONSES_STREAM_PRECOMMIT_MAX_ITEMS,
+        max_bytes=RESPONSES_STREAM_PRECOMMIT_MAX_BYTES,
+        retained_byte_budget=retained_byte_budget,
+    )
     sse_parser = IncrementalSSEParser()
     commit_policy = (commit_policy or "real_output").strip().lower()
     if commit_policy not in {"real_output", "completed_usage"}:
         commit_policy = "real_output"
 
-    while True:
-        if disconnect_event is not None and disconnect_event.is_set():
-            return buffered_chunks, False
-
+    async def append_buffered(chunk: bytes) -> None:
         try:
-            chunk = await upstream_iter.__anext__()
-        except StopAsyncIteration:
-            if not buffered_chunks:
-                raise HTTPException(status_code=502, detail="Upstream closed stream without data")
-            if sse_parser.pending_text.strip():
-                raise HTTPException(status_code=502, detail="Upstream closed stream with an incomplete SSE event")
-            raise HTTPException(status_code=502, detail="Responses upstream closed before substantive output")
+            await buffered_chunks.append(chunk)
+        except StreamQueueItemTooLarge as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="Responses upstream precommit buffer limit exceeded",
+            ) from exc
 
-        decoded_chunk = decoder.decode(chunk)
-        raw_events = sse_parser.feed(decoded_chunk)
+    chunk = None
+    raw_event = None
+    raw_events = []
+    try:
+        while True:
+            if disconnect_event is not None and disconnect_event.is_set():
+                return buffered_chunks, False
 
-        for event_index, raw_event in enumerate(raw_events):
-            if not raw_event.strip():
-                continue
+            reached_eof = False
+            try:
+                chunk = await _await_first_byte_deadline(
+                    upstream_iter.__anext__(),
+                    disconnect_event=disconnect_event,
+                )
+            except StopAsyncIteration:
+                reached_eof = True
+                try:
+                    raw_events = sse_parser.finish()
+                except SSEProtocolError as exc:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"Invalid upstream SSE stream: {exc}",
+                    ) from exc
+            else:
+                try:
+                    raw_events = sse_parser.feed(chunk)
+                except SSEProtocolError as exc:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"Invalid upstream SSE stream: {exc}",
+                    ) from exc
+                finally:
+                    chunk = None
 
-            event_type, event_payload = _extract_responses_stream_event(raw_event)
-            if event_type == "[DONE]":
+            for event_index, raw_event in enumerate(raw_events):
+                if not raw_event.strip():
+                    continue
+
+                event_owner = await parse_owned_sse_event(raw_event)
+                event_type = event_owner.event_name
+                event_payload = event_owner.payload
+                semantic_failure = None
+                event_bytes = None
+                handled = None
+                try:
+                    if event_type == "[DONE]":
+                        raise HTTPException(
+                            status_code=502,
+                            detail="Responses upstream ended before substantive output",
+                        )
+
+                    try:
+                        _validate_responses_terminal_payload(
+                            event_type,
+                            event_payload,
+                        )
+                    except SSEProtocolError as exc:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"Invalid upstream SSE stream: {exc}",
+                        ) from exc
+                    semantic_failure = _responses_failure_http_exception(event_payload)
+                    if semantic_failure is not None:
+                        raise semantic_failure
+
+                    event_bytes = _raw_responses_sse_event_bytes(raw_event)
+                    if event_type == "keepalive" and precommit_keepalive_callback is not None:
+                        handled = await precommit_keepalive_callback(event_bytes)
+                        if not handled:
+                            await append_buffered(event_bytes)
+                    else:
+                        if event_type == "response.created" and precommit_keepalive_callback is not None:
+                            await precommit_keepalive_callback(None)
+                        await append_buffered(event_bytes)
+
+                    if _responses_stream_event_commits(event_type, event_payload, commit_policy):
+                        for remaining_raw_event in raw_events[event_index + 1:]:
+                            if remaining_raw_event.strip():
+                                await append_buffered(
+                                    _raw_responses_sse_event_bytes(remaining_raw_event)
+                                )
+                        if sse_parser.pending_data:
+                            await append_buffered(sse_parser.pending_data)
+                        return buffered_chunks, True
+                finally:
+                    # The owned parser reservation may only be returned after
+                    # every local alias into its materialized graph is gone.
+                    handled = None
+                    event_bytes = None
+                    semantic_failure = None
+                    event_payload = None
+                    event_type = None
+                    await event_owner.aclose()
+
+            # IncrementalSSEParser frames carry process-wide retained-byte
+            # ownership.  A completed nonterminal batch must not remain live
+            # while the next upstream byte is awaited.
+            raw_event = None
+            raw_events.clear()
+            raw_events = None
+
+            if reached_eof:
+                if not buffered_chunks:
+                    raise HTTPException(
+                        status_code=502,
+                        detail="Upstream closed stream without data",
+                    )
                 raise HTTPException(
                     status_code=502,
-                    detail="Responses upstream ended before substantive output",
+                    detail="Responses upstream closed before substantive output",
                 )
-
-            semantic_failure = _responses_failure_http_exception(event_payload)
-            if semantic_failure is not None:
-                raise semantic_failure
-
-            event_bytes = _raw_responses_sse_event_bytes(raw_event)
-            if event_type == "keepalive" and precommit_keepalive_callback is not None:
-                handled = await precommit_keepalive_callback(event_bytes)
-                if not handled:
-                    buffered_chunks.append(event_bytes)
-            else:
-                if event_type == "response.created" and precommit_keepalive_callback is not None:
-                    await precommit_keepalive_callback(None)
-                buffered_chunks.append(event_bytes)
-
-            if _responses_stream_event_commits(event_type, event_payload, commit_policy):
-                for remaining_raw_event in raw_events[event_index + 1:]:
-                    if remaining_raw_event.strip():
-                        buffered_chunks.append(_raw_responses_sse_event_bytes(remaining_raw_event))
-                if sse_parser.pending_text:
-                    buffered_chunks.append(sse_parser.pending_text.encode("utf-8"))
-                return buffered_chunks, True
-
-            continue
+    except BaseException:
+        sse_parser.discard()
+        chunk = None
+        raw_event = None
+        if raw_events is not None:
+            raw_events.clear()
+        await buffered_chunks.clear()
+        raise
+    finally:
+        chunk = None
+        raw_event = None
+        if raw_events is not None:
+            raw_events.clear()
+        raw_events = None
+        sse_parser.discard()
 
 class ResponsesRequestHandler:
     def __init__(self):
@@ -3470,6 +4464,98 @@ class ResponsesRequestHandler:
         return await execution.run()
 
 
+class _ResponsesQueueBody:
+    """Release each queue item only after its downstream send completes."""
+
+    def __init__(
+        self,
+        execution: "ResponsesRequestExecution",
+        worker_task: asyncio.Task[Any],
+        first_lease: StreamQueueItemLease,
+    ) -> None:
+        self._execution = execution
+        self._worker_task = worker_task
+        self._current_lease: StreamQueueItemLease | None = first_lease
+        self._first_pending = True
+        self._closed = False
+        self._close_lock = asyncio.Lock()
+        self._close_task: asyncio.Task[None] | None = None
+
+    def __aiter__(self) -> "_ResponsesQueueBody":
+        return self
+
+    async def __anext__(self) -> Any:
+        if self._closed:
+            raise StopAsyncIteration
+
+        if self._first_pending:
+            self._first_pending = False
+            assert self._current_lease is not None
+            return self._current_lease.item
+
+        if self._current_lease is not None:
+            await self._current_lease.release()
+            self._current_lease = None
+
+        queue = self._execution.stream_output_queue
+        assert queue is not None
+        try:
+            self._current_lease = await queue.get_lease()
+        except StreamQueueClosed:
+            await self.aclose()
+            raise StopAsyncIteration from None
+        except BaseException:
+            # An upstream/local producer failure is not evidence of a client
+            # disconnect.  Still release the in-flight item and unregister the
+            # queue before propagating the precise error.
+            await self.aclose()
+            raise
+        return self._current_lease.item
+
+    async def aclose(self) -> None:
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close_once())
+        task = self._close_task
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+            task.result()
+            raise
+
+    async def _close_once(self) -> None:
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._current_lease is not None:
+                await self._current_lease.release()
+                self._current_lease = None
+            await self._execution._close_stream_body(
+                self._worker_task,
+            )
+
+
+async def _finish_stream_queue_cleanup_task(
+    task: asyncio.Task[None],
+) -> None:
+    """Complete a queue ownership handoff before propagating cancellation."""
+
+    pending_cancel: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            pending_cancel = pending_cancel or exc
+    task.result()
+    if pending_cancel is not None:
+        raise pending_cancel
+
+
 @dataclass(slots=True)
 class ResponsesRequestExecution:
     handler: Any
@@ -3486,13 +4572,11 @@ class ResponsesRequestExecution:
     plan: RoutingPlan
     runner: UpstreamRunner
     last_error_response: dict[str, Any] = field(default_factory=dict)
-    stream_output_queue: Optional[asyncio.Queue[Any]] = None
+    stream_output_queue: Optional[ByteBoundedQueue] = None
     stream_response_headers: dict[str, str] = field(default_factory=dict)
-    stream_done_sentinel: object = field(default_factory=object)
     stream_body_started: bool = False
     stream_keepalive_sent: bool = False
-    stream_precommit_chunks: list[bytes] = field(default_factory=list)
-    stream_stats_tasks: list[asyncio.Task[Any]] = field(default_factory=list)
+    stream_precommit_chunks: Optional[ReservedChunkBuffer] = None
 
     @classmethod
     async def create(
@@ -3573,17 +4657,101 @@ class ResponsesRequestExecution:
         )
 
     async def _run_stream(self):
-        self.stream_output_queue = asyncio.Queue()
+        self.stream_precommit_chunks = ReservedChunkBuffer(
+            max_items=1,
+            max_bytes=DEFAULT_MAX_EVENT_BYTES,
+            retained_byte_budget=responses_stream_byte_budget,
+        )
+        self.stream_output_queue = ByteBoundedQueue(
+            max_items=RESPONSES_STREAM_QUEUE_MAX_ITEMS,
+            max_bytes=RESPONSES_STREAM_QUEUE_MAX_BYTES,
+            put_timeout_seconds=RESPONSES_STREAM_QUEUE_PUT_TIMEOUT_SECONDS,
+            retained_byte_budget=responses_stream_byte_budget,
+        )
+        runtime_gauges.register_stream_queue(self.stream_output_queue)
         worker_task = asyncio.create_task(self._stream_worker())
-        first_item = await self.stream_output_queue.get()
-        if first_item is self.stream_done_sentinel:
+        first_lease: StreamQueueItemLease | None = None
+
+        async def retire_unreturned_queue(
+            lease_to_release: StreamQueueItemLease | None = None,
+        ) -> None:
+            try:
+                if lease_to_release is not None:
+                    await lease_to_release.release()
+            finally:
+                try:
+                    await self.stream_output_queue.close(discard=True)
+                finally:
+                    try:
+                        if not worker_task.done():
+                            worker_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await worker_task
+                    finally:
+                        self._record_stream_queue_metrics()
+                        runtime_gauges.unregister_stream_queue(
+                            self.stream_output_queue
+                        )
+
+        async def finish_retiring_unreturned_queue(
+            lease_to_release: StreamQueueItemLease | None = None,
+        ) -> None:
+            cleanup_task = asyncio.create_task(
+                retire_unreturned_queue(lease_to_release)
+            )
+            await _finish_stream_queue_cleanup_task(cleanup_task)
+
+        try:
+            first_lease = await self.stream_output_queue.get_lease()
+            first_item = first_lease.item
+        except StreamQueueClosed:
+            await finish_retiring_unreturned_queue()
             return Response(content="", status_code=204)
+        except (
+            StreamBufferBudgetTimeout,
+            StreamQueuePutTimeout,
+            StreamQueueItemTooLarge,
+        ) as exc:
+            self.current_info["status_code"] = 503
+            self.current_info["stream_error_status_code"] = 503
+            await finish_retiring_unreturned_queue(first_lease)
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": {
+                        "message": "Local streaming buffer capacity exceeded",
+                        "type": "local_overload",
+                        "code": type(exc).__name__,
+                    }
+                },
+                headers={"retry-after": "1"},
+            )
+        except BaseException:
+            await finish_retiring_unreturned_queue(first_lease)
+            raise
         if isinstance(first_item, Response):
-            with suppress(asyncio.CancelledError):
-                await worker_task
-            return first_item
+            response_body = None
+            response_memory_transferred = False
+            try:
+                self.current_info["status_code"] = first_item.status_code
+                response_body = getattr(first_item, "body", b"")
+                request_lease = get_request_admission_lease()
+                if (
+                    request_lease is not None
+                    and isinstance(response_body, (bytes, bytearray, memoryview))
+                    and response_body
+                ):
+                    await request_lease.reserve_response_bytes(len(response_body))
+                response_memory_transferred = True
+                response_body = None
+                return first_item
+            finally:
+                response_body = None
+                if not response_memory_transferred:
+                    first_item = None
+                await finish_retiring_unreturned_queue(first_lease)
         return StarletteStreamingResponse(
-            self._stream_body(worker_task, first_item),
+            _ResponsesQueueBody(self, worker_task, first_lease),
             media_type="text/event-stream",
             headers=self.stream_response_headers,
         )
@@ -3597,15 +4765,22 @@ class ResponsesRequestExecution:
                     return
                 if hasattr(response, "body_iterator"):
                     self.stream_response_headers = dict(response.headers)
-                    for chunk in self.stream_precommit_chunks:
-                        await self._emit_stream_chunk(chunk)
-                    self.stream_precommit_chunks.clear()
+                    assert self.stream_precommit_chunks is not None
+                    while self.stream_precommit_chunks:
+                        chunk, reservation = self.stream_precommit_chunks.popleft()
+                        if reservation is None:
+                            await self._emit_stream_chunk(chunk)
+                        else:
+                            await self._emit_stream_chunk(
+                                ReservedStreamChunk(chunk, reservation)
+                            )
                     async with aclosing(response.body_iterator):
                         async for chunk in response.body_iterator:
                             await self._emit_stream_chunk(chunk)
                     return
                 if not self.stream_body_started:
-                    self.stream_precommit_chunks.clear()
+                    if self.stream_precommit_chunks is not None:
+                        await self.stream_precommit_chunks.clear()
                     await self.stream_output_queue.put(response)
                     return
                 if response.status_code != 499:
@@ -3615,59 +4790,143 @@ class ResponsesRequestExecution:
                 await self._emit_stream_chunk(response)
         except asyncio.CancelledError:
             raise
+        except (
+            StreamBufferBudgetTimeout,
+            StreamQueuePutTimeout,
+            StreamQueueItemTooLarge,
+        ) as exc:
+            await self._abort_stream_for_backpressure(exc)
+        except AdmissionRejected as exc:
+            _record_local_admission_rejection(self.current_info, exc)
+            await self._abort_stream_for_backpressure(exc)
         except Exception as exc:
-            await self._handle_stream_worker_error(exc)
+            try:
+                await self._handle_stream_worker_error(exc)
+            except (
+                StreamBufferBudgetTimeout,
+                StreamQueuePutTimeout,
+                StreamQueueItemTooLarge,
+            ) as queue_exc:
+                await self._abort_stream_for_backpressure(queue_exc)
         finally:
-            if self.stream_stats_tasks:
-                await asyncio.gather(*self.stream_stats_tasks, return_exceptions=True)
-            await self.stream_output_queue.put(self.stream_done_sentinel)
+            if self.stream_precommit_chunks is not None:
+                await self.stream_precommit_chunks.clear()
+            await self.stream_output_queue.close()
 
-    async def _stream_body(self, worker_task: asyncio.Task[Any], first_item: Any):
+    async def _close_stream_body(
+        self,
+        worker_task: asyncio.Task[Any],
+    ) -> None:
         assert self.stream_output_queue is not None
-        try:
-            yield first_item
-            while True:
-                item = await self.stream_output_queue.get()
-                if item is self.stream_done_sentinel:
-                    break
-                yield item
-        finally:
-            if self.disconnect_event is not None:
-                self.disconnect_event.set()
-            if not worker_task.done():
-                worker_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await worker_task
+        # Closing a local iterator may mean a write deadline, server shutdown,
+        # or another local failure.  Only the receive monitor is allowed to
+        # assert a real peer disconnect on the shared sticky event.
+        if not worker_task.done():
+            worker_task.cancel()
+        await self.stream_output_queue.close(discard=True)
+        with suppress(asyncio.CancelledError):
+            await worker_task
+        self._record_stream_queue_metrics()
+        runtime_gauges.unregister_stream_queue(self.stream_output_queue)
 
     async def _handle_stream_worker_error(self, exc: Exception) -> None:
         assert self.stream_output_queue is not None
+        error_message = bounded_stream_error_text(exc)
         trace_logger.error(
-            "%s stream worker failed request_id=%s model=%s error_type=%s: %s",
+            "%s stream worker failed request_id=%s model=%s error=%s",
             self.endpoint,
             self.request_id,
             self.request_model_name,
-            type(exc).__name__,
-            str(exc) or type(exc).__name__,
+            error_message,
         )
-        error_message = str(exc) or type(exc).__name__
         if not self.stream_body_started:
-            self.stream_precommit_chunks.clear()
+            if self.stream_precommit_chunks is not None:
+                await self.stream_precommit_chunks.clear()
+            self.current_info["status_code"] = 500
+            self.current_info["stream_error_status_code"] = 500
+            self.current_info["error_type"] = type(exc).__name__
+            self.current_info["stream_outcome"] = "stream_worker_error"
+            self.current_info["success"] = False
             await self.stream_output_queue.put(
                 JSONResponse(status_code=500, content={"error": error_message})
             )
             return
+        self.current_info["stream_error_status_code"] = 500
+        self.current_info["error_type"] = type(exc).__name__
+        self.current_info["stream_outcome"] = "stream_worker_error"
+        self.current_info["success"] = False
         await self._emit_stream_chunk(_build_responses_stream_error_event(500, error_message))
         await self._emit_stream_chunk(b"data: [DONE]\n\n")
 
     async def _emit_stream_chunk(self, chunk: Any) -> None:
         if self.stream_output_queue is None:
             return
+        reservation = None
+        if isinstance(chunk, ReservedStreamChunk):
+            reservation = chunk.reservation
+            chunk = chunk.data
         if isinstance(chunk, str):
             chunk = chunk.encode("utf-8")
         if not isinstance(chunk, (bytes, bytearray)):
             chunk = str(chunk).encode("utf-8")
         self.stream_body_started = True
-        await self.stream_output_queue.put(bytes(chunk))
+        chunk_bytes = bytes(chunk)
+        segment_bytes = min(
+            RESPONSES_STREAM_QUEUE_MAX_BYTES,
+            256 * 1024,
+        )
+        try:
+            for offset in range(0, len(chunk_bytes), segment_bytes):
+                segment = chunk_bytes[offset : offset + segment_bytes]
+                transferred = (
+                    reservation.split(len(segment))
+                    if reservation is not None
+                    else None
+                )
+                try:
+                    await self.stream_output_queue.put(
+                        segment,
+                        retained_byte_lease=transferred,
+                    )
+                except BaseException:
+                    if transferred is not None and not transferred.released:
+                        await transferred.release()
+                    raise
+            if not chunk_bytes:
+                transferred = reservation.split(0) if reservation is not None else None
+                try:
+                    await self.stream_output_queue.put(
+                        b"",
+                        retained_byte_lease=transferred,
+                    )
+                except BaseException:
+                    if transferred is not None and not transferred.released:
+                        await transferred.release()
+                    raise
+        finally:
+            if reservation is not None and not reservation.released:
+                await reservation.release()
+
+    def _record_stream_queue_metrics(self) -> None:
+        if self.stream_output_queue is None:
+            return
+        snapshot = self.stream_output_queue.snapshot()
+        self.current_info["stream_queue_peak_items"] = snapshot.peak_items
+        self.current_info["stream_queue_peak_bytes"] = snapshot.peak_bytes
+        self.current_info["stream_queue_blocked_puts"] = snapshot.blocked_puts
+        self.current_info["stream_queue_put_wait_ms"] = int(
+            round(snapshot.put_wait_ms)
+        )
+        self.current_info["stream_queue_put_timeouts"] = snapshot.put_timeouts
+
+    async def _abort_stream_for_backpressure(self, exc: Exception) -> None:
+        assert self.stream_output_queue is not None
+        _record_local_admission_rejection(self.current_info, exc)
+        self.current_info["stream_error_status_code"] = 503
+        self.current_info["error_type"] = type(exc).__name__
+        self.current_info["stream_outcome"] = "local_backpressure_abort"
+        self.current_info["success"] = False
+        await self.stream_output_queue.close(error=exc, discard=True)
 
     async def _emit_precommit_keepalive(
         self,
@@ -3690,7 +4949,8 @@ class ResponsesRequestExecution:
             await self._emit_stream_chunk(chunk_bytes)
             _mark_first_byte_observed(self.current_info)
             return True
-        self.stream_precommit_chunks.append(chunk_bytes)
+        assert self.stream_precommit_chunks is not None
+        await self.stream_precommit_chunks.append(chunk_bytes)
         return True
 
     def _schedule_channel_stats(self, channel_id: str, *, success: bool, provider_api_key: Optional[str]) -> None:
@@ -3702,13 +4962,19 @@ class ResponsesRequestExecution:
         )
         kwargs = {"success": success, "provider_api_key": provider_api_key}
         if self.stream_output_queue is not None:
-            self.stream_stats_tasks.append(asyncio.create_task(update_channel_stats(*args, **kwargs)))
-        else:
-            self.background_tasks.add_task(update_channel_stats, *args, **kwargs)
+            if responses_stream_stats_queue is not None:
+                _enqueue_responses_stream_stats(args, kwargs)
+                return
+        _schedule_channel_stats_bounded(
+            *args,
+            **kwargs,
+            fallback_background_tasks=self.background_tasks,
+        )
 
     async def _before_next_attempt(self):
         if self.stream_output_queue is not None and not self.stream_body_started:
-            self.stream_precommit_chunks.clear()
+            if self.stream_precommit_chunks is not None:
+                await self.stream_precommit_chunks.clear()
             self.stream_keepalive_sent = False
         if self.disconnect_event is not None and self.disconnect_event.is_set():
             _log_responses_downstream_disconnect(
@@ -3827,7 +5093,7 @@ class ResponsesRequestExecution:
         proxy = attempt.state["proxy"]
         headers = self._build_headers(attempt)
         payload = self._build_payload(attempt)
-        json_payload = await asyncio.to_thread(json.dumps, payload)
+        json_payload = await run_json_cpu(json.dumps, payload)
         attempt.state["payload_bytes"] = len(json_payload.encode("utf-8"))
         self._record_upstream_attempt_start(attempt)
         self._log_attempt(attempt, headers, payload)
@@ -3938,6 +5204,8 @@ class ResponsesRequestExecution:
             return
         entry["status_code"] = int(status_code)
         entry["success"] = bool(success)
+        if attempt.state.get("local_admission_rejected"):
+            entry["local_admission_rejected"] = True
         if error_type:
             entry["error_type"] = str(error_type)[:80]
         trace = _coerce_request_trace(self.current_info)
@@ -4011,19 +5279,36 @@ class ResponsesRequestExecution:
         if attempt.state.get("upstream_timeout") is not None:
             stream_kwargs["timeout"] = attempt.state["upstream_timeout"]
         stream_cm = client.stream(**stream_kwargs)
-        upstream_resp = await _await_first_byte_deadline(
-            stream_cm.__aenter__(),
-            timeout_seconds=first_byte_timeout,
-            deadline=first_byte_deadline,
-            total_timeout_seconds=total_timeout,
-            total_deadline=total_deadline,
-        )
+
+        async def cleanup_cancelled_stream_enter(response: Any) -> None:
+            await _close_upstream_response_stream_safely(stream_cm, response)
+
+        try:
+            upstream_resp = await _await_first_byte_deadline(
+                stream_cm.__aenter__(),
+                timeout_seconds=first_byte_timeout,
+                deadline=first_byte_deadline,
+                total_timeout_seconds=total_timeout,
+                total_deadline=total_deadline,
+                cancel_result_cleanup=cleanup_cancelled_stream_enter,
+                disconnect_event=self.disconnect_event,
+            )
+        except DownstreamDisconnectedDuringWait:
+            runtime_gauges.end_waiting_first_byte(self.current_info)
+            _log_responses_downstream_disconnect(
+                self.endpoint,
+                self.current_info,
+                model_id=self.request_model_name,
+                provider_name=attempt.provider_name,
+                stage="upstream-response-headers",
+            )
+            return Response(content="", status_code=499)
         _mark_current_info_stage(self.current_info, "upstream_headers_received")
         if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
             runtime_gauges.end_waiting_first_byte(self.current_info)
-            raw = await upstream_resp.aread()
+            raw = await read_limited_response_body(upstream_resp)
             await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
-            raise HTTPException(status_code=upstream_resp.status_code, detail=raw.decode("utf-8", errors="replace"))
+            raise HTTPException(status_code=upstream_resp.status_code, detail=raw.text())
 
         if self.stream_output_queue is not None:
             self.stream_response_headers = _copy_upstream_response_headers(upstream_resp.headers)
@@ -4035,20 +5320,38 @@ class ResponsesRequestExecution:
                     self._emit_precommit_keepalive,
                     passthrough=attempt.state.get("engine") == "codex",
                 )
+            async def cleanup_cancelled_precommit(result: Any) -> None:
+                buffer, _committed = result
+                await buffer.clear()
+
             buffered_chunks, stream_committed = await _await_first_byte_deadline(
                 _prime_responses_upstream_stream(
                     upstream_iter,
                     disconnect_event=self.disconnect_event,
                     commit_policy=attempt.state.get("responses_stream_commit_policy", "real_output"),
                     precommit_keepalive_callback=precommit_keepalive_callback,
+                    retained_byte_budget=responses_stream_byte_budget,
                 ),
                 timeout_seconds=first_byte_timeout,
                 deadline=first_byte_deadline,
                 total_timeout_seconds=total_timeout,
                 total_deadline=total_deadline,
                 satisfied=lambda: self.stream_body_started,
+                cancel_result_cleanup=cleanup_cancelled_precommit,
+                disconnect_event=self.disconnect_event,
             )
             _mark_first_byte_observed(self.current_info)
+        except DownstreamDisconnectedDuringWait:
+            runtime_gauges.end_waiting_first_byte(self.current_info)
+            await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
+            _log_responses_downstream_disconnect(
+                self.endpoint,
+                self.current_info,
+                model_id=self.request_model_name,
+                provider_name=attempt.provider_name,
+                stage="before-stream-commit",
+            )
+            return Response(content="", status_code=499)
         except HTTPException:
             runtime_gauges.end_waiting_first_byte(self.current_info)
             await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
@@ -4063,6 +5366,7 @@ class ResponsesRequestExecution:
             raise
 
         if self.disconnect_event is not None and self.disconnect_event.is_set():
+            await buffered_chunks.clear()
             await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
             _log_responses_downstream_disconnect(
                 self.endpoint,
@@ -4073,8 +5377,7 @@ class ResponsesRequestExecution:
             )
             return Response(content="", status_code=499)
 
-        self._record_upstream_attempt_result(attempt, status_code=upstream_resp.status_code, success=True)
-        self._mark_success(attempt.state["channel_id"], attempt.provider_api_key_raw)
+        attempt.state["stream_upstream_status_code"] = upstream_resp.status_code
         response_headers = _copy_upstream_response_headers(upstream_resp.headers)
         return StarletteStreamingResponse(
             self._proxy_responses_stream(
@@ -4094,7 +5397,7 @@ class ResponsesRequestExecution:
     async def _proxy_responses_stream(
         self,
         attempt: Any,
-        buffered_chunks: list[bytes],
+        buffered_chunks: ReservedChunkBuffer,
         upstream_iter: Any,
         stream_cm: Any,
         upstream_resp: Any,
@@ -4104,64 +5407,319 @@ class ResponsesRequestExecution:
         total_timeout_seconds: Any = None,
     ):
         completed_seen = False
+        incomplete_seen = False
         usage_seen = False
         output_seen = False
-        proxy_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         proxy_sse_parser = IncrementalSSEParser()
 
-        def track_responses_events(chunk: bytes) -> None:
-            nonlocal completed_seen, usage_seen, output_seen
-            decoded_chunk = proxy_decoder.decode(chunk)
-            for raw_event in proxy_sse_parser.feed(decoded_chunk):
-                if not raw_event.strip():
-                    continue
-                event_type, event_payload = _extract_responses_stream_event(raw_event)
-                if _responses_stream_event_has_real_output(event_type, event_payload):
-                    output_seen = True
-                if event_type == "response.completed":
-                    completed_seen = True
-                    if _responses_usage_from_payload(event_payload) is not None:
-                        usage_seen = True
+        async def source_events():
+            """Frame transport chunks before exposing any protocol event."""
 
-        try:
-            for chunk in buffered_chunks:
-                _mark_first_byte_observed(self.current_info)
-                if self._downstream_disconnected(attempt, stage="after-stream-commit"):
-                    return
-                track_responses_events(chunk)
-                yield chunk
-            while True:
+            while buffered_chunks:
+                chunk, reservation = buffered_chunks.popleft()
+                raw_events = []
                 try:
-                    chunk = await _await_stream_next_with_total_deadline(
-                        upstream_iter,
-                        total_deadline=total_deadline,
+                    raw_events = proxy_sse_parser.feed(chunk)
+                    exact_transfer = (
+                        reservation is not None
+                        and len(raw_events) == 1
+                        and not proxy_sse_parser.pending_data
+                        and _raw_responses_sse_event_bytes(raw_events[0]) == chunk
+                    )
+                    chunk = None
+                    for event_index in range(len(raw_events)):
+                        raw_event = raw_events[event_index]
+                        transferred = None
+                        if exact_transfer and event_index == 0:
+                            transferred = reservation
+                            reservation = None
+                        try:
+                            yield raw_event, transferred
+                        finally:
+                            transferred = None
+                            raw_event = None
+                            raw_events[event_index] = ""
+                finally:
+                    raw_events.clear()
+                    raw_events = None
+                    chunk = None
+                    if reservation is not None:
+                        await reservation.release()
+
+            while True:
+                if self._downstream_disconnected(
+                    attempt,
+                    stage="after-stream-commit",
+                ):
+                    raise DownstreamDisconnectedDuringWait()
+                try:
+                    chunk = await _await_first_byte_deadline(
+                        upstream_iter.__anext__(),
+                        deadline=total_deadline,
                         total_timeout_seconds=total_timeout_seconds,
+                        disconnect_event=self.disconnect_event,
                     )
                 except StopAsyncIteration:
                     break
-                _mark_first_byte_observed(self.current_info)
-                if self._downstream_disconnected(attempt, stage="after-stream-commit"):
-                    break
-                track_responses_events(chunk)
-                yield chunk
-        except RESPONSES_STREAM_NETWORK_ERRORS as exc:
+                if self._downstream_disconnected(
+                    attempt,
+                    stage="after-stream-commit",
+                ):
+                    # The disconnect may become visible while the upstream
+                    # __anext__ call is completing.  Never forward the chunk
+                    # that raced with that disconnect.
+                    chunk = None
+                    raise DownstreamDisconnectedDuringWait()
+                raw_events = proxy_sse_parser.feed(bytes(chunk))
+                chunk = None
+                try:
+                    for event_index in range(len(raw_events)):
+                        raw_event = raw_events[event_index]
+                        try:
+                            yield raw_event, None
+                        finally:
+                            raw_event = None
+                            raw_events[event_index] = ""
+                finally:
+                    raw_events.clear()
+                    raw_events = None
+
+            raw_events = proxy_sse_parser.finish()
+            try:
+                for event_index in range(len(raw_events)):
+                    raw_event = raw_events[event_index]
+                    try:
+                        yield raw_event, None
+                    finally:
+                        raw_event = None
+                        raw_events[event_index] = ""
+            finally:
+                raw_events.clear()
+                raw_events = None
+
+        source = source_events()
+        try:
+            async for raw_event, reservation in source:
+                event_bytes = None
+                transferred = None
+                failure = None
+                event_owner = None
+                try:
+                    if not raw_event.strip():
+                        continue
+                    event_bytes = _raw_responses_sse_event_bytes(raw_event)
+                    if is_sse_comment_frame(raw_event):
+                        if reservation is None:
+                            yield event_bytes
+                        else:
+                            transferred = reservation
+                            reservation = None
+                            yield ReservedStreamChunk(event_bytes, transferred)
+                        continue
+
+                    event_owner = await parse_owned_sse_event(raw_event)
+                    event_type = event_owner.event_name
+                    event_payload = event_owner.payload
+                    semantic_failure = None
+                    terminal_success = False
+                    try:
+                        if event_type == "[DONE]":
+                            raise SSEProtocolError(
+                                "Responses upstream emitted [DONE] without a terminal response event"
+                            )
+
+                        _validate_responses_terminal_payload(
+                            event_type,
+                            event_payload,
+                        )
+                        if _responses_stream_event_has_real_output(
+                            event_type,
+                            event_payload,
+                        ):
+                            output_seen = True
+
+                        semantic_failure = _responses_failure_http_exception(
+                            event_payload
+                        )
+                        if semantic_failure is not None:
+                            failure = SSEProtocolError(
+                                "Responses upstream emitted a failure terminal: "
+                                f"{str(semantic_failure.detail)[:1000]}"
+                            )
+                            self.current_info["stream_error_status_code"] = int(
+                                semantic_failure.status_code
+                            )
+                            self.current_info["stream_outcome"] = (
+                                "upstream_failure_terminal"
+                            )
+                            self.current_info["error_type"] = "UpstreamSemanticFailure"
+                            self.current_info["success"] = False
+                            self._finalize_stream_attempt_failure(attempt, failure)
+                            # Preserve the provider's structured terminal.
+                            if reservation is None:
+                                yield event_bytes
+                            else:
+                                transferred = reservation
+                                reservation = None
+                                yield ReservedStreamChunk(event_bytes, transferred)
+                            return
+
+                        terminal_success = event_type in {
+                            "response.completed",
+                            "response.incomplete",
+                        }
+                        if event_type == "response.completed":
+                            completed_seen = True
+                        elif event_type == "response.incomplete":
+                            incomplete_seen = True
+                        if terminal_success and _responses_usage_from_payload(
+                            event_payload
+                        ) is not None:
+                            usage_seen = True
+
+                        if reservation is None:
+                            yield event_bytes
+                        else:
+                            transferred = reservation
+                            reservation = None
+                            yield ReservedStreamChunk(event_bytes, transferred)
+
+                        if terminal_success:
+                            # The semantic terminal ends the response.  Do not
+                            # wait for EOF/[DONE] on a keep-alive connection.
+                            self._finalize_stream_attempt_success(attempt)
+                            return
+                    finally:
+                        terminal_success = False
+                        semantic_failure = None
+                        event_payload = None
+                        event_type = None
+                        await event_owner.aclose()
+                finally:
+                    failure = None
+                    transferred = None
+                    event_bytes = None
+                    raw_event = None
+                    event_owner = None
+                    if reservation is not None:
+                        await reservation.release()
+            raise SSEProtocolError(
+                "Responses upstream ended without a terminal response event"
+            )
+        except DownstreamDisconnectedDuringWait:
+            self._finalize_stream_attempt_cancelled(
+                attempt,
+                downstream_disconnected=True,
+            )
+            return
+        except RESPONSES_STREAM_NETWORK_ERRORS + (SSEProtocolError,) as exc:
+            self._finalize_stream_attempt_failure(attempt, exc)
             await self._handle_proxy_stream_abort(attempt, exc, stream_committed)
             if stream_committed:
+                self.current_info["stream_error_status_code"] = 502
+                self.current_info["error_type"] = type(exc).__name__
+                self.current_info["stream_outcome"] = "upstream_stream_abort"
+                self.current_info["success"] = False
+                yield _build_responses_stream_error_event(502, exc)
                 yield b"data: [DONE]\n\n"
         finally:
-            if not completed_seen or not usage_seen:
-                trace_logger.warning(
-                    "%s upstream stream finished without completed usage request_id=%s model=%s provider=%s output_seen=%s completed_seen=%s usage_seen=%s upstream_url=%s",
-                    self.endpoint,
-                    self.request_id,
-                    self.request_model_name,
-                    attempt.provider_name,
-                    output_seen,
-                    completed_seen,
-                    usage_seen,
-                    attempt.state["upstream_url"],
-                )
-            await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
+            try:
+                await source.aclose()
+            finally:
+                proxy_sse_parser.discard()
+                try:
+                    await buffered_chunks.clear()
+                finally:
+                    try:
+                        if not attempt.state.get("stream_attempt_finalized"):
+                            if completed_seen or incomplete_seen:
+                                self._finalize_stream_attempt_success(attempt)
+                            elif (
+                                self.disconnect_event is not None
+                                and self.disconnect_event.is_set()
+                            ):
+                                self._finalize_stream_attempt_cancelled(
+                                    attempt,
+                                    downstream_disconnected=True,
+                                )
+                            else:
+                                # A consumer may close an iterator for server
+                                # shutdown or another local reason.  Do not
+                                # fabricate a peer disconnect/provider fault.
+                                attempt.state["stream_attempt_finalized"] = True
+                        if not (completed_seen or incomplete_seen) or not usage_seen:
+                            trace_logger.warning(
+                                "%s upstream stream finished without completed usage request_id=%s model=%s provider=%s output_seen=%s completed_seen=%s usage_seen=%s upstream_url=%s",
+                                self.endpoint,
+                                self.request_id,
+                                self.request_model_name,
+                                attempt.provider_name,
+                                output_seen,
+                                completed_seen or incomplete_seen,
+                                usage_seen,
+                                attempt.state["upstream_url"],
+                            )
+                    finally:
+                        await _close_upstream_response_stream_safely(
+                            stream_cm,
+                            upstream_resp,
+                        )
+
+    def _finalize_stream_attempt_success(self, attempt: Any) -> None:
+        if attempt.state.get("stream_attempt_finalized"):
+            return
+        attempt.state["stream_attempt_finalized"] = True
+        self._record_upstream_attempt_result(
+            attempt,
+            status_code=int(attempt.state.get("stream_upstream_status_code") or 200),
+            success=True,
+        )
+        self._mark_success(
+            attempt.state["channel_id"],
+            attempt.provider_api_key_raw,
+        )
+
+    def _finalize_stream_attempt_failure(
+        self,
+        attempt: Any,
+        exc: BaseException,
+    ) -> None:
+        if attempt.state.get("stream_attempt_finalized"):
+            return
+        attempt.state["stream_attempt_finalized"] = True
+        self._record_upstream_attempt_result(
+            attempt,
+            status_code=502,
+            success=False,
+            error_type=type(exc).__name__,
+        )
+        if attempt.state.get("track_channel_stats"):
+            self._schedule_channel_stats(
+                attempt.state["channel_id"],
+                success=False,
+                provider_api_key=attempt.provider_api_key_raw,
+            )
+
+    def _finalize_stream_attempt_cancelled(
+        self,
+        attempt: Any,
+        *,
+        downstream_disconnected: bool,
+    ) -> None:
+        if attempt.state.get("stream_attempt_finalized"):
+            return
+        attempt.state["stream_attempt_finalized"] = True
+        if downstream_disconnected:
+            self.current_info["downstream_disconnected"] = True
+            self.current_info["stream_outcome"] = "downstream_disconnected"
+            self.current_info["error_type"] = "downstream_disconnect"
+            self.current_info["success"] = False
+        self._record_upstream_attempt_result(
+            attempt,
+            status_code=499,
+            success=False,
+            error_type="DownstreamDisconnected",
+        )
 
     def _downstream_disconnected(self, attempt: Any, *, stage: str) -> bool:
         if self.disconnect_event is None or not self.disconnect_event.is_set():
@@ -4177,7 +5735,7 @@ class ResponsesRequestExecution:
 
     async def _handle_proxy_stream_abort(self, attempt: Any, exc: Exception, stream_committed: bool) -> None:
         stream_stage = "post-commit" if stream_committed else "preflight"
-        error_text = str(exc) or type(exc).__name__
+        error_text = bounded_stream_error_text(exc)
         request_model, actual_model = _log_model_names(self.request_model_name, attempt.original_model)
         trace_logger.warning(
             "%s upstream stream aborted stage=%s error_type=%s request_id=%s request_model=%s actual_model=%s provider=%s key=%s upstream_url=%s: %s",
@@ -4196,23 +5754,53 @@ class ResponsesRequestExecution:
     async def _execute_non_stream_attempt(self, client: Any, attempt: Any, headers: dict[str, str], json_payload: str):
         _mark_current_info_stage(self.current_info, "upstream_send_start")
         runtime_gauges.begin_waiting_first_byte(self.current_info)
+
+        async def cleanup_cancelled_response(response: Any) -> None:
+            close = getattr(response, "aclose", None)
+            if callable(close):
+                await close()
+
         try:
-            upstream_resp = await client.post(
-                attempt.state["upstream_url"],
-                headers=headers,
-                content=json_payload,
-                timeout=attempt.state["timeout_value"],
+            upstream_resp = await _await_first_byte_deadline(
+                client.post(
+                    attempt.state["upstream_url"],
+                    headers=headers,
+                    content=json_payload,
+                    timeout=attempt.state["timeout_value"],
+                ),
+                disconnect_event=self.disconnect_event,
+                cancel_result_cleanup=cleanup_cancelled_response,
             )
             _mark_current_info_stage(self.current_info, "upstream_headers_received")
             _mark_first_byte_observed(self.current_info)
-        except Exception:
+        except DownstreamDisconnectedDuringWait:
+            runtime_gauges.end_waiting_first_byte(self.current_info)
+            _log_responses_downstream_disconnect(
+                self.endpoint,
+                self.current_info,
+                model_id=self.request_model_name,
+                provider_name=attempt.provider_name,
+                stage="non-stream-upstream-response",
+            )
+            return Response(content="", status_code=499)
+        except BaseException:
             runtime_gauges.end_waiting_first_byte(self.current_info)
             raise
+        if self.disconnect_event is not None and self.disconnect_event.is_set():
+            await cleanup_cancelled_response(upstream_resp)
+            _log_responses_downstream_disconnect(
+                self.endpoint,
+                self.current_info,
+                model_id=self.request_model_name,
+                provider_name=attempt.provider_name,
+                stage="non-stream-upstream-response",
+            )
+            return Response(content="", status_code=499)
         if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
-            raw = await upstream_resp.aread()
-            raise HTTPException(status_code=upstream_resp.status_code, detail=raw.decode("utf-8", errors="replace"))
+            raw = await read_limited_response_body(upstream_resp)
+            raise HTTPException(status_code=upstream_resp.status_code, detail=raw.text())
 
-        data = upstream_resp.json()
+        data = await run_json_cpu(json.loads, upstream_resp.content)
         semantic_failure = _responses_failure_http_exception(data)
         if semantic_failure is not None:
             raise semantic_failure
@@ -4220,7 +5808,12 @@ class ResponsesRequestExecution:
         self._record_upstream_attempt_result(attempt, status_code=upstream_resp.status_code, success=True)
         self._mark_success(attempt.state["channel_id"], attempt.provider_api_key_raw)
         response_headers = _copy_upstream_response_headers(upstream_resp.headers)
-        return JSONResponse(status_code=upstream_resp.status_code, content=data, headers=response_headers)
+        return Response(
+            status_code=upstream_resp.status_code,
+            content=upstream_resp.content,
+            headers=response_headers,
+            media_type=response_headers.get("content-type", "application/json"),
+        )
 
     def _mark_success(self, channel_id: str, provider_api_key: Optional[str]) -> None:
         self._schedule_channel_stats(channel_id, success=True, provider_api_key=provider_api_key)
@@ -4229,6 +5822,7 @@ class ResponsesRequestExecution:
         self.current_info["provider"] = channel_id
 
     def _after_failure(self, attempt: Any, exc: Exception, status_code: int, error_message: Any) -> None:
+        _record_local_admission_rejection(self.current_info, exc)
         self._record_upstream_attempt_result(
             attempt,
             status_code=status_code,
@@ -4469,7 +6063,7 @@ class MessagesPassthroughHandler:
 
         headers = self._messages_headers(ctx["http_request"], provider, attempt.state["api_key"])
         self._messages_log_attempt(ctx, attempt, payload, headers)
-        json_payload = await asyncio.to_thread(json.dumps, payload)
+        json_payload = await run_json_cpu(json.dumps, payload)
 
         async with app.state.client_manager.get_client(upstream_url, proxy) as client:
             if payload.get("stream"):
@@ -4528,17 +6122,45 @@ class MessagesPassthroughHandler:
     async def _messages_stream_response(self, client: Any, attempt: Any, ctx: dict[str, Any], headers: dict[str, str], json_payload: str):
         upstream_url = attempt.state["upstream_url"]
         stream_cm = client.stream("POST", upstream_url, headers=headers, content=json_payload, timeout=attempt.state["timeout_value"])
-        upstream_resp = await stream_cm.__aenter__()
+
+        async def cleanup_cancelled_stream_enter(response: Any) -> None:
+            await _close_upstream_response_stream_safely(stream_cm, response)
+
+        try:
+            upstream_resp = await _await_first_byte_deadline(
+                stream_cm.__aenter__(),
+                disconnect_event=ctx["disconnect_event"],
+                cancel_result_cleanup=cleanup_cancelled_stream_enter,
+            )
+        except DownstreamDisconnectedDuringWait:
+            trace_logger.info(
+                "%s downstream disconnect stage=upstream-response-headers request_id=%s model=%s provider=%s",
+                ctx["endpoint"],
+                ctx["request_id"],
+                ctx["request_model_name"],
+                attempt.provider_name,
+            )
+            return Response(content="", status_code=499)
         response_headers = _copy_upstream_response_headers(upstream_resp.headers)
         if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
-            raw = await upstream_resp.aread()
+            raw = await read_limited_response_body(upstream_resp)
             await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
-            self._messages_set_last_error(ctx, raw, response_headers)
-            raise HTTPException(status_code=upstream_resp.status_code, detail=raw.decode("utf-8", errors="replace"))
+            self._messages_set_last_error(ctx, raw.body, response_headers)
+            raise HTTPException(status_code=upstream_resp.status_code, detail=raw.text())
 
         upstream_iter = upstream_resp.aiter_raw()
         try:
             buffered_chunks = await _prime_passthrough_upstream_stream(upstream_iter, disconnect_event=ctx["disconnect_event"])
+        except DownstreamDisconnectedDuringWait:
+            await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
+            trace_logger.info(
+                "%s downstream disconnect stage=before-stream-commit request_id=%s model=%s provider=%s",
+                ctx["endpoint"],
+                ctx["request_id"],
+                ctx["request_model_name"],
+                attempt.provider_name,
+            )
+            return Response(content="", status_code=499)
         except BaseException:
             await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
             raise
@@ -4554,7 +6176,7 @@ class MessagesPassthroughHandler:
             )
             return Response(content="", status_code=499)
 
-        self._messages_record_success(ctx, attempt)
+        attempt.state["stream_upstream_status_code"] = upstream_resp.status_code
         return StarletteStreamingResponse(
             self._messages_proxy_stream(ctx, attempt, buffered_chunks, upstream_iter, stream_cm, upstream_resp),
             status_code=upstream_resp.status_code,
@@ -4563,17 +6185,198 @@ class MessagesPassthroughHandler:
         )
 
     async def _messages_proxy_stream(self, ctx: dict[str, Any], attempt: Any, buffered_chunks: list[bytes], upstream_iter: Any, stream_cm: Any, upstream_resp: Any):
-        try:
-            for chunk in buffered_chunks:
-                if self._messages_downstream_disconnected(ctx, attempt, stage="after-stream-commit"):
-                    return
-                yield chunk
-            async for chunk in upstream_iter:
-                if self._messages_downstream_disconnected(ctx, attempt, stage="after-stream-commit"):
+        parser = IncrementalSSEParser()
+        terminal_seen = False
+
+        async def source_events():
+            try:
+                while buffered_chunks:
+                    chunk = buffered_chunks.pop(0)
+                    raw_events = parser.feed(bytes(chunk))
+                    chunk = None
+                    try:
+                        for event_index in range(len(raw_events)):
+                            raw_event = raw_events[event_index]
+                            try:
+                                yield raw_event
+                            finally:
+                                raw_event = None
+                                raw_events[event_index] = ""
+                    finally:
+                        raw_events.clear()
+                        raw_events = None
+                buffered_chunks.clear()
+            finally:
+                # Ensure a terminal return cannot leave the precommit list's
+                # remaining byte aliases to async-generator GC finalization.
+                buffered_chunks.clear()
+            while True:
+                try:
+                    chunk = await _await_first_byte_deadline(
+                        upstream_iter.__anext__(),
+                        disconnect_event=ctx["disconnect_event"],
+                    )
+                except StopAsyncIteration:
                     break
-                yield chunk
+                raw_events = parser.feed(bytes(chunk))
+                chunk = None
+                try:
+                    for event_index in range(len(raw_events)):
+                        raw_event = raw_events[event_index]
+                        try:
+                            yield raw_event
+                        finally:
+                            raw_event = None
+                            raw_events[event_index] = ""
+                finally:
+                    raw_events.clear()
+                    raw_events = None
+            raw_events = parser.finish()
+            try:
+                for event_index in range(len(raw_events)):
+                    raw_event = raw_events[event_index]
+                    try:
+                        yield raw_event
+                    finally:
+                        raw_event = None
+                        raw_events[event_index] = ""
+            finally:
+                raw_events.clear()
+                raw_events = None
+
+        source = source_events()
+        try:
+            async for raw_event in source:
+                if self._messages_downstream_disconnected(ctx, attempt, stage="after-stream-commit"):
+                    self._messages_finalize_stream_disconnect(ctx, attempt)
+                    return
+                if not raw_event.strip():
+                    raw_event = None
+                    continue
+                event_bytes = _raw_responses_sse_event_bytes(raw_event)
+                if is_sse_comment_frame(raw_event):
+                    try:
+                        yield event_bytes
+                    finally:
+                        event_bytes = None
+                        raw_event = None
+                    continue
+                event_owner = await parse_owned_sse_event(raw_event)
+                event_name = event_owner.event_name
+                payload = event_owner.payload
+                payload_type = None
+                try:
+                    if not isinstance(payload, dict):
+                        raise SSEProtocolError(
+                            "Anthropic upstream SSE data must be a JSON object"
+                        )
+                    payload_type = str(payload.get("type") or "").strip()
+                    if event_name == "message_stop" or payload_type == "message_stop":
+                        terminal_seen = True
+                    yield event_bytes
+                    if terminal_seen:
+                        # message_stop is the protocol terminal.  Waiting for
+                        # EOF on a keep-alive connection would retain leases.
+                        self._messages_finalize_stream_success(ctx, attempt)
+                        return
+                finally:
+                    payload_type = None
+                    payload = None
+                    event_name = None
+                    raw_event = None
+                    event_bytes = None
+                    owner_to_close = event_owner
+                    event_owner = None
+                    await owner_to_close.aclose()
+                    owner_to_close = None
+            raise SSEProtocolError(
+                "Anthropic upstream ended without message_stop"
+            )
+        except DownstreamDisconnectedDuringWait:
+            self._messages_finalize_stream_disconnect(ctx, attempt)
+            return
+        except (SSEProtocolError,) + UPSTREAM_NETWORK_ERRORS as exc:
+            self._messages_finalize_stream_failure(ctx, attempt, exc)
+            raise
+        except AdmissionRejected as exc:
+            _record_local_admission_rejection(ctx["current_info"], exc)
+            ctx["current_info"]["stream_outcome"] = "local_backpressure_abort"
+            ctx["current_info"]["stream_error_status_code"] = int(
+                getattr(exc, "status_code", 503)
+            )
+            attempt.state["messages_stream_finalized"] = True
+            raise
+        except (asyncio.CancelledError, GeneratorExit):
+            if ctx["disconnect_event"] is not None and ctx["disconnect_event"].is_set():
+                self._messages_finalize_stream_disconnect(ctx, attempt)
+            raise
         finally:
-            await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
+            try:
+                await source.aclose()
+            finally:
+                parser.discard()
+                buffered_chunks.clear()
+                try:
+                    if (
+                        not attempt.state.get("messages_stream_finalized")
+                        and ctx["disconnect_event"] is not None
+                        and ctx["disconnect_event"].is_set()
+                    ):
+                        self._messages_finalize_stream_disconnect(ctx, attempt)
+                finally:
+                    await _close_upstream_response_stream_safely(
+                        stream_cm,
+                        upstream_resp,
+                    )
+
+    def _messages_finalize_stream_success(
+        self,
+        ctx: dict[str, Any],
+        attempt: Any,
+    ) -> None:
+        if attempt.state.get("messages_stream_finalized"):
+            return
+        attempt.state["messages_stream_finalized"] = True
+        self._messages_record_success(ctx, attempt)
+
+    def _messages_finalize_stream_failure(
+        self,
+        ctx: dict[str, Any],
+        attempt: Any,
+        exc: BaseException,
+    ) -> None:
+        if attempt.state.get("messages_stream_finalized"):
+            return
+        attempt.state["messages_stream_finalized"] = True
+        current_info = ctx["current_info"]
+        current_info["success"] = False
+        current_info["stream_outcome"] = "upstream_stream_abort"
+        current_info["stream_error_status_code"] = 502
+        current_info["error_type"] = type(exc).__name__
+        if attempt.state.get("track_channel_stats"):
+            _schedule_channel_stats_bounded(
+                current_info["request_id"],
+                attempt.state["channel_id"],
+                ctx["request_model_name"],
+                current_info["api_key"],
+                success=False,
+                provider_api_key=attempt.provider_api_key_raw,
+                fallback_background_tasks=ctx["background_tasks"],
+            )
+
+    def _messages_finalize_stream_disconnect(
+        self,
+        ctx: dict[str, Any],
+        attempt: Any,
+    ) -> None:
+        if attempt.state.get("messages_stream_finalized"):
+            return
+        attempt.state["messages_stream_finalized"] = True
+        current_info = ctx["current_info"]
+        current_info["downstream_disconnected"] = True
+        current_info["stream_outcome"] = "downstream_disconnected"
+        current_info["error_type"] = "downstream_disconnect"
+        current_info["success"] = False
 
     def _messages_downstream_disconnected(self, ctx: dict[str, Any], attempt: Any, *, stage: str) -> bool:
         disconnect_event = ctx["disconnect_event"]
@@ -4590,12 +6393,41 @@ class MessagesPassthroughHandler:
         return True
 
     async def _messages_non_stream_response(self, client: Any, attempt: Any, ctx: dict[str, Any], headers: dict[str, str], json_payload: str):
-        upstream_resp = await client.post(
-            attempt.state["upstream_url"],
-            headers=headers,
-            content=json_payload,
-            timeout=attempt.state["timeout_value"],
-        )
+        async def cleanup_cancelled_response(response: Any) -> None:
+            close = getattr(response, "aclose", None)
+            if callable(close):
+                await close()
+
+        try:
+            upstream_resp = await _await_first_byte_deadline(
+                client.post(
+                    attempt.state["upstream_url"],
+                    headers=headers,
+                    content=json_payload,
+                    timeout=attempt.state["timeout_value"],
+                ),
+                disconnect_event=ctx["disconnect_event"],
+                cancel_result_cleanup=cleanup_cancelled_response,
+            )
+        except DownstreamDisconnectedDuringWait:
+            trace_logger.info(
+                "%s downstream disconnect stage=non-stream-upstream-response request_id=%s model=%s provider=%s",
+                ctx["endpoint"],
+                ctx["request_id"],
+                ctx["request_model_name"],
+                attempt.provider_name,
+            )
+            return Response(content="", status_code=499)
+        if ctx["disconnect_event"] is not None and ctx["disconnect_event"].is_set():
+            await cleanup_cancelled_response(upstream_resp)
+            trace_logger.info(
+                "%s downstream disconnect stage=non-stream-upstream-response request_id=%s model=%s provider=%s",
+                ctx["endpoint"],
+                ctx["request_id"],
+                ctx["request_model_name"],
+                attempt.provider_name,
+            )
+            return Response(content="", status_code=499)
         response_headers = _copy_upstream_response_headers(upstream_resp.headers)
         raw = upstream_resp.content
         if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
@@ -4617,14 +6449,14 @@ class MessagesPassthroughHandler:
     def _messages_record_success(self, ctx: dict[str, Any], attempt: Any) -> None:
         current_info = ctx["current_info"]
         channel_id = attempt.state["channel_id"]
-        ctx["background_tasks"].add_task(
-            update_channel_stats,
+        _schedule_channel_stats_bounded(
             current_info["request_id"],
             channel_id,
             ctx["request_model_name"],
             current_info["api_key"],
             success=True,
             provider_api_key=attempt.provider_api_key_raw,
+            fallback_background_tasks=ctx["background_tasks"],
         )
         current_info["first_response_time"] = 0
         current_info["success"] = True
@@ -4632,15 +6464,16 @@ class MessagesPassthroughHandler:
 
     def _messages_after_failure(self, attempt: Any, exc: Exception, status_code: int, error_message: Any, ctx: dict[str, Any]) -> None:
         current_info = ctx["current_info"]
+        _record_local_admission_rejection(current_info, exc)
         if attempt.state.get("track_channel_stats"):
-            ctx["background_tasks"].add_task(
-                update_channel_stats,
+            _schedule_channel_stats_bounded(
                 current_info["request_id"],
                 attempt.state["channel_id"],
                 ctx["request_model_name"],
                 current_info["api_key"],
                 success=False,
                 provider_api_key=attempt.provider_api_key_raw,
+                fallback_background_tasks=ctx["background_tasks"],
             )
         request_model, actual_model = _log_model_names(ctx["request_model_name"], attempt.original_model)
         trace_logger.error(
@@ -4822,12 +6655,12 @@ class VideoTaskHandler:
     ) -> httpx.Response:
         async with app.state.client_manager.get_client(upstream_url, proxy) as client:
             if method == "POST":
-                json_payload = await asyncio.to_thread(json.dumps, payload or {})
+                json_payload = await run_json_cpu(json.dumps, payload or {})
                 return await client.post(upstream_url, headers=headers, content=json_payload, timeout=timeout_value)
             if method == "GET":
                 return await client.get(upstream_url, headers=headers, timeout=timeout_value)
             if method == "PUT":
-                json_payload = await asyncio.to_thread(json.dumps, payload or {})
+                json_payload = await run_json_cpu(json.dumps, payload or {})
                 return await client.put(upstream_url, headers=headers, content=json_payload, timeout=timeout_value)
             if method == "DELETE":
                 return await client.delete(upstream_url, headers=headers, timeout=timeout_value)
@@ -4849,14 +6682,14 @@ class VideoTaskHandler:
         current_info["success"] = success
         current_info["provider"] = channel_id if success else None
         current_info["model"] = current_info.get("model") or request_model_name
-        background_tasks.add_task(
-            update_channel_stats,
+        _schedule_channel_stats_bounded(
             current_info["request_id"],
             channel_id,
             request_model_name,
             current_info["api_key"],
             success=success,
             provider_api_key=provider_api_key_raw,
+            fallback_background_tasks=background_tasks,
         )
 
     async def _request_with_fixed_route(
@@ -4922,13 +6755,17 @@ class VideoTaskHandler:
         )
 
         try:
-            upstream_resp = await self._send_upstream(
-                method=upstream_request.method,
-                upstream_url=upstream_url,
-                headers=headers,
-                payload=upstream_request.payload,
-                proxy=proxy,
-                timeout_value=int(timeout_resolution["timeout_value"]),
+            disconnect_event = current_info.get("disconnect_event")
+            upstream_resp = await _await_buffered_upstream_or_disconnect(
+                self._send_upstream(
+                    method=upstream_request.method,
+                    upstream_url=upstream_url,
+                    headers=headers,
+                    payload=upstream_request.payload,
+                    proxy=proxy,
+                    timeout_value=int(timeout_resolution["timeout_value"]),
+                ),
+                disconnect_event,
             )
             raw = upstream_resp.content
             normalized = adapter.normalize_response(
@@ -4953,15 +6790,18 @@ class VideoTaskHandler:
             if success and method == "DELETE":
                 self.task_routes.pop(task_id, None)
             return self._raw_response(upstream_resp, raw, media_type=response_media_type)
-        except Exception:
-            self._mark_result(
-                background_tasks=background_tasks,
-                current_info=current_info,
-                channel_id=channel_id,
-                request_model_name=request_model_name,
-                success=False,
-                provider_api_key_raw=provider_api_key_raw,
-            )
+        except DownstreamDisconnectedDuringWait:
+            return Response(content="", status_code=499)
+        except Exception as exc:
+            if not _record_local_admission_rejection(current_info, exc):
+                self._mark_result(
+                    background_tasks=background_tasks,
+                    current_info=current_info,
+                    channel_id=channel_id,
+                    request_model_name=request_model_name,
+                    success=False,
+                    provider_api_key_raw=provider_api_key_raw,
+                )
             raise
 
     async def create_task(
@@ -5183,14 +7023,20 @@ class VideoTaskHandler:
         payload = upstream_request.payload
         channel_id = attempt.state["channel_id"]
         self._video_log_attempt(attempt, ctx, upstream_request.headers, payload)
-        upstream_resp = await self._send_upstream(
-            method=upstream_request.method,
-            upstream_url=attempt.state["upstream_url"],
-            headers=upstream_request.headers,
-            payload=payload,
-            proxy=attempt.state["proxy"],
-            timeout_value=attempt.state["timeout_value"],
-        )
+        try:
+            upstream_resp = await _await_buffered_upstream_or_disconnect(
+                self._send_upstream(
+                    method=upstream_request.method,
+                    upstream_url=attempt.state["upstream_url"],
+                    headers=upstream_request.headers,
+                    payload=payload,
+                    proxy=attempt.state["proxy"],
+                    timeout_value=attempt.state["timeout_value"],
+                ),
+                ctx["disconnect_event"],
+            )
+        except DownstreamDisconnectedDuringWait:
+            return Response(content="", status_code=499)
         return self._video_response_from_upstream(attempt, ctx, upstream_resp)
 
     def _video_log_attempt(self, attempt: Any, ctx: dict[str, Any], headers: dict[str, str], payload: Optional[dict[str, Any]]) -> None:
@@ -5289,15 +7135,16 @@ class VideoTaskHandler:
 
     def _video_after_failure(self, attempt: Any, exc: Exception, status_code: int, error_message: Any, ctx: dict[str, Any]) -> None:
         current_info = ctx["current_info"]
+        _record_local_admission_rejection(current_info, exc)
         if attempt.state.get("track_channel_stats"):
-            ctx["background_tasks"].add_task(
-                update_channel_stats,
+            _schedule_channel_stats_bounded(
                 current_info["request_id"],
                 attempt.state["channel_id"],
                 ctx["request_model_name"],
                 current_info["api_key"],
                 success=False,
                 provider_api_key=attempt.provider_api_key_raw,
+                fallback_background_tasks=ctx["background_tasks"],
             )
         request_model, actual_model = _log_model_names(ctx["request_model_name"], attempt.original_model)
         trace_logger.error(
@@ -5367,10 +7214,10 @@ class LingjingOpenapiHandler:
             if method == "GET":
                 return await client.get(upstream_url, headers=headers, timeout=timeout_value)
             if method == "POST":
-                json_payload = await asyncio.to_thread(json.dumps, payload or {})
+                json_payload = await run_json_cpu(json.dumps, payload or {})
                 return await client.post(upstream_url, headers=headers, content=json_payload, timeout=timeout_value)
             if method == "PUT":
-                json_payload = await asyncio.to_thread(json.dumps, payload or {})
+                json_payload = await run_json_cpu(json.dumps, payload or {})
                 return await client.put(upstream_url, headers=headers, content=json_payload, timeout=timeout_value)
         raise HTTPException(status_code=405, detail=f"Unsupported method: {method}")
 
@@ -5403,6 +7250,7 @@ class LingjingOpenapiHandler:
         config = app.state.config
         current_info = get_request_info()
         current_info["model"] = current_info.get("model") or request_model_name
+        disconnect_event = current_info.get("disconnect_event") if isinstance(current_info, dict) else None
         request_id = _responses_request_id(current_info)
         request_body_bytes = _request_body_size_bytes(http_request, payload)
 
@@ -5432,6 +7280,7 @@ class LingjingOpenapiHandler:
             "endpoint": endpoint,
             "config": config,
             "current_info": current_info,
+            "disconnect_event": disconnect_event,
             "request_id": request_id,
             "plan": plan,
             "runner": runner,
@@ -5442,6 +7291,7 @@ class LingjingOpenapiHandler:
         return await runner.run(
             lambda attempt: self._lingjing_execute_attempt(attempt, ctx),
             prepare_attempt=lambda attempt: self._lingjing_prepare_attempt(attempt, ctx),
+            before_next_attempt=lambda: self._lingjing_before_next_attempt(ctx),
             after_failure=lambda attempt, exc, status_code, error_message: self._lingjing_after_failure(
                 attempt,
                 exc,
@@ -5459,6 +7309,12 @@ class LingjingOpenapiHandler:
             on_retry=_record_retry_observability,
             on_cooldown=_record_cooldown_observability,
         )
+
+    async def _lingjing_before_next_attempt(self, ctx: dict[str, Any]):
+        disconnect_event = ctx["disconnect_event"]
+        if disconnect_event is not None and disconnect_event.is_set():
+            return Response(content="", status_code=499)
+        return None
 
     async def _lingjing_prepare_attempt(self, attempt: Any, ctx: dict[str, Any]) -> None:
         provider = attempt.provider
@@ -5512,14 +7368,20 @@ class LingjingOpenapiHandler:
         )
         outbound_payload = self._lingjing_outbound_payload(attempt, ctx)
         self._lingjing_log_attempt(attempt, ctx, headers, outbound_payload)
-        upstream_resp = await self._send_upstream(
-            method=ctx["method_upper"],
-            upstream_url=attempt.state["upstream_url"],
-            headers=headers,
-            payload=outbound_payload,
-            proxy=attempt.state["proxy"],
-            timeout_value=attempt.state["timeout_value"],
-        )
+        try:
+            upstream_resp = await _await_buffered_upstream_or_disconnect(
+                self._send_upstream(
+                    method=ctx["method_upper"],
+                    upstream_url=attempt.state["upstream_url"],
+                    headers=headers,
+                    payload=outbound_payload,
+                    proxy=attempt.state["proxy"],
+                    timeout_value=attempt.state["timeout_value"],
+                ),
+                ctx["disconnect_event"],
+            )
+        except DownstreamDisconnectedDuringWait:
+            return Response(content="", status_code=499)
         return self._lingjing_response_from_upstream(attempt, ctx, upstream_resp)
 
     def _lingjing_outbound_payload(self, attempt: Any, ctx: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -5576,14 +7438,14 @@ class LingjingOpenapiHandler:
         current_info["first_response_time"] = 0 if success else -1
         current_info["success"] = success
         current_info["provider"] = channel_id if success else None
-        ctx["background_tasks"].add_task(
-            update_channel_stats,
+        _schedule_channel_stats_bounded(
             current_info["request_id"],
             channel_id,
             ctx["request_model_name"],
             current_info["api_key"],
             success=success,
             provider_api_key=attempt.provider_api_key_raw,
+            fallback_background_tasks=ctx["background_tasks"],
         )
         if success:
             return self._raw_response(upstream_resp)
@@ -5603,15 +7465,16 @@ class LingjingOpenapiHandler:
 
     def _lingjing_after_failure(self, attempt: Any, exc: Exception, status_code: int, error_message: Any, ctx: dict[str, Any]) -> None:
         current_info = ctx["current_info"]
+        _record_local_admission_rejection(current_info, exc)
         if attempt.state.get("track_channel_stats"):
-            ctx["background_tasks"].add_task(
-                update_channel_stats,
+            _schedule_channel_stats_bounded(
                 current_info["request_id"],
                 attempt.state["channel_id"],
                 ctx["request_model_name"],
                 current_info["api_key"],
                 success=False,
                 provider_api_key=attempt.provider_api_key_raw,
+                fallback_background_tasks=ctx["background_tasks"],
             )
         trace_logger.error(
             "%s upstream error status=%s error_type=%s request_id=%s model=%s provider=%s key=%s upstream_url=%s: %s",
@@ -6158,5 +8021,7 @@ if __name__ == '__main__':
         reload_includes=["*.py", "api.yaml"],
         reload_excludes=["./data"],
         ws="none",
+        limit_concurrency=1100,
+        backlog=256,
         # log_level="warning"
     )

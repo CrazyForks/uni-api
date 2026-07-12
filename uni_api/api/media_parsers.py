@@ -7,6 +7,7 @@ from typing import Any, Optional
 from fastapi import HTTPException, Request, UploadFile
 
 from core.models import AudioTranscriptionRequest, ImageEditRequest
+from uni_api.http_content import is_json_media_type
 
 
 def is_form_upload(value: Any) -> bool:
@@ -29,7 +30,7 @@ def form_bool(value: Any, default: bool = False) -> bool:
 
 async def parse_image_edit_request(http_request: Request) -> ImageEditRequest:
     content_type = (http_request.headers.get("content-type") or "").strip().lower()
-    if content_type.startswith("application/json"):
+    if is_json_media_type(content_type):
         try:
             body = await http_request.json()
         except json.JSONDecodeError as exc:

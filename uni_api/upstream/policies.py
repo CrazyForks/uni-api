@@ -52,6 +52,24 @@ class ProviderErrorClassifier:
         )
 
     def normalize_exception(self, exc: Exception) -> tuple[int, str]:
+        # Local admission errors deliberately expose a bounded HTTP outcome.
+        # Recognize the small protocol by attributes to avoid coupling this
+        # policy module back to the client-pool implementation.
+        local_status = getattr(exc, "status_code", None)
+        local_reason = str(getattr(exc, "reason", "") or "").strip()
+        if (
+            bool(getattr(exc, "local_admission_rejection", False))
+            and local_reason
+            and isinstance(local_status, int)
+            and 400 <= local_status <= 599
+        ):
+            return local_status, local_reason
+        if (
+            local_reason
+            and isinstance(local_status, int)
+            and 400 <= local_status <= 599
+        ):
+            return local_status, local_reason
         if isinstance(exc, httpx.ReadTimeout):
             timeout_extensions = getattr(getattr(exc, "request", None), "extensions", {}) or {}
             timeout_value = self.safe_get(timeout_extensions, "timeout", "read", default=-1)

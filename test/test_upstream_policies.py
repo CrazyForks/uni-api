@@ -27,6 +27,20 @@ def test_provider_error_classifier_normalizes_http_and_network_errors():
     assert classifier.remap_status_code(500, "string_above_max_length") == 413
 
 
+def test_provider_error_classifier_preserves_local_upstream_admission_503():
+    classifier = ProviderErrorClassifier(_safe_get)
+
+    class LocalAdmissionError(Exception):
+        status_code = 503
+        reason = "upstream_wait_timeout"
+        local_admission_rejection = True
+
+    assert classifier.normalize_exception(LocalAdmissionError()) == (
+        503,
+        "upstream_wait_timeout",
+    )
+
+
 def test_retry_policy_does_not_retry_missing_persisted_response_item():
     classifier = ProviderErrorClassifier(_safe_get)
     retry_policy = RetryPolicy(classifier, _get_engine)

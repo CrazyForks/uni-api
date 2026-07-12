@@ -249,6 +249,8 @@ class UpstreamAttemptResult:
     response: Any = None
     should_retry: bool = False
     finalize: bool = False
+    local_admission_reason: Optional[str] = None
+    local_admission_retry_after: Optional[int] = None
 
 
 class UpstreamRunner:
@@ -306,6 +308,8 @@ class UpstreamRunner:
         on_retry=None,
         on_cooldown=None,
     ) -> Any:
+        final_local_admission_reason: Optional[str] = None
+        final_local_admission_retry_after: Optional[int] = None
         while True:
             if before_next_attempt is not None:
                 maybe_response = await _maybe_await(before_next_attempt())
@@ -329,6 +333,10 @@ class UpstreamRunner:
                 on_retry=on_retry,
                 on_cooldown=on_cooldown,
             )
+            final_local_admission_reason = result.local_admission_reason
+            final_local_admission_retry_after = (
+                result.local_admission_retry_after
+            )
             if result.should_retry:
                 continue
             if result.finalize:
@@ -337,12 +345,18 @@ class UpstreamRunner:
                 return result.response
 
         if build_final_response is not None:
-            return await _maybe_await(build_final_response(self.plan))
-
-        return JSONResponse(
-            status_code=self.plan.status_code,
-            content={"error": f"All {self.plan.request_model_name} error: {self.plan.error_message}"},
+            response = await _maybe_await(build_final_response(self.plan))
+        else:
+            response = JSONResponse(
+                status_code=self.plan.status_code,
+                content={"error": f"All {self.plan.request_model_name} error: {self.plan.error_message}"},
+            )
+        self._apply_local_admission_headers(
+            response,
+            reason=final_local_admission_reason,
+            retry_after_seconds=final_local_admission_retry_after,
         )
+        return response
 
     async def _run_attempt(
         self,
@@ -416,8 +430,24 @@ class UpstreamRunner:
         status_code, error_message = normalize_provider_exception(exc)
         status_code = remap_status_code_from_error(status_code, error_message)
         self.plan.record_failure(status_code, error_message)
+        local_admission_rejection = bool(
+            getattr(exc, "local_admission_rejection", False)
+        )
+        local_admission_reason = (
+            str(getattr(exc, "reason", "") or "upstream_overload")
+            if local_admission_rejection
+            else None
+        )
+        local_admission_retry_after = (
+            max(1, int(getattr(exc, "retry_after_seconds", 1) or 1))
+            if local_admission_rejection
+            else None
+        )
+        if local_admission_rejection:
+            attempt.state["local_admission_rejected"] = True
+            attempt.state["track_channel_stats"] = False
 
-        if allow_channel_exclusion and not prepare_failure:
+        if allow_channel_exclusion and not prepare_failure and not local_admission_rejection:
             await maybe_exclude_failed_channel(
                 self.plan,
                 attempt.provider_name,
@@ -426,7 +456,7 @@ class UpstreamRunner:
                 debug=self.debug,
             )
 
-        should_cool_key = True
+        should_cool_key = not local_admission_rejection
         force_cool_key = _is_codex_chatgpt_model_unsupported_error(
             status_code,
             error_message,
@@ -434,7 +464,7 @@ class UpstreamRunner:
             self.endpoint,
             attempt.original_model,
         )
-        if should_cool_down is not None:
+        if should_cool_down is not None and not local_admission_rejection:
             should_cool_key = force_cool_key or bool(
                 await _maybe_await(
                     should_cool_down(exc, status_code, error_message, attempt)
@@ -463,24 +493,33 @@ class UpstreamRunner:
                 rollback_rate_limit_errors,
             )
 
-        await maybe_clear_provider_auth_cache(
-            attempt,
-            self.endpoint,
-            status_code,
-            self.clear_provider_auth_cache,
-        )
+        if not local_admission_rejection:
+            await maybe_clear_provider_auth_cache(
+                attempt,
+                self.endpoint,
+                status_code,
+                self.clear_provider_auth_cache,
+            )
 
         if after_failure is not None:
             await _maybe_await(after_failure(attempt, exc, status_code, error_message))
 
         if prepare_failure:
-            if self.plan.auto_retry:
+            if self.plan.auto_retry and not local_admission_rejection:
                 if on_retry is not None:
                     await _maybe_await(on_retry(attempt, status_code, error_message))
-                return UpstreamAttemptResult(should_retry=True)
-            return UpstreamAttemptResult(finalize=True)
+                return UpstreamAttemptResult(
+                    should_retry=True,
+                    local_admission_reason=local_admission_reason,
+                    local_admission_retry_after=local_admission_retry_after,
+                )
+            return UpstreamAttemptResult(
+                finalize=True,
+                local_admission_reason=local_admission_reason,
+                local_admission_retry_after=local_admission_retry_after,
+            )
 
-        if should_retry_provider(
+        if not local_admission_rejection and should_retry_provider(
             self.plan.auto_retry,
             status_code,
             attempt.provider,
@@ -490,7 +529,11 @@ class UpstreamRunner:
         ):
             if on_retry is not None:
                 await _maybe_await(on_retry(attempt, status_code, error_message))
-            return UpstreamAttemptResult(should_retry=True)
+            return UpstreamAttemptResult(
+                should_retry=True,
+                local_admission_reason=local_admission_reason,
+                local_admission_retry_after=local_admission_retry_after,
+            )
 
         if build_error_response is not None:
             response = await _maybe_await(build_error_response(status_code, error_message))
@@ -499,4 +542,27 @@ class UpstreamRunner:
                 status_code=status_code,
                 content={"error": f"Error: Current provider response failed: {error_message}"},
             )
-        return UpstreamAttemptResult(response=response)
+        self._apply_local_admission_headers(
+            response,
+            reason=local_admission_reason,
+            retry_after_seconds=local_admission_retry_after,
+        )
+        return UpstreamAttemptResult(
+            response=response,
+            local_admission_reason=local_admission_reason,
+            local_admission_retry_after=local_admission_retry_after,
+        )
+
+    @staticmethod
+    def _apply_local_admission_headers(
+        response: Any,
+        *,
+        reason: Optional[str],
+        retry_after_seconds: Optional[int],
+    ) -> None:
+        if not reason or not hasattr(response, "headers"):
+            return
+        response.headers["retry-after"] = str(
+            max(1, int(retry_after_seconds or 1))
+        )
+        response.headers["x-uni-api-admission-reason"] = reason

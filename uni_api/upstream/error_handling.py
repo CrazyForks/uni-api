@@ -10,8 +10,12 @@ from fastapi import HTTPException
 
 from core.log_config import logger
 from core.utils import safe_get
+from uni_api.admission.json_parsing import run_json_cpu
 from uni_api.serialization import json
-from uni_api.streaming.cleanup import close_async_iterator_safely
+from uni_api.streaming.cleanup import (
+    await_stream_cleanup_safely,
+    close_async_iterator_safely,
+)
 from uni_api.streaming.sse import is_sse_comment_frame
 
 
@@ -21,7 +25,7 @@ async def ensure_string(item: Any) -> str:
     if isinstance(item, str):
         return item
     if isinstance(item, dict):
-        json_str = await asyncio.to_thread(json.dumps, item)
+        json_str = await run_json_cpu(json.dumps, item)
         return f"data: {json_str}\n\n"
     return str(item)
 
@@ -51,15 +55,31 @@ async def wait_for_timeout(wait_for_thing, timeout=3, wait_task=None):
         first_response_task = wait_task
 
     timeout_task = asyncio.create_task(asyncio.sleep(timeout))
-    done, _pending = await asyncio.wait(
-        [first_response_task, timeout_task],
-        return_when=asyncio.FIRST_COMPLETED,
-    )
+    try:
+        done, _pending = await asyncio.wait(
+            [first_response_task, timeout_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
 
-    if first_response_task in done:
-        timeout_task.cancel()
-        return first_response_task.result(), "success"
-    return first_response_task, "timeout"
+        if first_response_task in done:
+            return first_response_task.result(), "success"
+        # Ownership of the still-running __anext__ task is deliberately
+        # transferred to the caller so the next keepalive interval can reuse
+        # it instead of issuing a concurrent anext().
+        return first_response_task, "timeout"
+    except BaseException:
+        await _cancel_pending_task_safely(
+            first_response_task,
+            "first-response",
+            "wait_for_timeout cancellation",
+        )
+        raise
+    finally:
+        await _cancel_pending_task_safely(
+            timeout_task,
+            "timeout",
+            "wait_for_timeout completion",
+        )
 
 
 async def _close_async_iterator_safely(iterator, channel_id, reason):
@@ -70,12 +90,18 @@ async def _close_async_iterator_safely(iterator, channel_id, reason):
 
 
 async def _cancel_pending_task_safely(task, channel_id, reason):
-    if task is None or not hasattr(task, "cancel") or not hasattr(task, "done") or task.done():
+    if task is None or not hasattr(task, "cancel") or not hasattr(task, "done"):
         return
-
-    task.cancel()
+    if not task.done():
+        task.cancel()
+    await await_stream_cleanup_safely(
+        task,
+        label=f"provider: {channel_id} pending task during {reason}",
+    )
+    if not task.done():
+        return
     try:
-        await asyncio.shield(task)
+        task.result()
     except asyncio.CancelledError:
         return
     except BaseException as exc:
@@ -165,16 +191,21 @@ async def error_handling_wrapper(
                             wait_task = None
                     except asyncio.CancelledError:
                         logger.debug("provider: %-11s Stream cancelled by client in main loop", channel_id)
-                        break
-                    except Exception:
-                        break
+                        raise
+                    except Exception as exc:
+                        logger.error(
+                            "provider: %-11s Stream failed in keepalive loop: %s",
+                            channel_id,
+                            exc,
+                        )
+                        raise
             else:
                 try:
                     async for item in generator:
                         yield await ensure_string(item)
                 except asyncio.CancelledError:
                     logger.debug("provider: %-11s Stream cancelled by client", channel_id)
-                    return
+                    raise
                 except (
                     httpx.ReadError,
                     httpx.RemoteProtocolError,
@@ -184,8 +215,7 @@ async def error_handling_wrapper(
                     h2.exceptions.ProtocolError,
                 ) as exc:
                     logger.error("provider: %-11s Network error in new_generator: %s", channel_id, exc)
-                    yield "data: [DONE]\n\n"
-                    return
+                    raise
         finally:
             await _cancel_pending_task_safely(wait_task, channel_id, "error_handling_wrapper")
             await _close_async_iterator_safely(generator, channel_id, "error_handling_wrapper")
@@ -234,7 +264,7 @@ async def error_handling_wrapper(
                 logger.error("provider: %-11s error const string: %s", channel_id, encode_first_item_str)
                 raise StopAsyncIteration
             try:
-                first_item_str = await asyncio.to_thread(json.loads, first_item_str)
+                first_item_str = await run_json_cpu(json.loads, first_item_str)
             except json.JSONDecodeError:
                 logger.error("provider: %-11s error_handling_wrapper JSONDecodeError! %r", channel_id, first_item_str)
                 raise StopAsyncIteration

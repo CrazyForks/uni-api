@@ -23,6 +23,10 @@ class _DummyStreamingResponse:
         for chunk in self._chunks:
             yield chunk
 
+    async def aiter_bytes(self):
+        for chunk in self._chunks:
+            yield chunk.encode("utf-8") if isinstance(chunk, str) else chunk
+
 
 class _DummyStreamContext:
     def __init__(self, response):

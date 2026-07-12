@@ -9,7 +9,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import main
 from fastapi import BackgroundTasks
 from fastapi import HTTPException
-from starlette.responses import Response
+from starlette.responses import Response, StreamingResponse
 from core.models import RequestModel
 from routing import RoutingPlan, build_api_key_models_map, get_right_order_providers
 
@@ -385,6 +385,97 @@ def test_model_request_handler_passes_selected_provider_key(monkeypatch):
             BackgroundTasks(),
         )
         assert response.status_code == 200
+
+    asyncio.run(run_test())
+
+
+def test_model_request_same_turn_disconnect_closes_completed_stream_result(
+    monkeypatch,
+):
+    provider_name = "provider-a"
+    disconnect_event = asyncio.Event()
+    body_closed = False
+
+    class DummyCircularList:
+        async def is_all_rate_limited(self, model):
+            return False
+
+        async def next(self, model):
+            return "provider-key-1"
+
+        def get_items_count(self):
+            return 1
+
+    async def fake_get_right_order_providers(*_args, **_kwargs):
+        return [
+            {
+                "provider": provider_name,
+                "_model_dict_cache": {"gpt-4.1": "gpt-4.1"},
+                "base_url": "https://example.com/v1/chat/completions",
+                "api": ["provider-key-1"],
+                "preferences": {},
+            }
+        ]
+
+    class Body:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await asyncio.Event().wait()
+
+        async def aclose(self):
+            nonlocal body_closed
+            body_closed = True
+
+    async def fake_process_request(*_args, **_kwargs):
+        # Make process_task and disconnect_task ready in the same event-loop
+        # turn.  Disconnect must own the result-transfer race.
+        disconnect_event.set()
+        return StreamingResponse(Body(), media_type="text/event-stream")
+
+    monkeypatch.setitem(
+        main.provider_api_circular_list,
+        provider_name,
+        DummyCircularList(),
+    )
+    monkeypatch.setattr(
+        main,
+        "get_right_order_providers",
+        fake_get_right_order_providers,
+    )
+    monkeypatch.setattr(main, "process_request", fake_process_request)
+
+    main.app.state.config = {
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["gpt-4.1"],
+                "preferences": {"AUTO_RETRY": False},
+            }
+        ]
+    }
+    main.app.state.provider_timeouts = {"global": {"default": 30}}
+    main.app.state.keepalive_interval = {"global": {"default": 99999}}
+
+    async def run_test():
+        handler = main.ModelRequestHandler()
+        response = await handler.request_model(
+            RequestModel(
+                model="gpt-4.1",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=True,
+            ),
+            0,
+            BackgroundTasks(),
+            current_info={
+                "request_id": "same-turn-disconnect",
+                "api_key": "sk-test",
+                "disconnect_event": disconnect_event,
+            },
+        )
+        assert response.status_code == 499
+        assert body_closed is True
 
     asyncio.run(run_test())
 

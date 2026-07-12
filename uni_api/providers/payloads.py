@@ -37,9 +37,14 @@ from core.utils import (
     get_engine,
     get_model_dict,
     get_text_message,
-    get_image_message,
 )
+from uni_api.providers.image_inputs import build_image_message
+from uni_api.providers.normalization import GEMINI_THOUGHT_SIGNATURE_MAX_BYTES
 from uni_api.providers.overrides import apply_post_body_parameter_overrides
+from uni_api.admission import AdmissionRejected, get_request_admission_lease
+from uni_api.admission.json_memory import JSONMemoryComplexityError
+from uni_api.admission.json_parsing import parse_owned_json_value, run_json_cpu
+from uni_api.upstream.response_limits import read_limited_response_body
 
 gemini_max_token_65k_models = ["gemini-3-pro", "gemini-2.5-pro", "gemini-2.0-pro", "gemini-2.0-flash-thinking", "gemini-2.5-flash"]
 CODEX_CLI_VERSION = "0.144.0"
@@ -56,7 +61,10 @@ def force_codex_client_headers(headers: dict) -> dict:
 def _decode_gemini_thought_signature_from_tool_call_id(tool_call_id: str | None) -> str | None:
     if not tool_call_id or not tool_call_id.startswith("call_"):
         return None
-    encoded = tool_call_id.removeprefix("call_")
+    max_encoded_bytes = ((GEMINI_THOUGHT_SIGNATURE_MAX_BYTES + 2) // 3) * 4
+    if len(tool_call_id) > len("call_") + max_encoded_bytes + 33:
+        return None
+    encoded = tool_call_id[len("call_") :]
     # Allow a nonce suffix (call_<b64url(thoughtSignature)>.<nonce>) to keep tool_call_id unique.
     # Only the first segment encodes the thoughtSignature.
     if "." in encoded:
@@ -65,7 +73,10 @@ def _decode_gemini_thought_signature_from_tool_call_id(tool_call_id: str | None)
         return None
     padded = encoded + ("=" * ((4 - (len(encoded) % 4)) % 4))
     try:
-        return base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
+        if len(decoded) > GEMINI_THOUGHT_SIGNATURE_MAX_BYTES:
+            return None
+        return decoded.decode("utf-8")
     except Exception:
         return None
 
@@ -391,7 +402,7 @@ async def _build_gemini_content_parts(msg, engine: str, provider: dict) -> list[
                 text_message.update(_get_extra_fields(item))
                 content.append(text_message)
             elif item.type == "image_url" and provider.get("image", True):
-                image_message = await get_image_message(item.image_url.url, engine)
+                image_message = await build_image_message(item.image_url.url, engine)
                 image_message.update(_get_extra_fields(item))
                 content.append(image_message)
             elif item.type == "input_audio":
@@ -408,14 +419,44 @@ async def _build_gemini_content_parts(msg, engine: str, provider: dict) -> list[
     return None
 
 
-def _gemini_function_call_part(tool_call) -> dict:
+async def _parse_tool_call_arguments(tool_call) -> object:
+    owner = None
     try:
-        args = json.loads(tool_call.function.arguments)
-    except Exception as e:
+        owner = await parse_owned_json_value(tool_call.function.arguments)
+        args = owner.value
+        reservation = owner.take_reservation()
+        if reservation is not None:
+            try:
+                # The parsed graph is inserted into the upstream payload and
+                # can outlive this helper.  Transfer its exact charge to the
+                # request lease before returning the escaping object.
+                await reservation.commit()
+            except BaseException:
+                await reservation.release()
+                raise
+        return args
+    except AdmissionRejected:
+        raise
+    except JSONMemoryComplexityError as e:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"tool_call arguments for '{tool_call.function.name}' "
+                f"exceed the local JSON complexity limit: {e}"
+            ),
+        ) from e
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
         raise HTTPException(
             status_code=400,
             detail=f"Invalid tool_call arguments for '{tool_call.function.name}': {e}",
         ) from e
+    finally:
+        if owner is not None:
+            await owner.aclose()
+
+
+async def _gemini_function_call_part(tool_call) -> dict:
+    args = await _parse_tool_call_arguments(tool_call)
     function_arguments = {
         "functionCall": {
             "name": tool_call.function.name,
@@ -478,7 +519,7 @@ async def _build_gemini_messages(
                 parts.extend(content)
             for tool_call in tool_calls:
                 tool_call_id_to_function_name[tool_call.id] = tool_call.function.name
-                parts.append(_gemini_function_call_part(tool_call))
+                parts.append(await _gemini_function_call_part(tool_call))
             messages.append({"role": "model", "parts": parts})
         elif role == "tool":
             tool_call_id = getattr(msg, "tool_call_id", None)
@@ -720,19 +761,84 @@ def create_jwt(client_email, private_key):
     return b'.'.join(segments).decode()
 
 async def get_access_token(client_email, private_key):
-    jwt = await asyncio.to_thread(create_jwt, client_email, private_key)
-
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            "https://oauth2.googleapis.com/token",
-            data={
-                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-                "assertion": jwt
-            },
-            headers={'Content-Type': "application/x-www-form-urlencoded"}
-        )
-        response.raise_for_status()
-        return response.json()["access_token"]
+    jwt = await run_json_cpu(create_jwt, client_email, private_key)
+    request_lease = get_request_admission_lease()
+    wire_reservation = (
+        await request_lease.reserve_temporary_response_bytes(0)
+        if request_lease is not None
+        else None
+    )
+    owner = None
+    persistent_reservation = None
+    limited = None
+    payload = None
+    access_token = None
+    try:
+        async with httpx.AsyncClient(
+            headers={"Accept-Encoding": "identity"},
+        ) as client:
+            async with asyncio.timeout(30):
+                async with client.stream(
+                    "POST",
+                    "https://oauth2.googleapis.com/token",
+                    data={
+                        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                        "assertion": jwt,
+                    },
+                    headers={
+                        "Content-Type": "application/x-www-form-urlencoded"
+                    },
+                    timeout=httpx.Timeout(30.0),
+                ) as response:
+                    if response.status_code < 200 or response.status_code >= 300:
+                        raise HTTPException(
+                            status_code=502,
+                            detail="OAuth token endpoint rejected the request",
+                        )
+                    limited = await read_limited_response_body(
+                        response,
+                        max_bytes=256 * 1024,
+                        reserve_bytes=(
+                            wire_reservation.reserve
+                            if wire_reservation is not None
+                            else None
+                        ),
+                        reservation_multiplier=4,
+                    )
+        if limited.truncated:
+            raise HTTPException(
+                status_code=502,
+                detail="OAuth token response is too large",
+            )
+        owner = await parse_owned_json_value(limited.body)
+        payload = owner.value
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=502, detail="Invalid OAuth token response")
+        access_token = payload.get("access_token")
+        if (
+            not isinstance(access_token, str)
+            or not access_token
+            or len(access_token) > 16 * 1024
+        ):
+            raise HTTPException(status_code=502, detail="Invalid OAuth access token")
+        persistent_reservation = owner.take_reservation()
+        if persistent_reservation is not None:
+            await persistent_reservation.commit()
+        return access_token
+    finally:
+        payload = None
+        access_token = None
+        limited = None
+        try:
+            if owner is not None:
+                await owner.aclose()
+        finally:
+            try:
+                if wire_reservation is not None:
+                    await wire_reservation.release()
+            finally:
+                if persistent_reservation is not None:
+                    await persistent_reservation.release()
 
 async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
     headers = {
@@ -967,7 +1073,7 @@ async def get_vertex_claude_payload(request, engine, provider, api_key=None):
                     text_message.update(_get_extra_fields(item))
                     content.append(text_message)
                 elif item.type == "image_url" and provider.get("image", True):
-                    image_message = await get_image_message(item.image_url.url, engine)
+                    image_message = await build_image_message(item.image_url.url, engine)
                     image_message.update(_get_extra_fields(item))
                     content.append(image_message)
         else:
@@ -983,7 +1089,7 @@ async def get_vertex_claude_payload(request, engine, provider, api_key=None):
                 "type": "tool_use",
                 "id": tool_call.id,
                 "name": tool_call.function.name,
-                "input": json.loads(tool_call.function.arguments),
+                "input": await _parse_tool_call_arguments(tool_call),
             })
             messages.append({"role": msg.role, "content": tool_calls_list})
         elif tool_call_id:
@@ -1174,7 +1280,7 @@ async def get_aws_payload(request, engine, provider, api_key=None):
                     text_message.update(_get_extra_fields(item))
                     content.append(text_message)
                 elif item.type == "image_url" and provider.get("image", True):
-                    image_message = await get_image_message(item.image_url.url, engine)
+                    image_message = await build_image_message(item.image_url.url, engine)
                     image_message.update(_get_extra_fields(item))
                     content.append(image_message)
         else:
@@ -1190,7 +1296,7 @@ async def get_aws_payload(request, engine, provider, api_key=None):
                 "type": "tool_use",
                 "id": tool_call.id,
                 "name": tool_call.function.name,
-                "input": json.loads(tool_call.function.arguments),
+                "input": await _parse_tool_call_arguments(tool_call),
             })
             messages.append({"role": msg.role, "content": tool_calls_list})
         elif tool_call_id:
@@ -1305,7 +1411,7 @@ async def get_aws_payload(request, engine, provider, api_key=None):
 
     if provider.get("aws_access_key") and provider.get("aws_secret_key"):
         ACCEPT_HEADER = "application/vnd.amazon.bedrock.payload+json" # 指定接受 Bedrock 流格式
-        amz_date, payload_hash, authorization_header = await asyncio.to_thread(
+        amz_date, payload_hash, authorization_header = await run_json_cpu(
             get_signature, payload, original_model, provider.get("aws_access_key"), provider.get("aws_secret_key"), AWS_REGION, HOST, CONTENT_TYPE, ACCEPT_HEADER
         )
         headers = {
@@ -1349,7 +1455,7 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
                     text_message.update(_get_extra_fields(item))
                     content.append(text_message)
                 elif item.type == "image_url" and provider.get("image", True):
-                    image_message = await get_image_message(item.image_url.url, engine)
+                    image_message = await build_image_message(item.image_url.url, engine)
                     if use_responses_api:
                         image_message = {
                             "type": "input_image",
@@ -1586,6 +1692,7 @@ def _codex_system_messages_to_instructions(request: RequestModel) -> str:
 
 _CODEX_EMPTY_TOOL_NAME_INFERENCE_LIMIT = 64
 _CODEX_TOOL_ARGUMENTS_INFERENCE_MAX_BYTES = 64 * 1024
+_CODEX_TOOL_ARGUMENTS_INFERENCE_MAX_ESTIMATED_BYTES = 8 * 1024 * 1024
 
 
 def _codex_tool_parameter_schema_index(request: RequestModel) -> list[dict]:
@@ -1613,44 +1720,65 @@ def _codex_tool_parameter_schema_index(request: RequestModel) -> list[dict]:
     return tools
 
 
-def _codex_tool_argument_keys(arguments) -> tuple[set[str] | None, str | None]:
+async def _infer_codex_tool_call_name_from_arguments(
+    tool_schema_index: list[dict],
+    arguments,
+) -> tuple[str | None, str | None]:
     if arguments is None:
         return None, "arguments is missing"
     raw = str(arguments)
     if not raw.strip():
         return None, "arguments is empty"
+    if len(raw) > _CODEX_TOOL_ARGUMENTS_INFERENCE_MAX_BYTES:
+        return None, "arguments is too large to infer safely"
     if len(raw.encode("utf-8")) > _CODEX_TOOL_ARGUMENTS_INFERENCE_MAX_BYTES:
         return None, "arguments is too large to infer safely"
+
+    owner = None
+    parsed = None
+    argument_keys = None
+    matches = None
     try:
-        parsed = json.loads(raw)
+        owner = await parse_owned_json_value(
+            raw,
+            max_estimated_bytes=(
+                _CODEX_TOOL_ARGUMENTS_INFERENCE_MAX_ESTIMATED_BYTES
+            ),
+        )
+        parsed = owner.value
+        if not isinstance(parsed, dict):
+            return None, "arguments is not a JSON object"
+        argument_keys = set(parsed.keys())
+        matches = [
+            item["name"]
+            for item in tool_schema_index
+            if argument_keys.issubset(item["properties"])
+            and item["required"].issubset(argument_keys)
+        ]
+        if len(matches) == 1:
+            return matches[0], None
+        if not matches:
+            return None, "arguments do not match any declared tool schema"
+        return None, "arguments match multiple declared tool schemas"
+    except AdmissionRejected:
+        raise
+    except JSONMemoryComplexityError:
+        return None, "arguments is too complex to infer safely"
     except Exception:
         return None, "arguments is not valid JSON"
-    if not isinstance(parsed, dict):
-        return None, "arguments is not a JSON object"
-    return set(str(key) for key in parsed.keys()), None
+    finally:
+        matches = None
+        argument_keys = None
+        parsed = None
+        raw = None
+        if owner is not None:
+            await owner.aclose()
 
 
-def _infer_codex_tool_call_name_from_arguments(
-    tool_schema_index: list[dict],
-    arguments,
-) -> tuple[str | None, str | None]:
-    argument_keys, reason = _codex_tool_argument_keys(arguments)
-    if argument_keys is None:
-        return None, reason
-
-    matches = [
-        item["name"]
-        for item in tool_schema_index
-        if argument_keys.issubset(item["properties"]) and item["required"].issubset(argument_keys)
-    ]
-    if len(matches) == 1:
-        return matches[0], None
-    if not matches:
-        return None, "arguments do not match any declared tool schema"
-    return None, "arguments match multiple declared tool schemas"
-
-
-def _codex_chat_messages_to_responses_input(request: RequestModel, provider: dict) -> list[dict]:
+async def _codex_chat_messages_to_responses_input(
+    request: RequestModel,
+    provider: dict,
+) -> list[dict]:
     input_items: list[dict] = []
     tool_schema_index: list[dict] | None = None
     inferred_empty_tool_name_count = 0
@@ -1746,7 +1874,7 @@ def _codex_chat_messages_to_responses_input(request: RequestModel, provider: dic
                         )
                     if tool_schema_index is None:
                         tool_schema_index = _codex_tool_parameter_schema_index(request)
-                    function_name, reason = _infer_codex_tool_call_name_from_arguments(
+                    function_name, reason = await _infer_codex_tool_call_name_from_arguments(
                         tool_schema_index,
                         getattr(func, "arguments", None),
                     )
@@ -1786,7 +1914,7 @@ async def get_codex_payload(request, engine, provider, api_key=None):
     payload: dict = {
         "model": original_model,
         "instructions": _codex_system_messages_to_instructions(request),
-        "input": _codex_chat_messages_to_responses_input(request, provider),
+        "input": await _codex_chat_messages_to_responses_input(request, provider),
         # CLIProxyAPI defaults that Codex commonly expects.
         "parallel_tool_calls": True,
         "reasoning": {"effort": reasoning_effort, "summary": "auto"},
@@ -1903,7 +2031,7 @@ async def get_azure_payload(request, engine, provider, api_key=None):
                     text_message.update(_get_extra_fields(item))
                     content.append(text_message)
                 elif item.type == "image_url" and provider.get("image", True):
-                    image_message = await get_image_message(item.image_url.url, engine)
+                    image_message = await build_image_message(item.image_url.url, engine)
                     image_message.update(_get_extra_fields(item))
                     content.append(image_message)
                 elif item.type == "input_audio":
@@ -1988,7 +2116,7 @@ async def get_azure_databricks_payload(request, engine, provider, api_key=None):
                     text_message.update(_get_extra_fields(item))
                     content.append(text_message)
                 elif item.type == "image_url" and provider.get("image", True):
-                    image_message = await get_image_message(item.image_url.url, engine)
+                    image_message = await build_image_message(item.image_url.url, engine)
                     image_message.update(_get_extra_fields(item))
                     content.append(image_message)
                 elif item.type == "input_audio":
@@ -2115,7 +2243,7 @@ async def get_openrouter_payload(request, engine, provider, api_key=None):
                     text_message.update(_get_extra_fields(item))
                     content.append(text_message)
                 elif item.type == "image_url" and provider.get("image", True):
-                    image_message = await get_image_message(item.image_url.url, engine)
+                    image_message = await build_image_message(item.image_url.url, engine)
                     image_message.update(_get_extra_fields(item))
                     content.append(image_message)
                 elif item.type == "input_audio":
@@ -2153,7 +2281,7 @@ async def get_openrouter_payload(request, engine, provider, api_key=None):
                         msg_dict.update(_get_extra_fields(msg))
                         messages.append(msg_dict)
                     elif item["type"] == "image_url":
-                        messages.append({"role": msg.role, "content": [await get_image_message(item["image_url"]["url"], engine)]})
+                        messages.append({"role": msg.role, "content": [await build_image_message(item["image_url"]["url"], engine)]})
                     elif item["type"] == "input_audio":
                         messages.append({"role": msg.role, "content": [item]})
             else:
@@ -2390,7 +2518,7 @@ async def get_claude_payload(request, engine, provider, api_key=None):
                     text_message.update(_get_extra_fields(item))
                     content.append(text_message)
                 elif item.type == "image_url" and provider.get("image", True):
-                    image_message = await get_image_message(item.image_url.url, engine)
+                    image_message = await build_image_message(item.image_url.url, engine)
                     image_message.update(_get_extra_fields(item))
                     content.append(image_message)
         else:
@@ -2406,7 +2534,7 @@ async def get_claude_payload(request, engine, provider, api_key=None):
                 "type": "tool_use",
                 "id": tool_call.id,
                 "name": tool_call.function.name,
-                "input": json.loads(tool_call.function.arguments),
+                "input": await _parse_tool_call_arguments(tool_call),
             })
             messages.append({"role": msg.role, "content": tool_calls_list})
         elif tool_call_id:
@@ -2580,28 +2708,118 @@ async def get_dalle_payload(request, engine, provider, api_key=None, endpoint=No
 
 async def get_upload_certificate(client: httpx.AsyncClient, api_key: str, model: str) -> dict:
     """第一步：获取文件上传凭证"""
-    # print("步骤 1: 正在获取上传凭证...")
     headers = {"Authorization": f"Bearer {api_key}"}
     params = {"action": "getPolicy", "model": model}
+    request_lease = get_request_admission_lease()
+    wire_reservation = (
+        await request_lease.reserve_temporary_response_bytes(0)
+        if request_lease is not None
+        else None
+    )
+    owner = None
+    persistent_reservation = None
+    limited = None
+    response_json = None
+    raw_certificate = None
+    certificate = None
+    value = None
+    upload_host = None
+    parsed_host = None
     try:
-        response = await client.get("https://dashscope.aliyuncs.com/api/v1/uploads", headers=headers, params=params)
-        response.raise_for_status()  # 如果请求失败则抛出异常
-        cert_data = response.json()
-        # print("凭证获取成功。")
-        return cert_data.get("data")
-    except httpx.HTTPStatusError as e:
-        print(f"获取凭证失败: HTTP {e.response.status_code}")
-        print(f"响应内容: {e.response.text}")
+        async with asyncio.timeout(30):
+            async with client.stream(
+                "GET",
+                "https://dashscope.aliyuncs.com/api/v1/uploads",
+                headers=headers,
+                params=params,
+                timeout=httpx.Timeout(30.0),
+            ) as response:
+                if response.status_code < 200 or response.status_code >= 300:
+                    return None
+                limited = await read_limited_response_body(
+                    response,
+                    max_bytes=256 * 1024,
+                    reserve_bytes=(
+                        wire_reservation.reserve
+                        if wire_reservation is not None
+                        else None
+                    ),
+                    reservation_multiplier=4,
+                )
+        if limited.truncated:
+            return None
+        owner = await parse_owned_json_value(limited.body)
+        response_json = owner.value
+        if not isinstance(response_json, dict):
+            return None
+        raw_certificate = response_json.get("data")
+        if not isinstance(raw_certificate, dict):
+            return None
+        limits = {
+            "upload_host": 2048,
+            "upload_dir": 1024,
+            "policy": 64 * 1024,
+            "oss_access_key_id": 4096,
+            "signature": 64 * 1024,
+            "x_oss_object_acl": 256,
+            "x_oss_forbid_overwrite": 256,
+        }
+        certificate = {}
+        for key, limit in limits.items():
+            value = raw_certificate.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, str) or len(value) > limit:
+                return None
+            certificate[key] = value
+        upload_host = certificate.get("upload_host")
+        parsed_host = urlparse(upload_host or "")
+        if parsed_host.scheme not in {"http", "https"} or not parsed_host.netloc:
+            return None
+        persistent_reservation = owner.take_reservation()
+        if persistent_reservation is not None:
+            await persistent_reservation.commit()
+        return certificate
+    except (asyncio.TimeoutError, httpx.HTTPError, ValueError):
         return None
-    except Exception as e:
-        print(f"获取凭证时发生未知错误: {e}")
-        return None
+    finally:
+        value = None
+        upload_host = None
+        parsed_host = None
+        raw_certificate = None
+        response_json = None
+        certificate = None
+        limited = None
+        try:
+            if owner is not None:
+                await owner.aclose()
+        finally:
+            try:
+                if wire_reservation is not None:
+                    await wire_reservation.release()
+            finally:
+                if persistent_reservation is not None:
+                    await persistent_reservation.release()
 
 async def upload_file_to_oss(client: httpx.AsyncClient, certificate: dict, file: Tuple[str, IOBase, str]) -> str:
     """第二步：使用凭证将文件内容上传到OSS"""
     upload_host = certificate.get("upload_host")
     upload_dir = certificate.get("upload_dir")
-    object_key = f"{upload_dir}/{file[0]}"
+    filename = str(file[0] or "")
+    if (
+        not isinstance(upload_host, str)
+        or not isinstance(upload_dir, str)
+        or not upload_host
+        or not upload_dir
+        or len(upload_host) > 2048
+        or len(upload_dir) > 1024
+        or len(filename) > 512
+    ):
+        return None
+    parsed_host = urlparse(upload_host)
+    if parsed_host.scheme not in {"http", "https"} or not parsed_host.netloc:
+        return None
+    object_key = f"{upload_dir}/{filename}"
 
     form_data = {
         "key": object_key,
@@ -2616,18 +2834,18 @@ async def upload_file_to_oss(client: httpx.AsyncClient, certificate: dict, file:
     files = {"file": file}
 
     try:
-        response = await client.post(upload_host, data=form_data, files=files, timeout=3600)
-        response.raise_for_status()
-        # print("文件上传成功！")
-        oss_url = f"oss://{object_key}"
-        # print(f"文件OSS URL: {oss_url}")
-        return oss_url
-    except httpx.HTTPStatusError as e:
-        print(f"上传文件失败: HTTP {e.response.status_code}")
-        print(f"响应内容: {e.response.text}")
-        return None
-    except Exception as e:
-        print(f"上传文件时发生未知错误: {e}")
+        async with asyncio.timeout(3600):
+            async with client.stream(
+                "POST",
+                upload_host,
+                data=form_data,
+                files=files,
+                timeout=httpx.Timeout(3600.0),
+            ) as response:
+                if response.status_code < 200 or response.status_code >= 300:
+                    return None
+        return f"oss://{object_key}"
+    except (asyncio.TimeoutError, httpx.HTTPError, ValueError):
         return None
 
 async def get_whisper_payload(request, engine, provider, api_key=None):
@@ -2640,13 +2858,25 @@ async def get_whisper_payload(request, engine, provider, api_key=None):
     url = BaseAPI(url).audio_transcriptions
 
     if "dashscope.aliyuncs.com" in url:
-        client = httpx.AsyncClient()
-        certificate = await get_upload_certificate(client, api_key, original_model)
-        if not certificate:
-            return
+        async with httpx.AsyncClient(
+            headers={"Accept-Encoding": "identity"},
+        ) as client:
+            certificate = await get_upload_certificate(
+                client,
+                api_key,
+                original_model,
+            )
+            if not certificate:
+                return
 
-        # 步骤 2: 上传文件
-        oss_url = await upload_file_to_oss(client, certificate, request.file)
+            # 步骤 2: 上传文件
+            oss_url = await upload_file_to_oss(
+                client,
+                certificate,
+                request.file,
+            )
+        if not oss_url:
+            return
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",

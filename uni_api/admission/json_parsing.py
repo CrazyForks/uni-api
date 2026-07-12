@@ -1,0 +1,243 @@
+from __future__ import annotations
+
+import asyncio
+import os
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+from typing import Any
+
+from uni_api.admission.core import get_request_admission_lease
+from uni_api.admission.json_memory import (
+    JSONMemoryComplexityError,
+    estimate_json_memory_bytes,
+    estimate_json_text_memory_bytes,
+)
+from uni_api.serialization import json
+
+
+DEFAULT_JSON_PARSE_MAX_ESTIMATED_BYTES = 64 * 1024 * 1024
+_JSON_PARSE_OFFLOAD_THRESHOLD_BYTES = 64 * 1024
+try:
+    JSON_PARSE_CPU_WORKERS = max(
+        1,
+        int(os.getenv("JSON_PARSE_CPU_WORKERS", "4") or "4"),
+    )
+except (TypeError, ValueError):
+    JSON_PARSE_CPU_WORKERS = 4
+_JSON_PARSE_CPU_EXECUTOR = ThreadPoolExecutor(
+    max_workers=JSON_PARSE_CPU_WORKERS,
+    thread_name_prefix="uni-api-json",
+)
+
+
+async def _finish_owner_cleanup_despite_cancellation(task: asyncio.Task[Any]) -> None:
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    task.result()
+
+
+async def run_json_cpu(callback, *args, **kwargs):
+    """Run bounded JSON CPU work without releasing ownership on cancellation."""
+
+    loop = asyncio.get_running_loop()
+
+    def invoke():
+        return callback(*args, **kwargs)
+
+    future = loop.run_in_executor(_JSON_PARSE_CPU_EXECUTOR, invoke)
+    pending_cancel: asyncio.CancelledError | None = None
+    owner_task = asyncio.current_task()
+    while not future.done():
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError as exc:
+            pending_cancel = pending_cancel or exc
+        except BaseException:
+            if pending_cancel is None and owner_task is not None and owner_task.cancelling():
+                pending_cancel = asyncio.CancelledError()
+            if pending_cancel is None:
+                raise
+            break
+    if pending_cancel is None and owner_task is not None and owner_task.cancelling():
+        pending_cancel = asyncio.CancelledError()
+    if pending_cancel is not None:
+        # Once task cancellation has been observed it remains the externally
+        # correct outcome.  We still wait for the worker to stop allocating,
+        # but a later parse/encode exception must not be misclassified as an
+        # upstream protocol failure or trigger provider cooldown.
+        try:
+            future.result()
+        except BaseException:
+            pass
+        raise pending_cancel
+    return future.result()
+
+
+class OwnedJSONValue:
+    """A materialized JSON graph coupled to its exact admission ownership."""
+
+    def __init__(self, value: Any, reservation: Any | None) -> None:
+        self._value = value
+        self._reservation = reservation
+        self._reservation_transferred = False
+        self._closed = False
+        self._closing = False
+        self._lock = asyncio.Lock()
+        self._close_task: asyncio.Task[None] | None = None
+
+    @property
+    def value(self) -> Any:
+        if self._closed or self._closing:
+            raise RuntimeError("owned JSON value is closed")
+        return self._value
+
+    def take_reservation(self):
+        """Atomically transfer the live graph charge exactly once.
+
+        This operation deliberately contains no await point.  State either
+        remains attached to this owner or the caller synchronously receives
+        the token; task cancellation cannot strand it between those states.
+        """
+
+        if self._closed or self._closing:
+            raise RuntimeError("owned JSON value is closed")
+        if self._reservation_transferred:
+            raise RuntimeError("owned JSON reservation was already transferred")
+        reservation = self._reservation
+        self._reservation = None
+        self._reservation_transferred = True
+        return reservation
+
+    async def aclose(self) -> None:
+        if self._close_task is None:
+            # Establish exact-once cleanup synchronously, before cancellation
+            # can strike the first lock acquisition.
+            self._closing = True
+            self._close_task = asyncio.create_task(self._close_once())
+        close_task = self._close_task
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError:
+            await _finish_owner_cleanup_despite_cancellation(close_task)
+            raise
+
+    async def _close_once(self) -> None:
+        async with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            # Drop our graph reference before returning the corresponding
+            # memory charge.  Consumers must likewise clear aliases before
+            # closing or explicitly transfer the reservation.
+            self._value = None
+            reservation = self._reservation
+            self._reservation = None
+        if reservation is not None:
+            await reservation.release()
+
+    async def __aenter__(self) -> OwnedJSONValue:
+        if self._closed or self._closing:
+            raise RuntimeError("owned JSON value is closed")
+        return self
+
+    async def __aexit__(self, *_exc_info: object) -> None:
+        await self.aclose()
+
+
+async def parse_owned_json_value(
+    payload: str | bytes | bytearray | memoryview,
+    *,
+    max_estimated_bytes: int = DEFAULT_JSON_PARSE_MAX_ESTIMATED_BYTES,
+    allow_invalid: bool = False,
+) -> OwnedJSONValue:
+    """Parse untrusted JSON and return explicit, transferable ownership."""
+
+    payload_is_memoryview = isinstance(payload, memoryview)
+    offload = (
+        len(payload) >= _JSON_PARSE_OFFLOAD_THRESHOLD_BYTES // 4
+        if isinstance(payload, str)
+        else len(payload) >= _JSON_PARSE_OFFLOAD_THRESHOLD_BYTES
+    )
+    if isinstance(payload, str):
+        estimate = (
+            await run_json_cpu(
+                estimate_json_text_memory_bytes,
+                payload,
+                raw_memory_multiplier=4,
+                token_memory_bytes=128,
+                max_estimated_bytes=max_estimated_bytes,
+            )
+            if offload
+            else estimate_json_text_memory_bytes(
+                payload,
+                raw_memory_multiplier=4,
+                token_memory_bytes=128,
+                max_estimated_bytes=max_estimated_bytes,
+            )
+        )
+    else:
+        estimate = (
+            await run_json_cpu(
+                estimate_json_memory_bytes,
+                payload,
+                raw_memory_multiplier=4,
+                token_memory_bytes=128,
+                max_estimated_bytes=max_estimated_bytes,
+            )
+            if offload
+            else estimate_json_memory_bytes(
+                payload,
+                raw_memory_multiplier=4,
+                token_memory_bytes=128,
+                max_estimated_bytes=max_estimated_bytes,
+            )
+        )
+
+    request_lease = get_request_admission_lease()
+    reservation = (
+        await request_lease.reserve_temporary_response_bytes(
+            estimate.estimated_bytes
+        )
+        if request_lease is not None
+        else None
+    )
+    try:
+        parse_payload = payload.tobytes() if payload_is_memoryview else payload
+        try:
+            value: Any = (
+                await run_json_cpu(json.loads, parse_payload)
+                if offload
+                else json.loads(parse_payload)
+            )
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            if not allow_invalid:
+                raise
+            value = parse_payload
+        return OwnedJSONValue(value, reservation)
+    except BaseException:
+        if reservation is not None:
+            await reservation.release()
+        raise
+
+
+@asynccontextmanager
+async def parsed_json_value(
+    payload: str | bytes | bytearray | memoryview,
+    *,
+    max_estimated_bytes: int = DEFAULT_JSON_PARSE_MAX_ESTIMATED_BYTES,
+    allow_invalid: bool = False,
+):
+    """Materialize untrusted JSON under a live structure-aware reservation."""
+
+    owner = await parse_owned_json_value(
+        payload,
+        max_estimated_bytes=max_estimated_bytes,
+        allow_invalid=allow_invalid,
+    )
+    try:
+        yield owner.value
+    finally:
+        await owner.aclose()

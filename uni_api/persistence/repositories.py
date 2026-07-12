@@ -33,8 +33,8 @@ class StatsRepository:
         self.semaphore = semaphore
         self.debug = debug
 
-    async def add_request_stat(self, current_info: dict[str, Any]) -> None:
-        async def write() -> None:
+    async def add_request_stat(self, current_info: dict[str, Any]) -> bool:
+        async def write() -> bool:
             async with self.session_factory() as session:
                 async with session.begin():
                     try:
@@ -47,12 +47,13 @@ class StatsRepository:
                             import traceback
 
                             traceback.print_exc()
+                        return False
+            return True
 
         if self.semaphore is None:
-            await write()
-            return
+            return await write()
         async with self.semaphore:
-            await write()
+            return await write()
 
     async def add_channel_stat(
         self,
@@ -63,8 +64,8 @@ class StatsRepository:
         api_key: str,
         success: bool,
         provider_api_key: str | None = None,
-    ) -> None:
-        async def write() -> None:
+    ) -> bool:
+        async def write() -> bool:
             async with self.session_factory() as session:
                 async with session.begin():
                     try:
@@ -86,12 +87,13 @@ class StatsRepository:
                             import traceback
 
                             traceback.print_exc()
+                        return False
+            return True
 
         if self.semaphore is None:
-            await write()
-            return
+            return await write()
         async with self.semaphore:
-            await write()
+            return await write()
 
     async def query_token_usage(
         self,

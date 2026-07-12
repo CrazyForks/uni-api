@@ -6,11 +6,19 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import httpx
+import pytest
 from fastapi import BackgroundTasks
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import main
+
+
+def _anthropic_sse(event_name, payload):
+    return (
+        f"event: {event_name}\n"
+        f"data: {json.dumps(payload)}\n\n"
+    ).encode("utf-8")
 
 
 def test_debug_header_pairs_preserves_raw_duplicate_headers():
@@ -364,3 +372,273 @@ def test_messages_debug_logs_final_upstream_request_headers_and_body(monkeypatch
     assert len(upstream_logs) == 1
     assert '"model": "claude-sonnet-4-5-20250929"' in upstream_logs[0]
     assert '"metadata": {\n    "source": "debug-test"\n  }' in upstream_logs[0]
+
+
+class _CloseProbe:
+    def __init__(self):
+        self.response_closes = 0
+        self.context_exits = 0
+
+    async def aclose(self):
+        self.response_closes += 1
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.context_exits += 1
+
+
+def _messages_stream_context(*, disconnect_event=None):
+    current_info = {
+        "request_id": "messages-stream",
+        "api_key": "sk-test",
+    }
+    return {
+        "endpoint": "/v1/messages",
+        "request_id": "messages-stream",
+        "request_model_name": "claude-alias",
+        "current_info": current_info,
+        "disconnect_event": disconnect_event,
+        "background_tasks": BackgroundTasks(),
+    }, SimpleNamespace(
+        provider_name="anthropic",
+        provider_api_key_raw="provider-key",
+        state={"channel_id": "anthropic", "track_channel_stats": True},
+    )
+
+
+def test_messages_stream_records_success_only_after_message_stop(monkeypatch):
+    async def scenario():
+        results = []
+
+        def record(*_args, success, **_kwargs):
+            results.append(success)
+
+        monkeypatch.setattr(main, "_schedule_channel_stats_bounded", record)
+        handler = main.MessagesPassthroughHandler()
+        ctx, attempt = _messages_stream_context()
+        probe = _CloseProbe()
+
+        async def upstream():
+            yield _anthropic_sse(
+                "message_stop",
+                {"type": "message_stop"},
+            )
+
+        stream = handler._messages_proxy_stream(
+            ctx,
+            attempt,
+            [
+                _anthropic_sse(
+                    "content_block_delta",
+                    {"type": "content_block_delta", "delta": {"text": "hi"}},
+                )
+            ],
+            upstream(),
+            probe,
+            probe,
+        )
+        assert b"content_block_delta" in await anext(stream)
+        assert results == []
+        remaining = [chunk async for chunk in stream]
+
+        assert b"message_stop" in b"".join(remaining)
+        assert results == [True]
+        assert ctx["current_info"]["success"] is True
+        assert probe.response_closes == 1
+        assert probe.context_exits == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("network_abort", [False, True])
+def test_messages_stream_truncation_records_failure_without_false_success(
+    monkeypatch,
+    network_abort,
+):
+    async def scenario():
+        results = []
+
+        def record(*_args, success, **_kwargs):
+            results.append(success)
+
+        monkeypatch.setattr(main, "_schedule_channel_stats_bounded", record)
+        handler = main.MessagesPassthroughHandler()
+        ctx, attempt = _messages_stream_context()
+        probe = _CloseProbe()
+
+        async def upstream():
+            if network_abort:
+                raise httpx.ReadError(
+                    "messages upstream aborted",
+                    request=httpx.Request(
+                        "POST",
+                        "https://example.com/v1/messages",
+                    ),
+                )
+            if False:
+                yield b""
+
+        stream = handler._messages_proxy_stream(
+            ctx,
+            attempt,
+            [
+                _anthropic_sse(
+                    "content_block_delta",
+                    {"type": "content_block_delta", "delta": {"text": "partial"}},
+                )
+            ],
+            upstream(),
+            probe,
+            probe,
+        )
+        assert b"content_block_delta" in await anext(stream)
+        expected = httpx.ReadError if network_abort else main.SSEProtocolError
+        with pytest.raises(expected):
+            await anext(stream)
+
+        assert results == [False]
+        assert ctx["current_info"]["success"] is False
+        assert ctx["current_info"]["stream_outcome"] == "upstream_stream_abort"
+        assert probe.response_closes == 1
+        assert probe.context_exits == 1
+
+    asyncio.run(scenario())
+
+
+def test_messages_real_disconnect_cancels_upstream_without_channel_failure(
+    monkeypatch,
+):
+    async def scenario():
+        results = []
+
+        def record(*_args, success, **_kwargs):
+            results.append(success)
+
+        monkeypatch.setattr(main, "_schedule_channel_stats_bounded", record)
+        disconnect_event = asyncio.Event()
+        handler = main.MessagesPassthroughHandler()
+        ctx, attempt = _messages_stream_context(
+            disconnect_event=disconnect_event
+        )
+        probe = _CloseProbe()
+        upstream_closed = False
+
+        async def upstream():
+            nonlocal upstream_closed
+            try:
+                await asyncio.Event().wait()
+                yield b"unreachable"
+            finally:
+                upstream_closed = True
+
+        stream = handler._messages_proxy_stream(
+            ctx,
+            attempt,
+            [
+                _anthropic_sse(
+                    "content_block_delta",
+                    {"type": "content_block_delta", "delta": {"text": "partial"}},
+                )
+            ],
+            upstream(),
+            probe,
+            probe,
+        )
+        assert b"content_block_delta" in await anext(stream)
+        disconnect_event.set()
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
+
+        assert results == []
+        assert upstream_closed is True
+        assert ctx["current_info"]["stream_outcome"] == "downstream_disconnected"
+        assert ctx["current_info"]["downstream_disconnected"] is True
+        assert probe.response_closes == 1
+        assert probe.context_exits == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("coalesced", [False, True])
+def test_messages_terminal_is_event_bounded_and_does_not_wait_for_eof(
+    monkeypatch,
+    coalesced,
+):
+    async def scenario():
+        results = []
+
+        def record(*_args, success, **_kwargs):
+            results.append(success)
+
+        monkeypatch.setattr(main, "_schedule_channel_stats_bounded", record)
+        handler = main.MessagesPassthroughHandler()
+        ctx, attempt = _messages_stream_context()
+        probe = _CloseProbe()
+        first = _anthropic_sse(
+            "content_block_delta",
+            {"type": "content_block_delta", "delta": {"text": "zero"}},
+        )
+        second = _anthropic_sse(
+            "content_block_delta",
+            {"type": "content_block_delta", "delta": {"text": "one"}},
+        )
+        terminal = _anthropic_sse("message_stop", {"type": "message_stop"})
+
+        async def upstream():
+            if coalesced:
+                yield second + terminal
+            else:
+                yield second
+                yield terminal
+            raise AssertionError("messages proxy read after message_stop")
+
+        stream = handler._messages_proxy_stream(
+            ctx,
+            attempt,
+            [first],
+            upstream(),
+            probe,
+            probe,
+        )
+        body = b"".join([chunk async for chunk in stream])
+
+        assert b"zero" in body
+        assert b"one" in body
+        assert b"message_stop" in body
+        assert results == [True]
+        assert probe.response_closes == 1
+        assert probe.context_exits == 1
+
+    asyncio.run(scenario())
+
+
+def test_messages_malformed_terminal_data_is_protocol_failure(monkeypatch):
+    async def scenario():
+        results = []
+
+        def record(*_args, success, **_kwargs):
+            results.append(success)
+
+        monkeypatch.setattr(main, "_schedule_channel_stats_bounded", record)
+        handler = main.MessagesPassthroughHandler()
+        ctx, attempt = _messages_stream_context()
+        probe = _CloseProbe()
+
+        async def upstream():
+            if False:
+                yield b""
+
+        stream = handler._messages_proxy_stream(
+            ctx,
+            attempt,
+            [b"event: message_stop\ndata: not-json\n\n"],
+            upstream(),
+            probe,
+            probe,
+        )
+        with pytest.raises(main.SSEProtocolError, match="JSON object"):
+            await anext(stream)
+
+        assert results == [False]
+        assert ctx["current_info"]["success"] is False
+
+    asyncio.run(scenario())

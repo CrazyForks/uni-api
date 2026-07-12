@@ -1,0 +1,179 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+DEFAULT_JSON_RAW_MEMORY_MULTIPLIER = 5
+DEFAULT_JSON_TOKEN_MEMORY_BYTES = 1024
+DEFAULT_JSON_MAX_DEPTH = 128
+DEFAULT_JSON_MAX_SCALAR_BYTES = 4096
+DEFAULT_JSON_MAX_ESTIMATED_BYTES = 256 * 1024 * 1024
+_TEXT_SCAN_CHUNK_CHARACTERS = 256 * 1024
+
+
+class JSONMemoryComplexityError(ValueError):
+    """A JSON document exceeds a finite structural/memory envelope."""
+
+
+@dataclass(frozen=True, slots=True)
+class JSONMemorySnapshot:
+    raw_bytes: int
+    tokens: int
+    depth: int
+    peak_depth: int
+    estimated_bytes: int
+
+
+class IncrementalJSONMemoryEstimator:
+    """Estimate JSON materialization memory with O(1) retained state.
+
+    Raw-byte multipliers alone are unsafe for object-dense JSON: a three-byte
+    ``{}`` can become a dict, list slot, and (for typed routes) validation
+    objects.  This scanner therefore charges both source bytes and every
+    string/scalar/container token.  The defaults deliberately overestimate
+    measured CPython 3.11 + Pydantic peaks while still allowing large single
+    strings such as base64 image inputs.
+
+    The scanner is not a JSON validator.  Malformed documents keep their
+    existing FastAPI error behavior; we only reject unreasonably deep/large
+    structures before a parser can materialize them.
+    """
+
+    def __init__(
+        self,
+        *,
+        raw_memory_multiplier: int = DEFAULT_JSON_RAW_MEMORY_MULTIPLIER,
+        token_memory_bytes: int = DEFAULT_JSON_TOKEN_MEMORY_BYTES,
+        max_depth: int = DEFAULT_JSON_MAX_DEPTH,
+        max_scalar_bytes: int = DEFAULT_JSON_MAX_SCALAR_BYTES,
+        max_estimated_bytes: int = DEFAULT_JSON_MAX_ESTIMATED_BYTES,
+    ) -> None:
+        if raw_memory_multiplier <= 0 or token_memory_bytes <= 0:
+            raise ValueError("JSON memory weights must be positive")
+        if max_depth <= 0 or max_scalar_bytes <= 0 or max_estimated_bytes <= 0:
+            raise ValueError("JSON complexity limits must be positive")
+        self.raw_memory_multiplier = int(raw_memory_multiplier)
+        self.token_memory_bytes = int(token_memory_bytes)
+        self.max_depth = int(max_depth)
+        self.max_scalar_bytes = int(max_scalar_bytes)
+        self.max_estimated_bytes = int(max_estimated_bytes)
+
+        self.raw_bytes = 0
+        self.tokens = 0
+        self.depth = 0
+        self.peak_depth = 0
+        self._in_string = False
+        self._escaped = False
+        self._scalar_active = False
+        self._scalar_bytes = 0
+
+    @property
+    def estimated_bytes(self) -> int:
+        return (
+            self.raw_bytes * self.raw_memory_multiplier
+            + self.tokens * self.token_memory_bytes
+        )
+
+    def snapshot(self) -> JSONMemorySnapshot:
+        return JSONMemorySnapshot(
+            raw_bytes=self.raw_bytes,
+            tokens=self.tokens,
+            depth=self.depth,
+            peak_depth=self.peak_depth,
+            estimated_bytes=self.estimated_bytes,
+        )
+
+    def feed(self, chunk: bytes | bytearray | memoryview) -> int:
+        view = memoryview(chunk).cast("B")
+        self.raw_bytes += len(view)
+        self._raise_if_estimate_exceeded()
+
+        for value in view:
+            if self._in_string:
+                if self._escaped:
+                    self._escaped = False
+                elif value == 0x5C:  # backslash
+                    self._escaped = True
+                elif value == 0x22:  # quote
+                    self._in_string = False
+                continue
+
+            if value == 0x22:  # quote starts a key or value string
+                self._finish_scalar()
+                self._count_token()
+                self._in_string = True
+                continue
+
+            if value in (0x7B, 0x5B):  # { [
+                self._finish_scalar()
+                self._count_token()
+                self.depth += 1
+                self.peak_depth = max(self.peak_depth, self.depth)
+                if self.depth > self.max_depth:
+                    raise JSONMemoryComplexityError(
+                        f"JSON nesting exceeds {self.max_depth} levels"
+                    )
+                continue
+
+            if value in (0x7D, 0x5D):  # } ]
+                self._finish_scalar()
+                self.depth = max(0, self.depth - 1)
+                continue
+
+            if value in (0x20, 0x09, 0x0A, 0x0D, 0x2C, 0x3A):
+                # JSON whitespace, comma, or colon terminates a scalar token.
+                self._finish_scalar()
+                continue
+
+            if not self._scalar_active:
+                self._scalar_active = True
+                self._scalar_bytes = 0
+                self._count_token()
+            self._scalar_bytes += 1
+            if self._scalar_bytes > self.max_scalar_bytes:
+                raise JSONMemoryComplexityError(
+                    f"JSON scalar exceeds {self.max_scalar_bytes} bytes"
+                )
+
+        return self.estimated_bytes
+
+    def _count_token(self) -> None:
+        self.tokens += 1
+        self._raise_if_estimate_exceeded()
+
+    def _raise_if_estimate_exceeded(self) -> None:
+        if self.estimated_bytes > self.max_estimated_bytes:
+            raise JSONMemoryComplexityError(
+                "JSON materialization estimate exceeds "
+                f"{self.max_estimated_bytes} bytes"
+            )
+
+    def _finish_scalar(self) -> None:
+        self._scalar_active = False
+        self._scalar_bytes = 0
+
+
+def estimate_json_memory_bytes(
+    payload: bytes | bytearray | memoryview,
+    **limits: int,
+) -> JSONMemorySnapshot:
+    estimator = IncrementalJSONMemoryEstimator(**limits)
+    estimator.feed(payload)
+    return estimator.snapshot()
+
+
+def estimate_json_text_memory_bytes(
+    payload: str,
+    **limits: int,
+) -> JSONMemorySnapshot:
+    """Scan text without allocating a second attacker-sized UTF-8 copy."""
+
+    estimator = IncrementalJSONMemoryEstimator(**limits)
+    for offset in range(0, len(payload), _TEXT_SCAN_CHUNK_CHARACTERS):
+        estimator.feed(
+            payload[offset : offset + _TEXT_SCAN_CHUNK_CHARACTERS].encode(
+                "utf-8",
+                errors="strict",
+            )
+        )
+    return estimator.snapshot()

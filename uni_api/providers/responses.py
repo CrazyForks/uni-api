@@ -2,26 +2,48 @@ import re
 import random
 import string
 import base64
+import binascii
 import uuid
 import asyncio
+import zlib
+from contextlib import aclosing
 from datetime import datetime
+from math import isfinite
 from urllib.parse import urlparse
 from typing import Any, AsyncIterator, Callable
 
 from core.log_config import logger
+from uni_api.admission import get_request_admission_lease
+from uni_api.admission.json_parsing import (
+    parse_owned_json_value,
+    parsed_json_value,
+    run_json_cpu,
+)
+from uni_api.http_content import is_json_media_type
 from uni_api.serialization import json
 
 from core.utils import (
     safe_get,
-    IncrementalSSEParser,
-    generate_sse_response,
-    generate_no_stream_response,
     end_of_line,
     parse_json_safely,
     parse_sse_event,
 )
 from uni_api.providers.normalization import build_openai_audio_object, normalize_gemini_parts
-from uni_api.streaming.sse import is_sse_comment_frame
+from uni_api.streaming.sse import (
+    DEFAULT_MAX_EVENT_BYTES,
+    IncrementalSSEParser,
+    OwnedSSEEvent,
+    SSEBufferOverflowError,
+    SSEOutputLimitError,
+    SSEProtocolError,
+    StreamParserRetainedLease,
+    is_sse_comment_frame,
+    iter_lines,
+    iter_sse_events,
+    parse_owned_sse_event,
+    parsed_sse_event,
+    retain_joined_parser_text,
+)
 from uni_api.streaming.cleanup import (
     BACKGROUND_STREAM_CLEANUP_TASKS as _BACKGROUND_STREAM_CLEANUP_TASKS,
     await_stream_cleanup_safely as _await_stream_cleanup_safely,
@@ -34,6 +56,8 @@ from uni_api.streaming.cleanup import (
     yield_from_stream as _yield_from_stream,
 )
 from uni_api.streaming.chat_completion_events import (
+    generate_no_stream_response,
+    generate_sse_response,
     responses_usage_to_chat_completion_usage as _responses_usage_to_chat_completion_usage,
 )
 from uni_api.streaming.responses_events import (
@@ -41,13 +65,346 @@ from uni_api.streaming.responses_events import (
     normalize_optional_text as _normalize_optional_text,
     stream_responses_to_chat_completions as _stream_responses_to_chat_completions,
 )
+from uni_api.upstream.response_limits import (
+    read_limited_response_body,
+    upstream_json_memory_reservation_multiplier,
+    upstream_success_body_max_bytes,
+)
 
 ResponseHeadersSink = Callable[[Any], None]
+_MAX_TOKEN_COUNT = (1 << 63) - 1
+
+
+def _coerce_token_count(value: Any) -> int:
+    """Collapse untrusted usage fields to one bounded scalar immediately."""
+
+    parsed: int
+    if isinstance(value, bool):
+        parsed = int(value)
+    elif isinstance(value, int):
+        parsed = value
+    elif isinstance(value, float):
+        if not isfinite(value):
+            return 0
+        parsed = int(value)
+    elif isinstance(value, str):
+        if len(value) > 32:
+            return 0
+        normalized = value.strip()
+        if not normalized or not normalized.isdecimal():
+            return 0
+        parsed = int(normalized)
+    else:
+        return 0
+    return min(_MAX_TOKEN_COUNT, max(0, parsed))
+
+
+def _extract_named_token_count(line: str, field: str) -> int:
+    match = re.search(
+        rf'"{re.escape(field)}"\s*:\s*(\d{{1,20}})',
+        line,
+    )
+    return _coerce_token_count(match.group(1)) if match is not None else 0
+
+
+def _bounded_text_concat(
+    current: str,
+    addition: str,
+    *,
+    label: str,
+    limit_bytes: int = 256,
+) -> str:
+    observed = len(current.encode("utf-8")) + len(addition.encode("utf-8"))
+    if observed > limit_bytes:
+        raise SSEBufferOverflowError(
+            buffer_name=label,
+            limit_bytes=limit_bytes,
+            observed_bytes=observed,
+        )
+    return current + addition
+
+
+class _BoundedTextAccumulator:
+    def __init__(
+        self,
+        *,
+        label: str,
+        limit_bytes: int = DEFAULT_MAX_EVENT_BYTES,
+        max_parts: int = 4096,
+    ) -> None:
+        self.label = label
+        self.limit_bytes = limit_bytes
+        self.parts: list[str] = []
+        self.total_bytes = 0
+        self.max_parts = max_parts
+        self._retained = StreamParserRetainedLease()
+
+    def append(self, value: str) -> None:
+        if len(self.parts) >= self.max_parts:
+            raise SSEOutputLimitError(
+                output_name=f"{self.label} fragments",
+                limit=self.max_parts,
+                observed=self.max_parts + 1,
+            )
+        worst_case_bytes = len(value) * 4
+        self._retained.grow(worst_case_bytes)
+        try:
+            encoded_bytes = len(value.encode("utf-8"))
+            observed = self.total_bytes + encoded_bytes
+            if observed > self.limit_bytes:
+                raise SSEBufferOverflowError(
+                    buffer_name=self.label,
+                    limit_bytes=self.limit_bytes,
+                    observed_bytes=observed,
+                )
+            self.parts.append(value)
+            self.total_bytes = observed
+        except BaseException:
+            self._retained.shrink(worst_case_bytes)
+            raise
+        self._retained.shrink(worst_case_bytes - encoded_bytes)
+
+    def append_slice(
+        self,
+        source: str,
+        start: int,
+        end: int,
+        *,
+        suffix: str = "",
+    ) -> None:
+        if len(self.parts) >= self.max_parts:
+            raise SSEOutputLimitError(
+                output_name=f"{self.label} fragments",
+                limit=self.max_parts,
+                observed=self.max_parts + 1,
+            )
+        worst_case_bytes = (max(0, end - start) + len(suffix)) * 4
+        self._retained.grow(worst_case_bytes)
+        try:
+            value = source[start:end] + suffix
+            encoded_bytes = len(value.encode("utf-8"))
+            observed = self.total_bytes + encoded_bytes
+            if observed > self.limit_bytes:
+                raise SSEBufferOverflowError(
+                    buffer_name=self.label,
+                    limit_bytes=self.limit_bytes,
+                    observed_bytes=observed,
+                )
+            self.parts.append(value)
+            self.total_bytes = observed
+        except BaseException:
+            self._retained.shrink(worst_case_bytes)
+            raise
+        self._retained.shrink(worst_case_bytes - encoded_bytes)
+
+    def take_text(self) -> str:
+        frame = retain_joined_parser_text(
+            self.parts,
+            retained_bytes=self.total_bytes,
+        )
+        self.parts.clear()
+        self.total_bytes = 0
+        self._retained.release()
+        self._retained = StreamParserRetainedLease()
+        return frame
+
+    def close(self) -> None:
+        self.parts.clear()
+        self.total_bytes = 0
+        self._retained.release()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class _BoundedJSONObjectAccumulator:
+    """Frame pretty-printed objects from a bounded top-level JSON array."""
+
+    def __init__(
+        self,
+        *,
+        label: str,
+        limit_bytes: int = DEFAULT_MAX_EVENT_BYTES,
+        max_frames_per_feed: int = 4096,
+    ) -> None:
+        if max_frames_per_feed <= 0:
+            raise ValueError("max_frames_per_feed must be positive")
+        self._text = _BoundedTextAccumulator(label=label, limit_bytes=limit_bytes)
+        self._max_frames_per_feed = int(max_frames_per_feed)
+        self._depth = 0
+        self._in_string = False
+        self._escaped = False
+        self._started = False
+
+    def feed_line(self, line: str) -> list[str]:
+        frames: list[str] = []
+        segment_start: int | None = 0 if self._started else None
+        for index, char in enumerate(line):
+            if not self._started:
+                if char.isspace() or char in "[, ]":
+                    continue
+                if char != "{":
+                    raise SSEProtocolError(
+                        "Gemini JSON stream contains a non-object array item"
+                    )
+                self._started = True
+                self._depth = 0
+                self._in_string = False
+                self._escaped = False
+                segment_start = index
+
+            if self._in_string:
+                if self._escaped:
+                    self._escaped = False
+                elif char == "\\":
+                    self._escaped = True
+                elif char == '"':
+                    self._in_string = False
+            elif char == '"':
+                self._in_string = True
+            elif char in "{[":
+                self._depth += 1
+            elif char in "}]":
+                self._depth -= 1
+                if self._depth < 0:
+                    raise SSEProtocolError("Gemini JSON stream has unbalanced brackets")
+
+            if self._started and self._depth == 0:
+                assert segment_start is not None
+                if len(frames) >= self._max_frames_per_feed:
+                    raise SSEOutputLimitError(
+                        output_name="Gemini JSON objects",
+                        limit=self._max_frames_per_feed,
+                        observed=self._max_frames_per_feed + 1,
+                    )
+                self._text.append_slice(line, segment_start, index + 1)
+                frames.append(self._text.take_text())
+                self._text = _BoundedTextAccumulator(
+                    label=self._text.label,
+                    limit_bytes=self._text.limit_bytes,
+                    max_parts=self._text.max_parts,
+                )
+                self._started = False
+                segment_start = None
+
+        if self._started:
+            assert segment_start is not None
+            self._text.append_slice(
+                line,
+                segment_start,
+                len(line),
+                suffix="\n",
+            )
+        return frames
+
+    def finish(self) -> None:
+        if self._started:
+            raise SSEProtocolError("Gemini JSON stream ended with an incomplete object")
 
 
 def _capture_response_headers(response_headers_sink: ResponseHeadersSink | None, headers: Any) -> None:
     if response_headers_sink is not None and headers is not None:
         response_headers_sink(headers)
+
+
+async def _iter_openai_stream_events(response: Any):
+    """Yield explicitly owned OpenAI events from SSE or JSON-lines streams."""
+
+    content_type = str(
+        getattr(response, "headers", {}).get("content-type", "") or ""
+    ).lower()
+    if "text/event-stream" in content_type:
+        events = _iter_owned_sse_events(response.aiter_bytes())
+        async with aclosing(events):
+            async for event_owner in events:
+                yield event_owner
+        return
+
+    lines = iter_lines(response.aiter_bytes())
+    async with aclosing(lines):
+        async for line in lines:
+            event_owner = None
+            precopy_reservation = None
+            raw_event = None
+            try:
+                if not line or (len(line) <= 64 and line.isspace()):
+                    continue
+
+                field_start = 0
+                # Only inspect a bounded protocol prefix in Python.  JSON
+                # accepts arbitrary leading whitespace; scanning an 8 MiB
+                # whitespace prefix character-by-character would block the
+                # event loop before admission can react.
+                prefix_scan_limit = min(len(line), 64)
+                while (
+                    field_start < prefix_scan_limit
+                    and line[field_start].isspace()
+                ):
+                    field_start += 1
+                has_sse_field = field_start < prefix_scan_limit and line.startswith(
+                    ("data:", ":", "event:"),
+                    field_start,
+                )
+                needs_copy = field_start > 0 or not has_sse_field
+                if needs_copy:
+                    request_lease = get_request_admission_lease()
+                    if request_lease is not None:
+                        precopy_reservation = (
+                            await request_lease.reserve_temporary_response_bytes(
+                                len(line) * 4 + 64
+                            )
+                        )
+                if has_sse_field:
+                    raw_event = line[field_start:] if field_start else line
+                else:
+                    # JSON parsers accept leading/trailing whitespace, so no
+                    # attacker-sized strip() copy is needed.
+                    raw_event = f"data: {line}"
+                event_owner = await parse_owned_sse_event(raw_event)
+                yield event_owner
+            except json.JSONDecodeError as exc:
+                raise SSEProtocolError(
+                    "upstream JSON-lines frame is not valid JSON"
+                ) from exc
+            finally:
+                line = None
+                raw_event = None
+                try:
+                    if event_owner is not None:
+                        await event_owner.aclose()
+                finally:
+                    if precopy_reservation is not None:
+                        await precopy_reservation.release()
+
+
+async def _iter_owned_sse_events(chunks):
+    """Yield events whose consumers explicitly own and close each payload."""
+
+    raw_source = iter_sse_events(chunks)
+    async with aclosing(raw_source):
+        async for raw_event in raw_source:
+            event_owner = await parse_owned_sse_event(raw_event)
+            try:
+                yield event_owner
+            finally:
+                raw_event = None
+                await event_owner.aclose()
+                event_owner = None
+
+
+async def _iter_owned_raw_events(raw_events):
+    for index, raw_event in enumerate(raw_events):
+        event_owner = await parse_owned_sse_event(raw_event)
+        try:
+            yield event_owner
+        finally:
+            raw_events[index] = None
+            raw_event = None
+            await event_owner.aclose()
+            event_owner = None
 
 
 def _normalize_search_item_defaults(item: dict) -> dict:
@@ -212,13 +569,16 @@ def _is_responses_api_call(url: str, payload: dict) -> bool:
 
 async def check_response(response, error_log):
     if response and not (200 <= response.status_code < 300):
-        error_message = await response.aread()
-        error_str = error_message.decode('utf-8', errors='replace')
-        try:
-            error_json = await asyncio.to_thread(json.loads, error_str)
-        except json.JSONDecodeError:
-            error_json = error_str
-        return {"error": f"{error_log} HTTP Error", "status_code": response.status_code, "details": error_json}
+        error_body = await read_limited_response_body(response)
+        error_str = error_body.text()
+        # Keep error diagnostics as bounded text.  Materializing arbitrary JSON
+        # here would let a dense error graph escape into the returned object
+        # after its parse reservation ended.
+        return {
+            "error": f"{error_log} HTTP Error",
+            "status_code": response.status_code,
+            "details": error_str,
+        }
     return None
 
 async def gemini_json_poccess(response_json):
@@ -232,16 +592,28 @@ async def gemini_json_poccess(response_json):
     finishReason = safe_get(response_json, "candidates", 0 , "finishReason", default=None)
     usage_metadata = response_json.get("usageMetadata") if isinstance(response_json, dict) else None
     if finishReason and isinstance(usage_metadata, dict):
-        promptTokenCount = usage_metadata.get("promptTokenCount", promptTokenCount) or 0
-        candidatesTokenCount = usage_metadata.get("candidatesTokenCount", candidatesTokenCount) or 0
-        totalTokenCount = usage_metadata.get("totalTokenCount", totalTokenCount) or 0
-        cachedContentTokenCount = usage_metadata.get("cachedContentTokenCount", cachedContentTokenCount) or 0
-        thoughtsTokenCount = usage_metadata.get("thoughtsTokenCount", thoughtsTokenCount) or 0
+        promptTokenCount = _coerce_token_count(
+            usage_metadata.get("promptTokenCount", promptTokenCount)
+        )
+        candidatesTokenCount = _coerce_token_count(
+            usage_metadata.get("candidatesTokenCount", candidatesTokenCount)
+        )
+        totalTokenCount = _coerce_token_count(
+            usage_metadata.get("totalTokenCount", totalTokenCount)
+        )
+        cachedContentTokenCount = _coerce_token_count(
+            usage_metadata.get("cachedContentTokenCount", cachedContentTokenCount)
+        )
+        thoughtsTokenCount = _coerce_token_count(
+            usage_metadata.get("thoughtsTokenCount", thoughtsTokenCount)
+        )
         if finishReason != "STOP":
             logger.error(f"finishReason: {finishReason}")
 
     parts_list = safe_get(json_data, "parts", default=[])
-    normalized = normalize_gemini_parts(parts_list if isinstance(parts_list, list) else [])
+    normalized = await normalize_gemini_parts(
+        parts_list if isinstance(parts_list, list) else []
+    )
 
     blockReason = safe_get(json_data, 0, "promptFeedback", "blockReason", default=None)
 
@@ -265,123 +637,233 @@ async def gemini_json_poccess(response_json):
 
 async def fetch_gemini_response_stream(client, url, headers, payload, model, timeout):
     timestamp = int(datetime.timestamp(datetime.now()))
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await run_json_cpu(json.dumps, payload)
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
         error_message = await check_response(response, "fetch_gemini_response_stream")
         if error_message:
             yield error_message
             return
-        buffer = ""
         promptTokenCount = 0
         candidatesTokenCount = 0
         totalTokenCount = 0
         cachedContentTokenCount = 0
         thoughtsTokenCount = 0
-        parts_json = ""
-        async for chunk in response.aiter_text():
-            buffer += chunk
-            if buffer and "\n" not in buffer:
-                buffer += "\n"
+        json_framer = _BoundedJSONObjectAccumulator(label="gemini JSON frame")
+        terminal_seen = False
+        content_type = str(response.headers.get("content-type") or "").lower()
 
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                if line.startswith("data: "):
-                    parts_json = line.lstrip("data: ").strip()
+        async def response_objects():
+            if "text/event-stream" in content_type:
+                events = _iter_owned_sse_events(response.aiter_bytes())
+                async with aclosing(events):
+                    async for event_owner in events:
+                        event_payload = None
+                        try:
+                            if event_owner.is_comment:
+                                continue
+                            event_payload = event_owner.payload
+                            if event_payload == "[DONE]":
+                                return
+                            if not isinstance(event_payload, dict):
+                                raise SSEProtocolError(
+                                    "Gemini SSE payload must be a JSON object"
+                                )
+                            yield event_owner
+                        finally:
+                            event_payload = None
+                            await event_owner.aclose()
+                return
+
+            lines = iter_lines(response.aiter_bytes())
+            async with aclosing(lines):
+                async for bounded_line in lines:
+                    frames = None
                     try:
-                        response_json = await asyncio.to_thread(json.loads, parts_json)
-                    except json.JSONDecodeError:
-                        # logger.error(f"JSON decode error: {parts_json}")
-                        continue
-                else:
-                    parts_json += line
-                    parts_json = parts_json.lstrip("[,")
-                    try:
-                        response_json = await asyncio.to_thread(json.loads, parts_json)
-                    except json.JSONDecodeError:
-                        continue
+                        if bounded_line.startswith("data:"):
+                            event_owner = await parse_owned_sse_event(bounded_line)
+                            event_payload = None
+                            try:
+                                event_payload = event_owner.payload
+                                if not isinstance(event_payload, dict):
+                                    continue
+                                yield event_owner
+                            finally:
+                                event_payload = None
+                                await event_owner.aclose()
+                            continue
 
-                # https://ai.google.dev/api/generate-content?hl=zh-cn#FinishReason
-                (
-                    is_thinking,
-                    reasoning_content,
-                    content,
-                    image_base64,
-                    audio_b64_wav,
-                    function_call_name,
-                    function_full_response,
-                    tools_id,
-                    finishReason,
-                    blockReason,
-                    promptTokenCount,
-                    candidatesTokenCount,
-                    totalTokenCount,
-                    cachedContentTokenCount,
-                    thoughtsTokenCount,
-                ) = await gemini_json_poccess(response_json)
+                        frames = (
+                            await run_json_cpu(
+                                json_framer.feed_line,
+                                bounded_line,
+                            )
+                            if len(bounded_line) >= 64 * 1024
+                            else json_framer.feed_line(bounded_line)
+                        )
+                        for index, frame in enumerate(frames):
+                            owner = None
+                            try:
+                                owner = await parse_owned_json_value(frame)
+                                if not isinstance(owner.value, dict):
+                                    raise SSEProtocolError(
+                                        "Gemini JSON stream payload must be an object"
+                                    )
+                                yield owner
+                            except json.JSONDecodeError:
+                                continue
+                            finally:
+                                frames[index] = None
+                                frame = None
+                                if owner is not None:
+                                    await owner.aclose()
+                    finally:
+                        frames = None
+                        bounded_line = None
+            json_framer.finish()
 
-                if is_thinking and reasoning_content:
-                    sse_string = await generate_sse_response(timestamp, model, reasoning_content=reasoning_content)
-                    yield sse_string
-                if not image_base64 and content:
-                    sse_string = await generate_sse_response(timestamp, model, content=content)
-                    yield sse_string
+        objects = response_objects()
+        async with aclosing(objects):
+            async for event_owner in objects:
+                response_json = None
+                is_thinking = None
+                reasoning_content = None
+                content = None
+                image_base64 = None
+                audio_b64_wav = None
+                function_call_name = None
+                function_full_response = None
+                tools_id = None
+                finishReason = None
+                blockReason = None
+                audio_obj = None
+                try:
+                    if isinstance(event_owner, OwnedSSEEvent):
+                        response_json = event_owner.payload
+                    else:
+                        response_json = event_owner.value
 
-                if image_base64:
-                    if "flash-image" not in model and "pro-image" not in model:
-                        completion_tokens = candidatesTokenCount + thoughtsTokenCount
-                        openai_total_tokens = totalTokenCount or (promptTokenCount + completion_tokens)
+                    # https://ai.google.dev/api/generate-content?hl=zh-cn#FinishReason
+                    (
+                        is_thinking,
+                        reasoning_content,
+                        content,
+                        image_base64,
+                        audio_b64_wav,
+                        function_call_name,
+                        function_full_response,
+                        tools_id,
+                        finishReason,
+                        blockReason,
+                        promptTokenCount,
+                        candidatesTokenCount,
+                        totalTokenCount,
+                        cachedContentTokenCount,
+                        thoughtsTokenCount,
+                    ) = await gemini_json_poccess(response_json)
+
+                    if is_thinking and reasoning_content:
+                        yield await generate_sse_response(
+                            timestamp, model, reasoning_content=reasoning_content
+                        )
+                    if not image_base64 and content:
+                        yield await generate_sse_response(timestamp, model, content=content)
+
+                    if image_base64:
+                        if "flash-image" not in model and "pro-image" not in model:
+                            completion_tokens = candidatesTokenCount + thoughtsTokenCount
+                            openai_total_tokens = totalTokenCount or (
+                                promptTokenCount + completion_tokens
+                            )
+                            yield await generate_no_stream_response(
+                                timestamp,
+                                model,
+                                content=content,
+                                role=None,
+                                total_tokens=openai_total_tokens,
+                                prompt_tokens=promptTokenCount,
+                                completion_tokens=completion_tokens,
+                                cached_tokens=cachedContentTokenCount,
+                                reasoning_tokens=thoughtsTokenCount,
+                                image_base64=image_base64,
+                            )
+                        else:
+                            yield await generate_sse_response(
+                                timestamp,
+                                model,
+                                content=f"\n![image](data:image/png;base64,{image_base64})",
+                            )
+                    if audio_b64_wav:
+                        audio_obj = build_openai_audio_object(
+                            audio_b64_wav,
+                            transcript=content or None,
+                        )
                         yield await generate_no_stream_response(
                             timestamp,
                             model,
-                            content=content,
-                            tools_id=None,
-                            function_call_name=None,
-                            function_call_content=None,
-                            role=None,
-                            total_tokens=openai_total_tokens,
+                            content=content or None,
+                            role="assistant",
+                            total_tokens=totalTokenCount
+                            or (
+                                promptTokenCount
+                                + candidatesTokenCount
+                                + thoughtsTokenCount
+                            ),
                             prompt_tokens=promptTokenCount,
-                            completion_tokens=completion_tokens,
+                            completion_tokens=candidatesTokenCount + thoughtsTokenCount,
                             cached_tokens=cachedContentTokenCount,
                             reasoning_tokens=thoughtsTokenCount,
-                            image_base64=image_base64,
+                            audio=audio_obj,
                         )
-                    else:
-                        sse_string = await generate_sse_response(timestamp, model, content=f"\n![image](data:image/png;base64,{image_base64})")
-                        yield sse_string
-                if audio_b64_wav:
-                    audio_obj = build_openai_audio_object(audio_b64_wav, transcript=content or None)
-                    yield await generate_no_stream_response(
-                        timestamp,
-                        model,
-                        content=content or None,
-                        tools_id=None,
-                        function_call_name=None,
-                        function_call_content=None,
-                        role="assistant",
-                        total_tokens=totalTokenCount or (promptTokenCount + candidatesTokenCount + thoughtsTokenCount),
-                        prompt_tokens=promptTokenCount,
-                        completion_tokens=candidatesTokenCount + thoughtsTokenCount,
-                        cached_tokens=cachedContentTokenCount,
-                        reasoning_tokens=thoughtsTokenCount,
-                        audio=audio_obj,
-                    )
 
-                if function_call_name:
-                    sse_string = await generate_sse_response(timestamp, model, content=None, tools_id=tools_id, function_call_name=function_call_name)
-                    yield sse_string
-                if function_full_response:
-                    sse_string = await generate_sse_response(timestamp, model, content=None, tools_id=tools_id, function_call_name=None, function_call_content=function_full_response)
-                    yield sse_string
+                    if function_call_name:
+                        yield await generate_sse_response(
+                            timestamp,
+                            model,
+                            content=None,
+                            tools_id=tools_id,
+                            function_call_name=function_call_name,
+                        )
+                    if function_full_response:
+                        yield await generate_sse_response(
+                            timestamp,
+                            model,
+                            content=None,
+                            tools_id=tools_id,
+                            function_call_name=None,
+                            function_call_content=function_full_response,
+                        )
 
-                if parts_json == "[]" or blockReason == "PROHIBITED_CONTENT":
-                    sse_string = await generate_sse_response(timestamp, model, stop="PROHIBITED_CONTENT")
-                    yield sse_string
-                elif finishReason:
-                    sse_string = await generate_sse_response(timestamp, model, stop="stop")
-                    yield sse_string
-                    break
+                    if blockReason == "PROHIBITED_CONTENT":
+                        yield await generate_sse_response(
+                            timestamp,
+                            model,
+                            stop="PROHIBITED_CONTENT",
+                        )
+                        terminal_seen = True
+                        break
+                    if finishReason:
+                        yield await generate_sse_response(timestamp, model, stop="stop")
+                        terminal_seen = True
+                        break
+                finally:
+                    response_json = None
+                    is_thinking = None
+                    reasoning_content = None
+                    content = None
+                    image_base64 = None
+                    audio_b64_wav = None
+                    function_call_name = None
+                    function_full_response = None
+                    tools_id = None
+                    finishReason = None
+                    blockReason = None
+                    audio_obj = None
+                    await event_owner.aclose()
 
-                parts_json = ""
+        if not terminal_seen:
+            raise SSEProtocolError(
+                "Gemini upstream ended without a finish reason"
+            )
 
         completion_tokens = candidatesTokenCount + thoughtsTokenCount
         openai_total_tokens = totalTokenCount or (promptTokenCount + completion_tokens)
@@ -405,67 +887,179 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
 
 async def fetch_vertex_claude_response_stream(client, url, headers, payload, model, timeout):
     timestamp = int(datetime.timestamp(datetime.now()))
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await run_json_cpu(json.dumps, payload)
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
         error_message = await check_response(response, "fetch_vertex_claude_response_stream")
         if error_message:
             yield error_message
             return
 
-        buffer = ""
         revicing_function_call = False
-        function_full_response = "{"
+        function_response_buffer = _BoundedTextAccumulator(
+            label="vertex tool call"
+        )
+        function_response_buffer.append("{")
         need_function_call = False
         is_finish = False
         promptTokenCount = 0
         candidatesTokenCount = 0
         totalTokenCount = 0
+        terminal_seen = False
 
-        async for chunk in response.aiter_text():
-            buffer += chunk
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                # logger.info(f"{line}")
-
-                if line and '\"finishReason\": \"' in line:
-                    is_finish = True
-                if is_finish and '\"promptTokenCount\": ' in line:
-                    json_data = parse_json_safely( "{" + line + "}")
-                    promptTokenCount = json_data.get('promptTokenCount', 0)
-                if is_finish and '\"candidatesTokenCount\": ' in line:
-                    json_data = parse_json_safely( "{" + line + "}")
-                    candidatesTokenCount = json_data.get('candidatesTokenCount', 0)
-                if is_finish and '\"totalTokenCount\": ' in line:
-                    json_data = parse_json_safely( "{" + line + "}")
-                    totalTokenCount = json_data.get('totalTokenCount', 0)
-
-                if line and '\"text\": \"' in line and not is_finish:
+        lines = iter_lines(response.aiter_bytes())
+        try:
+            async with aclosing(lines):
+                async for line in lines:
+                    json_owner = None
+                    precopy_reservation = None
+                    json_data = None
+                    content = None
+                    sse_string = None
+                    snippet = None
                     try:
-                        json_data = await asyncio.to_thread(json.loads, "{" + line.strip().rstrip(",") + "}")
-                        content = json_data.get('text', '')
-                        sse_string = await generate_sse_response(timestamp, model, content=content)
-                        yield sse_string
-                    except json.JSONDecodeError:
-                        logger.error(f"无法解析JSON: {line}")
+                        if line and '\"finishReason\": \"' in line:
+                            is_finish = True
+                            terminal_seen = True
+                        if is_finish:
+                            for field_name in (
+                                "promptTokenCount",
+                                "candidatesTokenCount",
+                                "totalTokenCount",
+                            ):
+                                if f'\"{field_name}\"' not in line:
+                                    continue
+                                value = (
+                                    await run_json_cpu(
+                                        _extract_named_token_count,
+                                        line,
+                                        field_name,
+                                    )
+                                    if len(line) >= 64 * 1024
+                                    else _extract_named_token_count(line, field_name)
+                                )
+                                if field_name == "promptTokenCount":
+                                    promptTokenCount = value
+                                elif field_name == "candidatesTokenCount":
+                                    candidatesTokenCount = value
+                                else:
+                                    totalTokenCount = value
 
-                if line and ('\"type\": \"tool_use\"' in line or revicing_function_call):
-                    revicing_function_call = True
-                    need_function_call = True
-                    if ']' in line:
-                        revicing_function_call = False
-                        continue
+                        if line and '\"text\": \"' in line and not is_finish:
+                            request_lease = get_request_admission_lease()
+                            if request_lease is not None:
+                                precopy_reservation = (
+                                    await request_lease.reserve_temporary_response_bytes(
+                                        len(line) * 4 + 64
+                                    )
+                                )
+                            snippet = "{" + line.strip().rstrip(",") + "}"
+                            try:
+                                json_owner = await parse_owned_json_value(snippet)
+                                json_data = json_owner.value
+                                if not isinstance(json_data, dict):
+                                    raise SSEProtocolError(
+                                        "Vertex Claude text frame must be an object"
+                                    )
+                                content = json_data.get("text", "")
+                                if not isinstance(content, str):
+                                    raise SSEProtocolError(
+                                        "Vertex Claude text field must be a string"
+                                    )
+                                sse_string = await generate_sse_response(
+                                    timestamp,
+                                    model,
+                                    content=content,
+                                )
+                                yield sse_string
+                            except json.JSONDecodeError:
+                                logger.error(
+                                    "Unable to parse Vertex Claude JSON line: %s",
+                                    line[:512],
+                                )
 
-                    function_full_response += line
+                        if line and (
+                            '\"type\": \"tool_use\"' in line
+                            or revicing_function_call
+                        ):
+                            revicing_function_call = True
+                            need_function_call = True
+                            if "]" in line:
+                                revicing_function_call = False
+                                continue
+                            function_response_buffer.append(line)
+                    finally:
+                        json_data = None
+                        content = None
+                        sse_string = None
+                        snippet = None
+                        line = None
+                        try:
+                            if json_owner is not None:
+                                await json_owner.aclose()
+                        finally:
+                            if precopy_reservation is not None:
+                                await precopy_reservation.release()
+        except BaseException:
+            function_response_buffer.close()
+            raise
 
         if need_function_call:
-            function_call = await asyncio.to_thread(json.loads, function_full_response)
-            function_call_name = function_call["name"]
-            function_call_id = function_call["id"]
-            sse_string = await generate_sse_response(timestamp, model, content=None, tools_id=function_call_id, function_call_name=function_call_name)
-            yield sse_string
-            function_full_response = await asyncio.to_thread(json.dumps, function_call["input"])
-            sse_string = await generate_sse_response(timestamp, model, content=None, tools_id=function_call_id, function_call_name=None, function_call_content=function_full_response)
-            yield sse_string
+            function_owner = None
+            function_text = function_response_buffer.take_text()
+            function_call = None
+            function_call_name = None
+            function_call_id = None
+            function_input = None
+            function_full_response = None
+            sse_string = None
+            try:
+                function_owner = await parse_owned_json_value(function_text)
+                function_call = function_owner.value
+                if not isinstance(function_call, dict):
+                    raise SSEProtocolError(
+                        "Vertex Claude tool call must be a JSON object"
+                    )
+                function_call_name = function_call["name"]
+                function_call_id = function_call["id"]
+                function_input = function_call["input"]
+                sse_string = await generate_sse_response(
+                    timestamp,
+                    model,
+                    content=None,
+                    tools_id=function_call_id,
+                    function_call_name=function_call_name,
+                )
+                yield sse_string
+                function_full_response = await run_json_cpu(
+                    json.dumps,
+                    function_input,
+                )
+                sse_string = await generate_sse_response(
+                    timestamp,
+                    model,
+                    content=None,
+                    tools_id=function_call_id,
+                    function_call_name=None,
+                    function_call_content=function_full_response,
+                )
+                yield sse_string
+            finally:
+                function_text = None
+                function_call = None
+                function_call_name = None
+                function_call_id = None
+                function_input = None
+                function_full_response = None
+                sse_string = None
+                if function_owner is not None:
+                    await function_owner.aclose()
+        else:
+            function_response_buffer.close()
+
+        if not terminal_seen:
+            raise SSEProtocolError(
+                "Vertex Claude upstream ended without a finish reason"
+            )
 
         sse_string = await generate_sse_response(timestamp, model, None, None, None, None, None, totalTokenCount, promptTokenCount, candidatesTokenCount)
         yield sse_string
@@ -479,9 +1073,10 @@ async def fetch_gpt_response_stream(client, url, headers, payload, timeout, resp
     is_thinking = False
     has_send_thinking = False
     ark_tag = False
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await run_json_cpu(json.dumps, payload)
     response = None
     completed_normally = False
+    semantic_terminal_seen = False
     input_tokens = 0
     output_tokens = 0
     try:
@@ -494,150 +1089,379 @@ async def fetch_gpt_response_stream(client, url, headers, payload, timeout, resp
 
             if _is_responses_api_call(url, payload):
                 async for chunk in _stream_responses_to_chat_completions(
-                    response.aiter_text(),
+                    response.aiter_bytes(),
                     request_model=payload["model"],
                 ):
                     yield chunk
                 completed_normally = True
                 return
 
-            buffer = ""
             enter_buffer = ""
 
-            async for chunk in response.aiter_text():
-                buffer += chunk
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    # logger.info("line: %s", repr(line))
-                    if line.startswith(": keepalive"):
-                        yield line + end_of_line
-                        continue
-                    if line and not is_sse_comment_frame(line) and (result:=line.lstrip("data: ").strip()) and not line.startswith("event: "):
-                        if result.strip() == "[DONE]":
-                            completed_normally = True
-                            break
-                        line = await asyncio.to_thread(json.loads, result)
-                        line['id'] = f"chatcmpl-{random_str}"
+            async def transform_event(event_owner: OwnedSSEEvent):
+                nonlocal ark_tag
+                nonlocal completed_normally
+                nonlocal enter_buffer
+                nonlocal has_send_thinking
+                nonlocal input_tokens
+                nonlocal is_thinking
+                nonlocal output_tokens
+                nonlocal semantic_terminal_seen
 
-                        # v1/responses
-                        if line.get("type") == "response.reasoning_summary_text.delta" and line.get("delta"):
-                            sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=line.get("delta"))
-                            yield sse_string
-                            continue
-                        elif line.get("type") == "response.reasoning_summary_text.done":
-                            sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content="\n\n")
-                            yield sse_string
-                            continue
-                        elif line.get("type") == "response.output_text.delta" and line.get("delta"):
-                            sse_string = await generate_sse_response(timestamp, payload["model"], content=line.get("delta"))
-                            yield sse_string
-                            continue
-                        elif line.get("type") == "response.output_text.done":
-                            sse_string = await generate_sse_response(timestamp, payload["model"], stop="stop")
-                            yield sse_string
-                            continue
-                        elif line.get("type") == "response.completed":
-                            input_tokens = safe_get(line, "response", "usage", "input_tokens", default=0)
-                            output_tokens = safe_get(line, "response", "usage", "output_tokens", default=0)
-                            continue
-                        elif line.get("type", "").startswith("response."):
-                            continue
+                raw_event = None
+                event_payload = None
+                line = None
+                event_type = None
+                content = None
+                end_think_reasoning_content = None
+                end_think_content = None
+                no_stream_content = None
+                openrouter_reasoning = None
+                openrouter_base64_image = None
+                image_data_url = None
+                azure_databricks_claude_summary_content = None
+                azure_databricks_claude_signature_content = None
+                reasoning_prefix = None
+                sse_string = None
+                json_line = None
+                try:
+                    if event_owner.is_comment:
+                        raw_event = event_owner.raw_event
+                        yield raw_event + end_of_line
+                        return
+                    event_payload = event_owner.payload
+                    if event_payload == "[DONE]":
+                        completed_normally = True
+                        return
+                    if not isinstance(event_payload, dict):
+                        if str(event_payload or "").strip():
+                            raise SSEProtocolError(
+                                "upstream SSE data is not valid JSON"
+                            )
+                        return
 
-                        # 处理 <think> 标签
-                        content = safe_get(line, "choices", 0, "delta", "content", default="")
-                        if "<think>" in content:
-                            is_thinking = True
-                            ark_tag = True
-                            content = content.replace("<think>", "")
-                        if "</think>" in content:
-                            end_think_reasoning_content = ""
-                            end_think_content = ""
-                            is_thinking = False
+                    line = event_payload
+                    line["id"] = f"chatcmpl-{random_str}"
+                    if safe_get(
+                        line,
+                        "choices",
+                        0,
+                        "finish_reason",
+                        default=None,
+                    ) is not None:
+                        semantic_terminal_seen = True
 
-                            if content.rstrip('\n').endswith("</think>"):
-                                end_think_reasoning_content = content.replace("</think>", "").rstrip('\n')
-                            elif content.lstrip('\n').startswith("</think>"):
-                                end_think_content = content.replace("</think>", "").lstrip('\n')
-                            else:
-                                end_think_reasoning_content = content.split("</think>")[0]
-                                end_think_content = content.split("</think>")[1]
+                    event_type = line.get("type")
+                    if (
+                        event_type == "response.reasoning_summary_text.delta"
+                        and line.get("delta")
+                    ):
+                        sse_string = await generate_sse_response(
+                            timestamp,
+                            payload["model"],
+                            reasoning_content=line.get("delta"),
+                        )
+                        yield sse_string
+                        return
+                    if event_type == "response.reasoning_summary_text.done":
+                        sse_string = await generate_sse_response(
+                            timestamp,
+                            payload["model"],
+                            reasoning_content="\n\n",
+                        )
+                        yield sse_string
+                        return
+                    if event_type == "response.output_text.delta" and line.get("delta"):
+                        sse_string = await generate_sse_response(
+                            timestamp,
+                            payload["model"],
+                            content=line.get("delta"),
+                        )
+                        yield sse_string
+                        return
+                    if event_type == "response.output_text.done":
+                        sse_string = await generate_sse_response(
+                            timestamp,
+                            payload["model"],
+                            stop="stop",
+                        )
+                        yield sse_string
+                        return
+                    if event_type == "response.completed":
+                        input_tokens = _coerce_token_count(
+                            safe_get(
+                                line,
+                                "response",
+                                "usage",
+                                "input_tokens",
+                                default=0,
+                            )
+                        )
+                        output_tokens = _coerce_token_count(
+                            safe_get(
+                                line,
+                                "response",
+                                "usage",
+                                "output_tokens",
+                                default=0,
+                            )
+                        )
+                        semantic_terminal_seen = True
+                        completed_normally = True
+                        return
+                    if isinstance(event_type, str) and event_type.startswith("response."):
+                        return
 
-                            if end_think_reasoning_content:
-                                sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=end_think_reasoning_content)
-                                yield sse_string
-                            if end_think_content:
-                                sse_string = await generate_sse_response(timestamp, payload["model"], content=end_think_content)
-                                yield sse_string
-                            continue
-                        if is_thinking and ark_tag:
-                            if not has_send_thinking:
-                                content = content.replace("\n\n", "")
-                            if content:
-                                sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=content)
-                                yield sse_string
-                                has_send_thinking = True
-                            continue
-
-                        # 处理 poe thinking 标签
-                        if "Thinking..." in content and "\n> " in content:
-                            is_thinking = True
-                            content = content.replace("Thinking...", "").replace("\n> ", "")
-                        if is_thinking and "\n\n" in content and not ark_tag:
-                            is_thinking = False
-                        if is_thinking and not ark_tag:
-                            content = content.replace("\n> ", "")
-                            if not has_send_thinking:
-                                content = content.replace("\n", "")
-                            if content:
-                                sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=content)
-                                yield sse_string
-                                has_send_thinking = True
-                            continue
-
-                        no_stream_content = safe_get(line, "choices", 0, "message", "content", default=None)
-                        openrouter_reasoning = safe_get(line, "choices", 0, "delta", "reasoning", default="")
-                        openrouter_base64_image = safe_get(line, "choices", 0, "delta", "images", 0, "image_url", "url", default="")
-                        if openrouter_base64_image:
-                            image_data_url = openrouter_base64_image if openrouter_base64_image.startswith("data:") else f"data:image/png;base64,{openrouter_base64_image}"
-                            sse_string = await generate_sse_response(timestamp, payload["model"], content=f"\n![image]({image_data_url})")
-                            yield sse_string
-                            continue
-                        azure_databricks_claude_summary_content = safe_get(line, "choices", 0, "delta", "content", 0, "summary", 0, "text", default="")
-                        azure_databricks_claude_signature_content = safe_get(line, "choices", 0, "delta", "content", 0, "summary", 0, "signature", default="")
-                        # print("openrouter_reasoning", repr(openrouter_reasoning), openrouter_reasoning.endswith("\\\\"), openrouter_reasoning.endswith("\\"))
-                        if azure_databricks_claude_signature_content:
-                            pass
-                        elif azure_databricks_claude_summary_content:
-                            sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=azure_databricks_claude_summary_content)
-                            yield sse_string
-                        elif openrouter_reasoning:
-                            if openrouter_reasoning.endswith("\\"):
-                                enter_buffer += openrouter_reasoning
-                                continue
-                            elif enter_buffer.endswith("\\") and openrouter_reasoning == 'n':
-                                enter_buffer += "n"
-                                continue
-                            elif enter_buffer.endswith("\\n") and openrouter_reasoning == '\\n':
-                                enter_buffer += "\\n"
-                                continue
-                            elif enter_buffer.endswith("\\n\\n"):
-                                openrouter_reasoning = '\n\n' + openrouter_reasoning
-                                enter_buffer = ""
-                            elif enter_buffer:
-                                openrouter_reasoning = enter_buffer + openrouter_reasoning
-                                enter_buffer = ''
-                            openrouter_reasoning = openrouter_reasoning.replace("\\n", "\n")
-
-                            sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=openrouter_reasoning)
-                            yield sse_string
-                        elif no_stream_content and not has_send_thinking:
-                            sse_string = await generate_sse_response(safe_get(line, "created", default=None), safe_get(line, "model", default=None), content=no_stream_content)
-                            yield sse_string
+                    content = safe_get(
+                        line,
+                        "choices",
+                        0,
+                        "delta",
+                        "content",
+                        default="",
+                    )
+                    if "<think>" in content:
+                        is_thinking = True
+                        ark_tag = True
+                        content = content.replace("<think>", "")
+                    if "</think>" in content:
+                        is_thinking = False
+                        if content.rstrip("\n").endswith("</think>"):
+                            end_think_reasoning_content = content.replace(
+                                "</think>", ""
+                            ).rstrip("\n")
+                        elif content.lstrip("\n").startswith("</think>"):
+                            end_think_content = content.replace(
+                                "</think>", ""
+                            ).lstrip("\n")
                         else:
-                            if no_stream_content:
-                                del line["choices"][0]["message"]
-                            json_line = await asyncio.to_thread(json.dumps, line)
-                            yield "data: " + json_line.strip() + end_of_line
+                            end_think_reasoning_content, end_think_content = (
+                                content.split("</think>", 1)
+                            )
+                        if end_think_reasoning_content:
+                            sse_string = await generate_sse_response(
+                                timestamp,
+                                payload["model"],
+                                reasoning_content=end_think_reasoning_content,
+                            )
+                            yield sse_string
+                        if end_think_content:
+                            sse_string = await generate_sse_response(
+                                timestamp,
+                                payload["model"],
+                                content=end_think_content,
+                            )
+                            yield sse_string
+                        return
+                    if is_thinking and ark_tag:
+                        if not has_send_thinking:
+                            content = content.replace("\n\n", "")
+                        if content:
+                            sse_string = await generate_sse_response(
+                                timestamp,
+                                payload["model"],
+                                reasoning_content=content,
+                            )
+                            yield sse_string
+                            has_send_thinking = True
+                        return
+
+                    if "Thinking..." in content and "\n> " in content:
+                        is_thinking = True
+                        content = content.replace("Thinking...", "").replace(
+                            "\n> ", ""
+                        )
+                    if is_thinking and "\n\n" in content and not ark_tag:
+                        is_thinking = False
+                    if is_thinking and not ark_tag:
+                        content = content.replace("\n> ", "")
+                        if not has_send_thinking:
+                            content = content.replace("\n", "")
+                        if content:
+                            sse_string = await generate_sse_response(
+                                timestamp,
+                                payload["model"],
+                                reasoning_content=content,
+                            )
+                            yield sse_string
+                            has_send_thinking = True
+                        return
+
+                    no_stream_content = safe_get(
+                        line,
+                        "choices",
+                        0,
+                        "message",
+                        "content",
+                        default=None,
+                    )
+                    openrouter_reasoning = safe_get(
+                        line,
+                        "choices",
+                        0,
+                        "delta",
+                        "reasoning",
+                        default="",
+                    )
+                    openrouter_base64_image = safe_get(
+                        line,
+                        "choices",
+                        0,
+                        "delta",
+                        "images",
+                        0,
+                        "image_url",
+                        "url",
+                        default="",
+                    )
+                    if openrouter_base64_image:
+                        image_data_url = (
+                            openrouter_base64_image
+                            if openrouter_base64_image.startswith("data:")
+                            else f"data:image/png;base64,{openrouter_base64_image}"
+                        )
+                        sse_string = await generate_sse_response(
+                            timestamp,
+                            payload["model"],
+                            content=f"\n![image]({image_data_url})",
+                        )
+                        yield sse_string
+                        return
+                    azure_databricks_claude_summary_content = safe_get(
+                        line,
+                        "choices",
+                        0,
+                        "delta",
+                        "content",
+                        0,
+                        "summary",
+                        0,
+                        "text",
+                        default="",
+                    )
+                    azure_databricks_claude_signature_content = safe_get(
+                        line,
+                        "choices",
+                        0,
+                        "delta",
+                        "content",
+                        0,
+                        "summary",
+                        0,
+                        "signature",
+                        default="",
+                    )
+                    if azure_databricks_claude_signature_content:
+                        return
+                    if azure_databricks_claude_summary_content:
+                        sse_string = await generate_sse_response(
+                            timestamp,
+                            payload["model"],
+                            reasoning_content=azure_databricks_claude_summary_content,
+                        )
+                        yield sse_string
+                        return
+                    if openrouter_reasoning:
+                        if openrouter_reasoning.endswith("\\"):
+                            # Only the ambiguous trailing escape marker needs
+                            # to cross an event boundary.  Emitting the safe
+                            # prefix immediately prevents one normal long
+                            # reasoning delta from becoming a tiny-buffer
+                            # protocol failure or retained-memory spike.
+                            reasoning_prefix = enter_buffer + openrouter_reasoning[:-1]
+                            enter_buffer = "\\"
+                            if reasoning_prefix:
+                                reasoning_prefix = reasoning_prefix.replace(
+                                    "\\n",
+                                    "\n",
+                                )
+                                sse_string = await generate_sse_response(
+                                    timestamp,
+                                    payload["model"],
+                                    reasoning_content=reasoning_prefix,
+                                )
+                                yield sse_string
+                            return
+                        if enter_buffer.endswith("\\") and openrouter_reasoning == "n":
+                            enter_buffer = _bounded_text_concat(
+                                enter_buffer,
+                                "n",
+                                label="reasoning escape buffer",
+                            )
+                            return
+                        if (
+                            enter_buffer.endswith("\\n")
+                            and openrouter_reasoning == "\\n"
+                        ):
+                            enter_buffer = _bounded_text_concat(
+                                enter_buffer,
+                                "\\n",
+                                label="reasoning escape buffer",
+                            )
+                            return
+                        if enter_buffer.endswith("\\n\\n"):
+                            openrouter_reasoning = "\n\n" + openrouter_reasoning
+                            enter_buffer = ""
+                        elif enter_buffer:
+                            openrouter_reasoning = enter_buffer + openrouter_reasoning
+                            enter_buffer = ""
+                        openrouter_reasoning = openrouter_reasoning.replace(
+                            "\\n", "\n"
+                        )
+                        sse_string = await generate_sse_response(
+                            timestamp,
+                            payload["model"],
+                            reasoning_content=openrouter_reasoning,
+                        )
+                        yield sse_string
+                        return
+                    if no_stream_content and not has_send_thinking:
+                        sse_string = await generate_sse_response(
+                            safe_get(line, "created", default=None),
+                            safe_get(line, "model", default=None),
+                            content=no_stream_content,
+                        )
+                        yield sse_string
+                        return
+                    if no_stream_content:
+                        del line["choices"][0]["message"]
+                    json_line = await run_json_cpu(json.dumps, line)
+                    yield "data: " + json_line.strip() + end_of_line
+                finally:
+                    raw_event = None
+                    event_payload = None
+                    line = None
+                    event_type = None
+                    content = None
+                    end_think_reasoning_content = None
+                    end_think_content = None
+                    no_stream_content = None
+                    openrouter_reasoning = None
+                    openrouter_base64_image = None
+                    image_data_url = None
+                    azure_databricks_claude_summary_content = None
+                    azure_databricks_claude_signature_content = None
+                    reasoning_prefix = None
+                    sse_string = None
+                    json_line = None
+                    await event_owner.aclose()
+
+            events = _iter_openai_stream_events(response)
+            async with aclosing(events):
+                async for event_owner in events:
+                    transformed = transform_event(event_owner)
+                    async with aclosing(transformed):
+                        async for output in transformed:
+                            try:
+                                yield output
+                            finally:
+                                output = None
+                    if completed_normally:
+                        break
+            if not completed_normally and not semantic_terminal_seen:
+                raise SSEProtocolError(
+                    "OpenAI-compatible upstream ended without a terminal event"
+                )
     finally:
         if response is not None and not completed_normally:
             await _force_close_response_httpcore_stream_chain_safely(
@@ -656,135 +1480,612 @@ async def fetch_azure_response_stream(client, url, headers, payload, timeout):
     is_thinking = False
     has_send_thinking = False
     ark_tag = False
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await run_json_cpu(json.dumps, payload)
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
         error_message = await check_response(response, "fetch_azure_response_stream")
         if error_message:
             yield error_message
             return
 
-        buffer = ""
         sse_string = ""
-        async for chunk in response.aiter_text():
-            buffer += chunk
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                # logger.info("line: %s", repr(line))
-                if line and not is_sse_comment_frame(line) and (result:=line.lstrip("data: ").strip()):
-                    if result.strip() == "[DONE]":
-                        break
-                    line = await asyncio.to_thread(json.loads, result)
-                    no_stream_content = safe_get(line, "choices", 0, "message", "content", default="")
-                    content = safe_get(line, "choices", 0, "delta", "content", default="")
-
-                    # 处理 <think> 标签
-                    if "<think>" in content:
-                        is_thinking = True
-                        ark_tag = True
-                        content = content.replace("<think>", "")
-                    if "</think>" in content:
-                        is_thinking = False
-                        content = content.replace("</think>", "")
-                        if not content:
-                            continue
-                    if is_thinking and ark_tag:
-                        if not has_send_thinking:
-                            content = content.replace("\n\n", "")
-                        if content:
-                            sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=content)
-                            yield sse_string
-                            has_send_thinking = True
+        terminal_seen = False
+        events = _iter_owned_sse_events(response.aiter_bytes())
+        async with aclosing(events):
+            async for event_owner in events:
+                event_payload = None
+                line = None
+                no_stream_content = None
+                content = None
+                json_line = None
+                try:
+                    if event_owner.is_comment:
                         continue
+                    event_payload = event_owner.payload
+                    if event_payload == "[DONE]":
+                        terminal_seen = True
+                        break
+                    if isinstance(event_payload, dict):
+                        line = event_payload
+                        if safe_get(
+                            line,
+                            "choices",
+                            0,
+                            "finish_reason",
+                            default=None,
+                        ) is not None:
+                            terminal_seen = True
+                        no_stream_content = safe_get(
+                            line,
+                            "choices",
+                            0,
+                            "message",
+                            "content",
+                            default="",
+                        )
+                        content = safe_get(
+                            line,
+                            "choices",
+                            0,
+                            "delta",
+                            "content",
+                            default="",
+                        )
 
-                    if no_stream_content or content or sse_string:
-                        input_tokens = safe_get(line, "usage", "prompt_tokens", default=0)
-                        output_tokens = safe_get(line, "usage", "completion_tokens", default=0)
-                        total_tokens = safe_get(line, "usage", "total_tokens", default=0)
-                        sse_string = await generate_sse_response(timestamp, safe_get(line, "model", default=None), content=no_stream_content or content, total_tokens=total_tokens, prompt_tokens=input_tokens, completion_tokens=output_tokens)
-                        yield sse_string
-                    else:
-                        if no_stream_content:
-                            del line["choices"][0]["message"]
-                        json_line = await asyncio.to_thread(json.dumps, line)
-                        yield "data: " + json_line.strip() + end_of_line
+                        if "<think>" in content:
+                            is_thinking = True
+                            ark_tag = True
+                            content = content.replace("<think>", "")
+                        if "</think>" in content:
+                            is_thinking = False
+                            content = content.replace("</think>", "")
+                            if not content:
+                                continue
+                        if is_thinking and ark_tag:
+                            if not has_send_thinking:
+                                content = content.replace("\n\n", "")
+                            if content:
+                                sse_string = await generate_sse_response(
+                                    timestamp,
+                                    payload["model"],
+                                    reasoning_content=content,
+                                )
+                                yield sse_string
+                                has_send_thinking = True
+                            continue
+
+                        if no_stream_content or content or sse_string:
+                            input_tokens = _coerce_token_count(
+                                safe_get(
+                                    line,
+                                    "usage",
+                                    "prompt_tokens",
+                                    default=0,
+                                )
+                            )
+                            output_tokens = _coerce_token_count(
+                                safe_get(
+                                    line,
+                                    "usage",
+                                    "completion_tokens",
+                                    default=0,
+                                )
+                            )
+                            total_tokens = _coerce_token_count(
+                                safe_get(
+                                    line,
+                                    "usage",
+                                    "total_tokens",
+                                    default=0,
+                                )
+                            )
+                            sse_string = await generate_sse_response(
+                                timestamp,
+                                safe_get(line, "model", default=None),
+                                content=no_stream_content or content,
+                                total_tokens=total_tokens,
+                                prompt_tokens=input_tokens,
+                                completion_tokens=output_tokens,
+                            )
+                            yield sse_string
+                        else:
+                            json_line = await run_json_cpu(json.dumps, line)
+                            yield "data: " + json_line.strip() + end_of_line
+                    elif str(event_payload or "").strip():
+                        raise SSEProtocolError(
+                            "Azure upstream SSE data is not valid JSON"
+                        )
+                finally:
+                    event_payload = None
+                    line = None
+                    no_stream_content = None
+                    content = None
+                    json_line = None
+                    await event_owner.aclose()
+        if not terminal_seen:
+            raise SSEProtocolError("Azure upstream ended without a terminal event")
     yield "data: [DONE]" + end_of_line
 
 async def fetch_cloudflare_response_stream(client, url, headers, payload, model, timeout):
     timestamp = int(datetime.timestamp(datetime.now()))
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await run_json_cpu(json.dumps, payload)
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
         error_message = await check_response(response, "fetch_cloudflare_response_stream")
         if error_message:
             yield error_message
             return
 
-        buffer = ""
-        async for chunk in response.aiter_text():
-            buffer += chunk
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                # logger.info("line: %s", repr(line))
-                if line.startswith("data:"):
-                    line = line.lstrip("data: ")
-                    if line == "[DONE]":
+        terminal_seen = False
+        events = _iter_owned_sse_events(response.aiter_bytes())
+        async with aclosing(events):
+            async for event_owner in events:
+                event_payload = None
+                resp = None
+                message = None
+                sse_string = None
+                try:
+                    if event_owner.is_comment:
+                        continue
+                    event_payload = event_owner.payload
+                    if event_payload == "[DONE]":
+                        terminal_seen = True
                         break
-                    resp: dict = await asyncio.to_thread(json.loads, line)
-                    message = resp.get("response")
-                    if message:
-                        sse_string = await generate_sse_response(timestamp, model, content=message)
-                        yield sse_string
+                    if isinstance(event_payload, dict):
+                        resp = event_payload
+                        message = resp.get("response")
+                        if message:
+                            sse_string = await generate_sse_response(
+                                timestamp,
+                                model,
+                                content=message,
+                            )
+                            yield sse_string
+                        if resp.get("done") is True or resp.get("event") in {
+                            "done",
+                            "completed",
+                        }:
+                            terminal_seen = True
+                            break
+                    elif str(event_payload or "").strip():
+                        raise SSEProtocolError(
+                            "Cloudflare upstream SSE data is not valid JSON"
+                        )
+                finally:
+                    event_payload = None
+                    resp = None
+                    message = None
+                    sse_string = None
+                    await event_owner.aclose()
+        if not terminal_seen:
+            raise SSEProtocolError(
+                "Cloudflare upstream ended without a terminal event"
+            )
     yield "data: [DONE]" + end_of_line
 
 async def fetch_cohere_response_stream(client, url, headers, payload, model, timeout):
     timestamp = int(datetime.timestamp(datetime.now()))
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await run_json_cpu(json.dumps, payload)
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
         error_message = await check_response(response, "fetch_cohere_response_stream")
         if error_message:
             yield error_message
             return
 
-        buffer = ""
-        async for chunk in response.aiter_text():
-            buffer += chunk
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                # logger.info("line: %s", repr(line))
-                resp: dict = await asyncio.to_thread(json.loads, line)
-                if resp.get("is_finished"):
-                    break
-                if resp.get("event_type") == "text-generation":
-                    message = resp.get("text")
-                    sse_string = await generate_sse_response(timestamp, model, content=message)
-                    yield sse_string
+        terminal_seen = False
+        lines = iter_lines(response.aiter_bytes())
+        async with aclosing(lines):
+            async for line in lines:
+                if not line.strip():
+                    line = None
+                    continue
+                owner = None
+                resp = None
+                message = None
+                sse_string = None
+                try:
+                    owner = await parse_owned_json_value(line)
+                    resp = owner.value
+                    if not isinstance(resp, dict):
+                        raise SSEProtocolError(
+                            "Cohere upstream frame must be a JSON object"
+                        )
+                    if resp.get("is_finished"):
+                        terminal_seen = True
+                        break
+                    if resp.get("event_type") == "text-generation":
+                        message = resp.get("text")
+                        sse_string = await generate_sse_response(
+                            timestamp,
+                            model,
+                            content=message,
+                        )
+                        yield sse_string
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise SSEProtocolError(
+                        "Cohere upstream frame is not valid JSON"
+                    ) from exc
+                finally:
+                    resp = None
+                    message = None
+                    sse_string = None
+                    line = None
+                    if owner is not None:
+                        await owner.aclose()
+        if not terminal_seen:
+            raise SSEProtocolError("Cohere upstream ended without is_finished")
     yield "data: [DONE]" + end_of_line
 
 async def fetch_claude_response_stream(client, url, headers, payload, model, timeout):
     timestamp = int(datetime.timestamp(datetime.now()))
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await run_json_cpu(json.dumps, payload)
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
         error_message = await check_response(response, "fetch_claude_response_stream")
         if error_message:
             yield error_message
             return
-        buffer = ""
         input_tokens = 0
         cache_read_input_tokens = 0
-        async for chunk in response.aiter_text():
-            # logger.info(f"chunk: {repr(chunk)}")
-            buffer += chunk
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                # logger.info(line)
+        terminal_seen = False
+        events = _iter_owned_sse_events(response.aiter_bytes())
+        async with aclosing(events):
+            async for event_owner in events:
+                event_name = None
+                event_payload = None
+                resp = None
+                text = None
+                function_call_name = None
+                tools_id = None
+                thinking_content = None
+                function_call_content = None
+                sse_string = None
+                try:
+                    if event_owner.is_comment:
+                        continue
+                    event_name = event_owner.event_name
+                    event_payload = event_owner.payload
+                    if event_payload == "[DONE]":
+                        terminal_seen = True
+                        break
+                    if isinstance(event_payload, dict):
+                        resp = event_payload
+                        if (
+                            event_name == "message_stop"
+                            or resp.get("type") == "message_stop"
+                        ):
+                            terminal_seen = True
 
-                if line.startswith("data:") and (line := line.lstrip("data: ")):
-                    resp: dict = await asyncio.to_thread(json.loads, line)
+                        input_tokens = _coerce_token_count(
+                            input_tokens
+                            or safe_get(
+                                resp,
+                                "message",
+                                "usage",
+                                "input_tokens",
+                                default=0,
+                            )
+                            or safe_get(resp, "usage", "input_tokens", default=0)
+                        )
+                        cache_read_input_tokens = _coerce_token_count(
+                            cache_read_input_tokens
+                            or safe_get(
+                                resp,
+                                "message",
+                                "usage",
+                                "cache_read_input_tokens",
+                                default=0,
+                            )
+                            or safe_get(
+                                resp,
+                                "usage",
+                                "cache_read_input_tokens",
+                                default=0,
+                            )
+                        )
+                        output_tokens = _coerce_token_count(
+                            safe_get(
+                                resp,
+                                "usage",
+                                "output_tokens",
+                                default=0,
+                            )
+                        )
+                        if output_tokens:
+                            thinking_tokens = _coerce_token_count(
+                                safe_get(
+                                    resp,
+                                    "usage",
+                                    "output_tokens_details",
+                                    "thinking_tokens",
+                                    default=0,
+                                )
+                            )
+                            total_tokens = input_tokens + output_tokens
+                            sse_string = await generate_sse_response(
+                                timestamp,
+                                model,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                total_tokens,
+                                input_tokens,
+                                output_tokens,
+                                cached_tokens=cache_read_input_tokens,
+                                reasoning_tokens=thinking_tokens,
+                            )
+                            yield sse_string
+                            terminal_seen = True
+                            break
 
-                    input_tokens = input_tokens or safe_get(resp, "message", "usage", "input_tokens", default=0) or safe_get(resp, "usage", "input_tokens", default=0)
-                    cache_read_input_tokens = cache_read_input_tokens or safe_get(resp, "message", "usage", "cache_read_input_tokens", default=0) or safe_get(resp, "usage", "cache_read_input_tokens", default=0)
-                    output_tokens = safe_get(resp, "usage", "output_tokens", default=0)
-                    if output_tokens:
-                        thinking_tokens = safe_get(resp, "usage", "output_tokens_details", "thinking_tokens", default=0) or 0
+                        text = safe_get(resp, "delta", "text", default="")
+                        if text:
+                            sse_string = await generate_sse_response(
+                                timestamp,
+                                model,
+                                text,
+                            )
+                            yield sse_string
+                            continue
+
+                        function_call_name = safe_get(
+                            resp,
+                            "content_block",
+                            "name",
+                            default=None,
+                        )
+                        tools_id = safe_get(
+                            resp,
+                            "content_block",
+                            "id",
+                            default=None,
+                        )
+                        if tools_id and function_call_name:
+                            sse_string = await generate_sse_response(
+                                timestamp,
+                                model,
+                                None,
+                                tools_id,
+                                function_call_name,
+                                None,
+                            )
+                            yield sse_string
+
+                        thinking_content = safe_get(
+                            resp,
+                            "delta",
+                            "thinking",
+                            default="",
+                        )
+                        if thinking_content:
+                            sse_string = await generate_sse_response(
+                                timestamp,
+                                model,
+                                reasoning_content=thinking_content,
+                            )
+                            yield sse_string
+
+                        function_call_content = safe_get(
+                            resp,
+                            "delta",
+                            "partial_json",
+                            default="",
+                        )
+                        if function_call_content:
+                            sse_string = await generate_sse_response(
+                                timestamp,
+                                model,
+                                None,
+                                None,
+                                None,
+                                function_call_content,
+                            )
+                            yield sse_string
+                        if terminal_seen:
+                            break
+                    elif str(event_payload or "").strip():
+                        raise SSEProtocolError(
+                            "Claude upstream SSE data is not valid JSON"
+                        )
+                finally:
+                    event_name = None
+                    event_payload = None
+                    resp = None
+                    text = None
+                    function_call_name = None
+                    tools_id = None
+                    thinking_content = None
+                    function_call_content = None
+                    sse_string = None
+                    await event_owner.aclose()
+
+        if not terminal_seen:
+            raise SSEProtocolError("Claude upstream ended without message_stop")
+
+    yield "data: [DONE]" + end_of_line
+
+async def _iter_aws_eventstream_payloads(response: Any):
+    iterator_factory = getattr(response, "aiter_raw", None)
+    if not callable(iterator_factory):
+        iterator_factory = response.aiter_bytes
+    pending = bytearray()
+    pending_budget = StreamParserRetainedLease()
+    try:
+        async for raw_chunk in iterator_factory():
+            chunk_size = len(raw_chunk)
+            pending_budget.grow(chunk_size)
+            try:
+                pending.extend(raw_chunk)
+            except BaseException:
+                pending_budget.shrink(chunk_size)
+                raise
+            raw_chunk = None
+            cursor = 0
+            while len(pending) - cursor >= 12:
+                total_length = int.from_bytes(
+                    pending[cursor : cursor + 4],
+                    "big",
+                )
+                headers_length = int.from_bytes(
+                    pending[cursor + 4 : cursor + 8],
+                    "big",
+                )
+                if (
+                    total_length < 16
+                    or total_length > DEFAULT_MAX_EVENT_BYTES
+                    or headers_length > total_length - 16
+                ):
+                    raise SSEProtocolError("invalid AWS event-stream frame length")
+                if len(pending) - cursor < total_length:
+                    break
+                frame_view = memoryview(pending)[cursor : cursor + total_length]
+                expected_prelude_crc = int.from_bytes(frame_view[8:12], "big")
+                prelude_valid = (
+                    zlib.crc32(frame_view[:8]) & 0xFFFFFFFF
+                ) == expected_prelude_crc
+                expected_message_crc = int.from_bytes(frame_view[-4:], "big")
+                message_valid = (
+                    zlib.crc32(frame_view[:-4]) & 0xFFFFFFFF
+                ) == expected_message_crc
+                del frame_view
+                if not prelude_valid:
+                    raise SSEProtocolError("invalid AWS event-stream prelude CRC")
+                if not message_valid:
+                    raise SSEProtocolError("invalid AWS event-stream message CRC")
+                request_lease = get_request_admission_lease()
+                frame_reservation = (
+                    await request_lease.reserve_temporary_response_bytes(
+                        total_length * 3
+                    )
+                    if request_lease is not None
+                    else None
+                )
+                owner = None
+                frame = None
+                payload_bytes = None
+                try:
+                    frame = bytes(pending[cursor : cursor + total_length])
+                    payload_start = 12 + headers_length
+                    payload_bytes = frame[payload_start:-4]
+                    cursor += total_length
+                    if not payload_bytes:
+                        continue
+                    owner = await parse_owned_json_value(payload_bytes)
+                    yield owner
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise SSEProtocolError(
+                        "AWS event-stream payload is not valid JSON"
+                    ) from exc
+                finally:
+                    payload_bytes = None
+                    frame = None
+                    try:
+                        if owner is not None:
+                            await owner.aclose()
+                    finally:
+                        if frame_reservation is not None:
+                            await frame_reservation.release()
+            if cursor:
+                del pending[:cursor]
+                pending_budget.shrink(cursor)
+            if len(pending) > DEFAULT_MAX_EVENT_BYTES:
+                raise SSEBufferOverflowError(
+                    buffer_name="AWS event-stream frame",
+                    limit_bytes=DEFAULT_MAX_EVENT_BYTES,
+                    observed_bytes=len(pending),
+                )
+        if pending:
+            raise SSEProtocolError(
+                "AWS event-stream ended with an incomplete frame"
+            )
+    finally:
+        pending.clear()
+        pending_budget.release()
+
+
+async def fetch_aws_response_stream(client, url, headers, payload, model, timeout):
+    timestamp = int(datetime.timestamp(datetime.now()))
+    json_payload = await run_json_cpu(json.dumps, payload)
+    async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
+        error_message = await check_response(response, "fetch_aws_response_stream")
+        if error_message:
+            yield error_message
+            return
+
+        terminal_seen = False
+        events = _iter_aws_eventstream_payloads(response)
+        async with aclosing(events):
+            async for event_owner in events:
+                chunk_data = None
+                encoded = None
+                decoded_bytes = None
+                payload_chunk = None
+                nested_owner = None
+                nested_reservation = None
+                text = None
+                usage = None
+                sse_string = None
+                try:
+                    chunk_data = event_owner.value
+                    if not isinstance(chunk_data, dict):
+                        raise SSEProtocolError(
+                            "AWS event-stream payload must be a JSON object"
+                        )
+                    if "bytes" not in chunk_data:
+                        continue
+                    encoded = chunk_data["bytes"]
+                    if not isinstance(encoded, str):
+                        raise SSEProtocolError(
+                            "AWS event-stream bytes field must be base64 text"
+                        )
+                    decoded_limit = ((len(encoded) + 3) // 4) * 3
+                    request_lease = get_request_admission_lease()
+                    nested_reservation = (
+                        await request_lease.reserve_temporary_response_bytes(
+                            decoded_limit * 2
+                        )
+                        if request_lease is not None
+                        else None
+                    )
+                    try:
+                        decoded_bytes = await run_json_cpu(
+                            base64.b64decode,
+                            encoded,
+                            validate=True,
+                        )
+                    except (ValueError, binascii.Error) as exc:
+                        raise SSEProtocolError(
+                            "AWS event-stream bytes field is not valid base64"
+                        ) from exc
+                    nested_owner = await parse_owned_json_value(decoded_bytes)
+                    payload_chunk = nested_owner.value
+                    if not isinstance(payload_chunk, dict):
+                        raise SSEProtocolError(
+                            "AWS decoded event payload must be a JSON object"
+                        )
+
+                    text = safe_get(payload_chunk, "delta", "text", default="")
+                    if text:
+                        sse_string = await generate_sse_response(
+                            timestamp,
+                            model,
+                            text,
+                            None,
+                            None,
+                        )
+                        yield sse_string
+
+                    usage = safe_get(
+                        payload_chunk,
+                        "amazon-bedrock-invocationMetrics",
+                        default="",
+                    )
+                    if usage:
+                        input_tokens = _coerce_token_count(
+                            usage.get("inputTokenCount", 0)
+                        )
+                        output_tokens = _coerce_token_count(
+                            usage.get("outputTokenCount", 0)
+                        )
                         total_tokens = input_tokens + output_tokens
                         sse_string = await generate_sse_response(
                             timestamp,
@@ -797,85 +2098,32 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                             total_tokens,
                             input_tokens,
                             output_tokens,
-                            cached_tokens=cache_read_input_tokens,
-                            reasoning_tokens=thinking_tokens,
                         )
                         yield sse_string
+                        terminal_seen = True
                         break
+                finally:
+                    chunk_data = None
+                    encoded = None
+                    decoded_bytes = None
+                    payload_chunk = None
+                    text = None
+                    usage = None
+                    sse_string = None
+                    try:
+                        if nested_owner is not None:
+                            await nested_owner.aclose()
+                    finally:
+                        try:
+                            if nested_reservation is not None:
+                                await nested_reservation.release()
+                        finally:
+                            await event_owner.aclose()
 
-                    text = safe_get(resp, "delta", "text", default="")
-                    if text:
-                        sse_string = await generate_sse_response(timestamp, model, text)
-                        yield sse_string
-                        continue
-
-                    function_call_name = safe_get(resp, "content_block", "name", default=None)
-                    tools_id = safe_get(resp, "content_block", "id", default=None)
-                    if tools_id and function_call_name:
-                        sse_string = await generate_sse_response(timestamp, model, None, tools_id, function_call_name, None)
-                        yield sse_string
-
-                    thinking_content = safe_get(resp, "delta", "thinking", default="")
-                    if thinking_content:
-                        sse_string = await generate_sse_response(timestamp, model, reasoning_content=thinking_content)
-                        yield sse_string
-
-                    function_call_content = safe_get(resp, "delta", "partial_json", default="")
-                    if function_call_content:
-                        sse_string = await generate_sse_response(timestamp, model, None, None, None, function_call_content)
-                        yield sse_string
-
-    yield "data: [DONE]" + end_of_line
-
-async def fetch_aws_response_stream(client, url, headers, payload, model, timeout):
-    timestamp = int(datetime.timestamp(datetime.now()))
-    json_payload = await asyncio.to_thread(json.dumps, payload)
-    async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
-        error_message = await check_response(response, "fetch_aws_response_stream")
-        if error_message:
-            yield error_message
-            return
-
-        buffer = ""
-        async for line in response.aiter_text():
-            buffer += line
-            while "\r" in buffer:
-                line, buffer = buffer.split("\r", 1)
-                if not line or \
-                line.strip() == "" or \
-                line.strip().startswith(':content-type') or \
-                line.strip().startswith(':event-type'): # 过滤掉完全空的行或只有空白的行
-                    continue
-
-                json_match = re.search(r'event{.*?}', line)
-                if not json_match:
-                    continue
-                try:
-                    chunk_data = await asyncio.to_thread(json.loads, json_match.group(0).lstrip('event'))
-                except json.JSONDecodeError:
-                    logger.error(f"DEBUG json.JSONDecodeError: {json_match.group(0).lstrip('event')!r}")
-                    continue
-
-                # --- 后续处理逻辑不变 ---
-                if "bytes" in chunk_data:
-                    # 解码 Base64 编码的字节
-                    decoded_bytes = base64.b64decode(chunk_data["bytes"])
-                    # 将解码后的字节再次解析为 JSON
-                    payload_chunk = await asyncio.to_thread(json.loads, decoded_bytes.decode('utf-8'))
-                    # print(f"DEBUG payload_chunk: {payload_chunk!r}")
-
-                    text = safe_get(payload_chunk, "delta", "text", default="")
-                    if text:
-                        sse_string = await generate_sse_response(timestamp, model, text, None, None)
-                        yield sse_string
-
-                    usage = safe_get(payload_chunk, "amazon-bedrock-invocationMetrics", default="")
-                    if usage:
-                        input_tokens = usage.get("inputTokenCount", 0)
-                        output_tokens = usage.get("outputTokenCount", 0)
-                        total_tokens = input_tokens + output_tokens
-                        sse_string = await generate_sse_response(timestamp, model, None, None, None, None, None, total_tokens, input_tokens, output_tokens)
-                        yield sse_string
+        if not terminal_seen:
+            raise SSEProtocolError(
+                "AWS event-stream ended without invocation metrics"
+            )
 
     yield "data: [DONE]" + end_of_line
 
@@ -965,7 +2213,7 @@ async def _fetch_search_response(client, url, headers, payload, timeout, respons
         if key in (headers or {}):
             content_type = headers.get(key)
             break
-    if content_type and "application/json" in str(content_type).lower():
+    if content_type and is_json_media_type(content_type):
         response = await client.post(url, headers=headers, json=payload, timeout=timeout)
     else:
         response = await client.get(url, headers=headers, params=payload, timeout=timeout)
@@ -973,41 +2221,63 @@ async def _fetch_search_response(client, url, headers, payload, timeout, respons
     return response
 
 
-async def _fetch_post_response(client, url, headers, payload, timeout, response_headers_sink: ResponseHeadersSink | None = None):
+async def _fetch_post_response(
+    client,
+    url,
+    headers,
+    payload,
+    timeout,
+    response_headers_sink: ResponseHeadersSink | None = None,
+    *,
+    binary_response: bool = False,
+):
+    post = client.post
+    if binary_response:
+        # The managed client still enforces the same 64 MiB wire limit and
+        # shared response-byte budget, but does not charge an 8x JSON object
+        # expansion for trusted TTS bytes.  Raw/dummy clients keep their
+        # ordinary post method for compatibility in isolated provider tests.
+        post = getattr(client, "post_buffered_binary", post)
     multipart_payload = _pop_multipart_payload(payload)
     if multipart_payload is not None:
         data, files = multipart_payload
         multipart_headers, multipart_content = _build_multipart_content(headers, data, files)
-        response = await client.post(url, headers=multipart_headers, content=multipart_content, timeout=timeout)
+        response = await post(url, headers=multipart_headers, content=multipart_content, timeout=timeout)
         _capture_response_headers(response_headers_sink, getattr(response, "headers", None))
         return response
     if payload.get("file"):
         file = payload.pop("file")
-        response = await client.post(url, headers=headers, data=payload, files={"file": file}, timeout=timeout)
+        response = await post(url, headers=headers, data=payload, files={"file": file}, timeout=timeout)
         _capture_response_headers(response_headers_sink, getattr(response, "headers", None))
         return response
-    json_payload = await asyncio.to_thread(json.dumps, payload)
-    response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
+    json_payload = await run_json_cpu(json.dumps, payload)
+    response = await post(url, headers=headers, content=json_payload, timeout=timeout)
     _capture_response_headers(response_headers_sink, getattr(response, "headers", None))
     return response
 
 
 async def _yield_search_response(response, url):
     try:
-        response_json = response.json()
+        response_json = await run_json_cpu(json.loads, response.content)
     except Exception:
         response_json = {"text": response.text}
     normalized = normalize_search_response(url, response_json)
-    yield await asyncio.to_thread(json.dumps, normalized, ensure_ascii=False)
+    yield await run_json_cpu(json.dumps, normalized, ensure_ascii=False)
 
 
 async def _yield_responses_api_chat_completion(response, model):
     response_bytes = await response.aread()
-    response_json = await asyncio.to_thread(json.loads, response_bytes)
+    response_json = await run_json_cpu(json.loads, response_bytes)
     usage = _responses_usage_to_chat_completion_usage(safe_get(response_json, "usage", default=None))
-    prompt_tokens = safe_get(usage, "prompt_tokens", default=0) or 0
-    completion_tokens = safe_get(usage, "completion_tokens", default=0) or 0
-    total_tokens = safe_get(usage, "total_tokens", default=0) or 0
+    prompt_tokens = _coerce_token_count(
+        safe_get(usage, "prompt_tokens", default=0)
+    )
+    completion_tokens = _coerce_token_count(
+        safe_get(usage, "completion_tokens", default=0)
+    )
+    total_tokens = _coerce_token_count(
+        safe_get(usage, "total_tokens", default=0)
+    )
     content, reasoning_content = _responses_output_to_text(response_json)
     timestamp = safe_get(response_json, "created", default=int(datetime.timestamp(datetime.now())))
     yield await generate_no_stream_response(
@@ -1019,40 +2289,43 @@ async def _yield_responses_api_chat_completion(response, model):
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         reasoning_content=reasoning_content or None,
-        cached_tokens=safe_get(usage, "prompt_tokens_details", "cached_tokens", default=0) or 0,
-        prompt_audio_tokens=safe_get(usage, "prompt_tokens_details", "audio_tokens", default=0) or 0,
-        reasoning_tokens=safe_get(usage, "completion_tokens_details", "reasoning_tokens", default=0) or 0,
-        completion_audio_tokens=safe_get(usage, "completion_tokens_details", "audio_tokens", default=0) or 0,
-        accepted_prediction_tokens=safe_get(usage, "completion_tokens_details", "accepted_prediction_tokens", default=0) or 0,
-        rejected_prediction_tokens=safe_get(usage, "completion_tokens_details", "rejected_prediction_tokens", default=0) or 0,
+        cached_tokens=_coerce_token_count(safe_get(usage, "prompt_tokens_details", "cached_tokens", default=0)),
+        prompt_audio_tokens=_coerce_token_count(safe_get(usage, "prompt_tokens_details", "audio_tokens", default=0)),
+        reasoning_tokens=_coerce_token_count(safe_get(usage, "completion_tokens_details", "reasoning_tokens", default=0)),
+        completion_audio_tokens=_coerce_token_count(safe_get(usage, "completion_tokens_details", "audio_tokens", default=0)),
+        accepted_prediction_tokens=_coerce_token_count(safe_get(usage, "completion_tokens_details", "accepted_prediction_tokens", default=0)),
+        rejected_prediction_tokens=_coerce_token_count(safe_get(usage, "completion_tokens_details", "rejected_prediction_tokens", default=0)),
     )
 
 
 def _parse_provider_json_response(response_json):
     if isinstance(response_json, str):
-        import ast
-
-        return ast.literal_eval(str(response_json))
+        raise SSEProtocolError(
+            "provider returned nested JSON text instead of an object or array"
+        )
     if isinstance(response_json, list):
         return response_json
     if isinstance(response_json, dict):
         return [response_json]
-    logger.error("error fetch_response: Unknown response_json type: %s", type(response_json))
-    return response_json
+    raise SSEProtocolError(
+        f"provider returned unsupported JSON type {type(response_json).__name__}"
+    )
 
 
 async def _yield_gemini_chat_completion(response, model):
     response_bytes = await response.aread()
-    response_json = await asyncio.to_thread(json.loads, response_bytes)
+    response_json = await run_json_cpu(json.loads, response_bytes)
     parsed_data = _parse_provider_json_response(response_json)
     parts_list = safe_get(parsed_data, 0, "candidates", 0, "content", "parts", default=[])
-    normalized_parts = normalize_gemini_parts(parts_list if isinstance(parts_list, list) else [])
+    normalized_parts = await normalize_gemini_parts(
+        parts_list if isinstance(parts_list, list) else []
+    )
     usage_metadata = safe_get(parsed_data, -1, "usageMetadata")
-    prompt_tokens = safe_get(usage_metadata, "promptTokenCount", default=0)
-    candidates_tokens = safe_get(usage_metadata, "candidatesTokenCount", default=0)
-    total_tokens = safe_get(usage_metadata, "totalTokenCount", default=0)
-    cached_tokens = safe_get(usage_metadata, "cachedContentTokenCount", default=0)
-    reasoning_tokens = safe_get(usage_metadata, "thoughtsTokenCount", default=0)
+    prompt_tokens = _coerce_token_count(safe_get(usage_metadata, "promptTokenCount", default=0))
+    candidates_tokens = _coerce_token_count(safe_get(usage_metadata, "candidatesTokenCount", default=0))
+    total_tokens = _coerce_token_count(safe_get(usage_metadata, "totalTokenCount", default=0))
+    cached_tokens = _coerce_token_count(safe_get(usage_metadata, "cachedContentTokenCount", default=0))
+    reasoning_tokens = _coerce_token_count(safe_get(usage_metadata, "thoughtsTokenCount", default=0))
     completion_tokens = candidates_tokens + reasoning_tokens
     role = safe_get(parsed_data, -1, "candidates", 0, "content", "role")
     if role == "model":
@@ -1086,10 +2359,22 @@ async def _yield_gemini_chat_completion(response, model):
 
 async def _yield_claude_chat_completion(response, model):
     response_bytes = await response.aread()
-    response_json = await asyncio.to_thread(json.loads, response_bytes)
-    prompt_tokens = safe_get(response_json, "usage", "input_tokens", default=0)
-    output_tokens = safe_get(response_json, "usage", "output_tokens", default=0)
-    thinking_tokens = safe_get(response_json, "usage", "output_tokens_details", "thinking_tokens", default=0) or 0
+    response_json = await run_json_cpu(json.loads, response_bytes)
+    prompt_tokens = _coerce_token_count(
+        safe_get(response_json, "usage", "input_tokens", default=0)
+    )
+    output_tokens = _coerce_token_count(
+        safe_get(response_json, "usage", "output_tokens", default=0)
+    )
+    thinking_tokens = _coerce_token_count(
+        safe_get(
+            response_json,
+            "usage",
+            "output_tokens_details",
+            "thinking_tokens",
+            default=0,
+        )
+    )
     yield await generate_no_stream_response(
         int(datetime.timestamp(datetime.now())),
         model,
@@ -1101,14 +2386,14 @@ async def _yield_claude_chat_completion(response, model):
         total_tokens=prompt_tokens + output_tokens,
         prompt_tokens=prompt_tokens,
         completion_tokens=output_tokens,
-        cached_tokens=safe_get(response_json, "usage", "cache_read_input_tokens", default=0),
+        cached_tokens=_coerce_token_count(safe_get(response_json, "usage", "cache_read_input_tokens", default=0)),
         reasoning_tokens=thinking_tokens,
     )
 
 
 async def _yield_doubao_translation_chat_completion(response, model):
     response_bytes = await response.aread()
-    response_json = await asyncio.to_thread(json.loads, response_bytes)
+    response_json = await run_json_cpu(json.loads, response_bytes)
     if isinstance(response_json, dict) and response_json.get("error"):
         yield {
             "error": "doubao-translation upstream error",
@@ -1137,14 +2422,19 @@ async def _yield_doubao_translation_chat_completion(response, model):
         return
 
     usage_obj = safe_get(response_json, "usage", default={}) or {}
-    prompt_tokens = usage_obj.get("input_tokens") or usage_obj.get("prompt_tokens") or 0
-    completion_tokens = usage_obj.get("output_tokens") or usage_obj.get("completion_tokens") or 0
+    prompt_tokens = _coerce_token_count(
+        usage_obj.get("input_tokens") or usage_obj.get("prompt_tokens")
+    )
+    completion_tokens = _coerce_token_count(
+        usage_obj.get("output_tokens") or usage_obj.get("completion_tokens")
+    )
     yield await generate_no_stream_response(
         int(datetime.timestamp(datetime.now())),
         model,
         content=output_text,
         role="assistant",
-        total_tokens=usage_obj.get("total_tokens") or (prompt_tokens + completion_tokens),
+        total_tokens=_coerce_token_count(usage_obj.get("total_tokens"))
+        or (prompt_tokens + completion_tokens),
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
     )
@@ -1152,7 +2442,7 @@ async def _yield_doubao_translation_chat_completion(response, model):
 
 async def _yield_azure_response(response):
     response_bytes = await response.aread()
-    response_json = await asyncio.to_thread(json.loads, response_bytes)
+    response_json = await run_json_cpu(json.loads, response_bytes)
     if "choices" in response_json:
         for choice in response_json["choices"]:
             if "content_filter_results" in choice:
@@ -1164,13 +2454,13 @@ async def _yield_azure_response(response):
 
 async def _yield_dashscope_multimodal_response(response):
     response_bytes = await response.aread()
-    response_json = await asyncio.to_thread(json.loads, response_bytes)
+    response_json = await run_json_cpu(json.loads, response_bytes)
     yield safe_get(response_json, "output", "choices", 0, "message", "content", 0, default=None)
 
 
 async def _yield_embedding_response(response, model):
     response_bytes = await response.aread()
-    response_json = await asyncio.to_thread(json.loads, response_bytes)
+    response_json = await run_json_cpu(json.loads, response_bytes)
     content = safe_get(response_json, "embedding", "values", default=[])
     yield {
         "object": "list",
@@ -1200,7 +2490,15 @@ async def fetch_response(client, url, headers, payload, engine, model, timeout=2
             yield item
         return
 
-    response = await _fetch_post_response(client, url, headers, payload, timeout, response_headers_sink=response_headers_sink)
+    response = await _fetch_post_response(
+        client,
+        url,
+        headers,
+        payload,
+        timeout,
+        response_headers_sink=response_headers_sink,
+        binary_response=engine == "tts",
+    )
     error_message = await check_response(response, "fetch_response")
     if error_message:
         yield error_message
@@ -1237,12 +2535,12 @@ async def fetch_response(client, url, headers, payload, engine, model, timeout=2
             yield item
     else:
         response_bytes = await response.aread()
-        response_json = await asyncio.to_thread(json.loads, response_bytes)
+        response_json = await run_json_cpu(json.loads, response_bytes)
         yield response_json
 
 async def fetch_doubao_translation_response_stream(client, url, headers, payload, model, timeout):
     timestamp = int(datetime.timestamp(datetime.now()))
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await run_json_cpu(json.dumps, payload)
 
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
         error_message = await check_response(response, "fetch_doubao_translation_response_stream")
@@ -1255,47 +2553,113 @@ async def fetch_doubao_translation_response_stream(client, url, headers, payload
         completion_tokens = 0
         total_tokens = 0
 
-        async for chunk in response.aiter_text():
-            for raw_event in sse_parser.feed(chunk):
-                if not raw_event.strip():
-                    continue
+        async def raw_event_batches():
+            try:
+                async for chunk in response.aiter_bytes():
+                    batch = sse_parser.feed(chunk)
+                    chunk = None
+                    try:
+                        yield batch
+                    finally:
+                        batch = None
+                batch = sse_parser.finish()
+                try:
+                    yield batch
+                finally:
+                    batch = None
+            finally:
+                sse_parser.discard()
 
-                event_name, event_data = parse_sse_event(raw_event)
-                if not event_name and not event_data:
-                    continue
-                if event_name == "[DONE]":
-                    yield "data: [DONE]" + end_of_line
-                    return
+        batches = raw_event_batches()
+        async with aclosing(batches):
+            async for raw_events in batches:
+                events = _iter_owned_raw_events(raw_events)
+                async with aclosing(events):
+                    async for event_owner in events:
+                        raw_event = None
+                        event_name = None
+                        event_data = None
+                        delta_text = None
+                        usage_obj = None
+                        try:
+                            raw_event = event_owner.raw_event
+                            event_name = event_owner.event_name
+                            event_data = event_owner.payload
+                            if not raw_event.strip():
+                                continue
+                            if not event_name and not event_data:
+                                continue
+                            if event_data == "[DONE]":
+                                yield "data: [DONE]" + end_of_line
+                                return
 
-                if not isinstance(event_data, dict):
-                    continue
+                            if not isinstance(event_data, dict):
+                                continue
 
-                if event_name == "response.output_text.delta":
-                    delta_text = safe_get(event_data, "delta", default=None)
-                    if not delta_text:
-                        continue
-                    yield await generate_sse_response(timestamp, model, content=delta_text)
-                    continue
+                            if event_name == "response.output_text.delta":
+                                delta_text = safe_get(
+                                    event_data,
+                                    "delta",
+                                    default=None,
+                                )
+                                if not delta_text:
+                                    continue
+                                yield await generate_sse_response(
+                                    timestamp,
+                                    model,
+                                    content=delta_text,
+                                )
+                                continue
 
-                if event_name == "response.completed":
-                    usage_obj = safe_get(event_data, "response", "usage", default={}) or {}
-                    prompt_tokens = usage_obj.get("input_tokens") or 0
-                    completion_tokens = usage_obj.get("output_tokens") or 0
-                    total_tokens = usage_obj.get("total_tokens") or (prompt_tokens + completion_tokens)
+                            if event_name == "response.completed":
+                                usage_obj = (
+                                    safe_get(
+                                        event_data,
+                                        "response",
+                                        "usage",
+                                        default={},
+                                    )
+                                    or {}
+                                )
+                                prompt_tokens = _coerce_token_count(
+                                    usage_obj.get("input_tokens")
+                                )
+                                completion_tokens = _coerce_token_count(
+                                    usage_obj.get("output_tokens")
+                                )
+                                total_tokens = _coerce_token_count(
+                                    usage_obj.get("total_tokens")
+                                ) or (
+                                    prompt_tokens + completion_tokens
+                                )
 
-                    yield await generate_sse_response(timestamp, model, stop="stop")
-                    if total_tokens:
-                        yield await generate_sse_response(
-                            timestamp,
-                            model,
-                            total_tokens=total_tokens,
-                            prompt_tokens=prompt_tokens,
-                            completion_tokens=completion_tokens,
-                        )
-                    yield "data: [DONE]" + end_of_line
-                    return
+                                yield await generate_sse_response(
+                                    timestamp,
+                                    model,
+                                    stop="stop",
+                                )
+                                if total_tokens:
+                                    yield await generate_sse_response(
+                                        timestamp,
+                                        model,
+                                        total_tokens=total_tokens,
+                                        prompt_tokens=prompt_tokens,
+                                        completion_tokens=completion_tokens,
+                                    )
+                                yield "data: [DONE]" + end_of_line
+                                return
+                        finally:
+                            raw_event = None
+                            event_name = None
+                            event_data = None
+                            delta_text = None
+                            usage_obj = None
+                            await event_owner.aclose()
+                raw_events = None
 
-        yield "data: [DONE]" + end_of_line
+        raise SSEProtocolError(
+            "Doubao translation upstream ended without response.completed or [DONE]"
+        )
 
 async def fetch_dalle_response_stream(client, url, headers, payload, timeout=200):
     multipart_payload = _pop_multipart_payload(payload)
@@ -1304,7 +2668,7 @@ async def fetch_dalle_response_stream(client, url, headers, payload, timeout=200
         headers, multipart_content = _build_multipart_content(headers, data, files)
         stream_kwargs = {"content": multipart_content}
     else:
-        json_payload = await asyncio.to_thread(json.dumps, payload)
+        json_payload = await run_json_cpu(json.dumps, payload)
         stream_kwargs = {"content": json_payload}
 
     async with client.stream("POST", url, headers=headers, timeout=timeout, **stream_kwargs) as response:
@@ -1312,8 +2676,111 @@ async def fetch_dalle_response_stream(client, url, headers, payload, timeout=200
         if error_message:
             yield error_message
             return
-        async for chunk in response.aiter_text():
-            yield chunk
+        content_type = str(response.headers.get("content-type") or "").lower()
+        if "text/event-stream" not in content_type:
+            # A normal Images API response is one finite JSON document whose
+            # EOF is its protocol terminal.  Transport chunks are not JSON
+            # frames, so collect under the shared weighted response budget and
+            # yield exactly one validated document to the legacy first-item
+            # checker.
+            request_lease = get_request_admission_lease()
+            limited = await read_limited_response_body(
+                response,
+                max_bytes=upstream_success_body_max_bytes(),
+                reserve_bytes=(
+                    request_lease.reserve_response_bytes
+                    if request_lease is not None
+                    else None
+                ),
+                reservation_multiplier=upstream_json_memory_reservation_multiplier(),
+            )
+            if limited.truncated:
+                raise SSEBufferOverflowError(
+                    buffer_name="DALL-E JSON response",
+                    limit_bytes=upstream_success_body_max_bytes(),
+                    observed_bytes=limited.observed_bytes_at_least,
+                )
+            owner = None
+            parsed = None
+            try:
+                owner = await parse_owned_json_value(limited.body)
+                parsed = owner.value
+                if not isinstance(parsed, dict):
+                    raise SSEProtocolError(
+                        "DALL-E upstream response must be a JSON object"
+                    )
+            except json.JSONDecodeError as exc:
+                raise SSEProtocolError(
+                    "DALL-E upstream returned an incomplete JSON document"
+                ) from exc
+            finally:
+                parsed = None
+                if owner is not None:
+                    await owner.aclose()
+            yield limited.body
+            return
+
+        terminal_seen = False
+        events = _iter_owned_sse_events(response.aiter_bytes())
+        async with aclosing(events):
+            async for event_owner in events:
+                raw_event = None
+                event_payload = None
+                payload_type = None
+                normalized_event = None
+                try:
+                    raw_event = event_owner.raw_event
+                    if event_owner.is_comment:
+                        yield raw_event + end_of_line
+                        continue
+                    event_payload = event_owner.payload
+                    payload_type = (
+                        str(event_payload.get("type") or "").strip().lower()
+                        if isinstance(event_payload, dict)
+                        else ""
+                    )
+                    normalized_event = event_owner.event_name.strip().lower()
+                    if event_payload == "[DONE]":
+                        terminal_seen = True
+                    elif normalized_event in {
+                        "done",
+                        "completed",
+                        "response.completed",
+                        "image_generation.completed",
+                    } or payload_type in {
+                        "done",
+                        "completed",
+                        "response.completed",
+                        "image_generation.completed",
+                    }:
+                        terminal_seen = True
+                    elif normalized_event in {
+                        "error",
+                        "response.failed",
+                        "response.incomplete",
+                        "image_generation.failed",
+                    } or payload_type in {
+                        "error",
+                        "response.failed",
+                        "response.incomplete",
+                        "image_generation.failed",
+                    }:
+                        raise SSEProtocolError(
+                            "DALL-E SSE upstream emitted failure terminal"
+                        )
+                    yield raw_event + end_of_line
+                    if terminal_seen:
+                        return
+                finally:
+                    raw_event = None
+                    event_payload = None
+                    payload_type = None
+                    normalized_event = None
+                    await event_owner.aclose()
+        if not terminal_seen:
+            raise SSEProtocolError(
+                "DALL-E SSE upstream ended without a terminal event"
+            )
 
 async def fetch_response_stream(client, url, headers, payload, engine, model, timeout=200, response_headers_sink: ResponseHeadersSink | None = None):
     if engine == "gemini" or engine == "vertex-gemini":

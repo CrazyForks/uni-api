@@ -99,9 +99,16 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
         },
         runtime_metrics={
             "inflight_requests": 12,
+            "request_body_reserved_weighted_bytes": 8192,
+            "upstream_response_reserved_weighted_bytes": 16384,
+            "request_retained_reserved_weighted_bytes": 24576,
+            "request_deferred_memory_requests": 2,
+            "request_deferred_memory_weighted_bytes": 4096,
             "waiting_first_byte": 4,
             "event_loop_lag_ms": 2,
             "upstream_pool_in_use": 3,
+            "stream_parser_reserved_bytes": 2048,
+            "stream_parser_rejected_total": 1,
         },
     )
 
@@ -129,6 +136,9 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
     assert log_event["event"] == "request_summary"
     assert log_event["event_type"] == "request_summary"
     assert log_event["message"] == "uni-api-ember request finished"
+    assert log_event["app_id"] == "app_123"
+    assert log_event["path"] == "/v1/responses"
+    assert log_event["status_code"] == 200
     attempt_event = next(event for event in telemetry["logs"] if event["event"] == "upstream_attempt")
     attempt_attrs = attempt_event["attributes"]
     assert attempt_attrs["provider"] == "fugue-codex"
@@ -167,6 +177,85 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
         assert "trace_id" not in attrs
         assert "request_id" not in attrs
         assert "api_key_hash" not in attrs
+
+    metrics = {event["metric"]: event for event in telemetry["metrics"]}
+    assert metrics["uniapi_ember_upstream_errors_total"]["value"] == 1
+    assert metrics["uniapi_ember_exposed_5xx_total"]["value"] == 0
+    assert (
+        metrics["uniapi_ember_request_body_reserved_weighted_bytes"]["value"]
+        == 8192
+    )
+    assert (
+        metrics[
+            "uniapi_ember_upstream_response_reserved_weighted_bytes"
+        ]["value"]
+        == 16384
+    )
+    assert (
+        metrics[
+            "uniapi_ember_request_retained_reserved_weighted_bytes"
+        ]["value"]
+        == 24576
+    )
+    assert metrics["uniapi_ember_request_deferred_memory_requests"]["value"] == 2
+    assert (
+        metrics["uniapi_ember_request_deferred_memory_weighted_bytes"]["value"]
+        == 4096
+    )
+    assert metrics["uniapi_ember_stream_parser_reserved_bytes"]["value"] == 2048
+    assert metrics["uniapi_ember_stream_parser_rejected_total"]["value"] == 1
+    assert "route_id" not in metrics["uniapi_ember_inflight_requests"]["attributes"]
+    assert metrics["uniapi_ember_request_duration_ms"]["attributes"]["route_id"]
+
+
+def test_local_admission_503_is_not_counted_as_upstream_failure():
+    telemetry = build_uni_api_ember_request_telemetry(
+        service_name="uni-api-ember",
+        service_version="test",
+        identity_attrs={"app_id": "app_123"},
+        current_info={
+            "endpoint": "POST /v1/responses",
+            "status_code": 503,
+            "admission_rejected": True,
+            "error_type": "queue_full",
+            "process_time": 0.01,
+            "upstream_attempts": [],
+        },
+        runtime_metrics={"inflight_requests": 100, "request_waiters": 900},
+    )
+
+    metrics = {event["metric"]: event["value"] for event in telemetry["metrics"]}
+    assert metrics["uniapi_ember_upstream_errors_total"] == 0
+    assert metrics["uniapi_ember_exposed_5xx_total"] == 1
+    assert metrics["uniapi_ember_request_admission_rejected_total"] == 1
+
+
+def test_post_commit_stream_failure_keeps_wire_200_and_has_failure_metric():
+    telemetry = build_uni_api_ember_request_telemetry(
+        service_name="uni-api-ember",
+        service_version="test",
+        identity_attrs={"app_id": "app_123"},
+        current_info={
+            "endpoint": "POST /v1/responses",
+            "status_code": 200,
+            "wire_status_code": 200,
+            "stream": True,
+            "stream_outcome": "local_backpressure_abort",
+            "stream_error_status_code": 503,
+            "stream_error_after_response_start": True,
+            "error_type": "StreamQueuePutTimeout",
+            "process_time": 1.0,
+        },
+    )
+
+    log_event = telemetry["logs"][0]
+    assert log_event["status_code"] == 200
+    assert log_event["level"] == "error"
+    assert log_event["attributes"]["stream_outcome"] == "local_backpressure_abort"
+    assert log_event["attributes"]["stream_error_status_code"] == "503"
+    metrics = {event["metric"]: event["value"] for event in telemetry["metrics"]}
+    assert metrics["uniapi_ember_exposed_5xx_total"] == 0
+    assert metrics["uniapi_ember_stream_failures_total"] == 1
 
 
 def test_traceparent_is_inherited_and_forwarded():

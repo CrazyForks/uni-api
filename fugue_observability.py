@@ -104,7 +104,17 @@ class FugueObservabilityClient:
         if not self.config.enabled:
             return
         status_code = _safe_int(current_info.get("status_code"), 0)
-        if status_code < 400 and self.config.sample_rate < 1.0 and random.random() > self.config.sample_rate:
+        stream_failure = _is_stream_failure(current_info)
+        downstream_disconnected = _safe_bool(
+            current_info.get("downstream_disconnected")
+        ) or status_code == 499
+        if (
+            status_code < 400
+            and not stream_failure
+            and not downstream_disconnected
+            and self.config.sample_rate < 1.0
+            and random.random() > self.config.sample_rate
+        ):
             return
         telemetry = build_uni_api_ember_request_telemetry(
             service_name=self.config.service_name,
@@ -228,6 +238,10 @@ def build_uni_api_ember_request_telemetry(
     duration_ms = _duration_ms_from_info(current_info)
     ttft_ms = _ttft_ms(spans)
     error_type = _safe_text(current_info.get("error_type")) or _classify_error(status_code)
+    stream_outcome = _safe_text(current_info.get("stream_outcome"))
+    stream_error_status_code = _safe_int(
+        current_info.get("stream_error_status_code"), 0
+    )
     retry_count = _safe_int(current_info.get("retry_count"), 0)
     cooldown_count = _safe_int(current_info.get("cooldown_count"), 0)
     is_stream = _safe_bool(current_info.get("stream"))
@@ -258,7 +272,7 @@ def build_uni_api_ember_request_telemetry(
     logs = [
         {
             "timestamp": _iso_timestamp(now),
-            "level": _event_level(status_code),
+            "level": _event_level(stream_error_status_code or status_code),
             "service": service_name,
             "trace_id": trace_id,
             "request_id": request_id,
@@ -266,6 +280,11 @@ def build_uni_api_ember_request_telemetry(
             "event_type": "request_summary",
             "source": service_name,
             "message": "uni-api-ember request finished",
+            # Fugue request_facts indexes these fields at the event top level.
+            # Keep the nested attributes too for existing log consumers.
+            "app_id": _safe_text((identity_attrs or {}).get("app_id")),
+            "path": path_template or endpoint,
+            "status_code": status_code,
             "attributes": _drop_empty(
                 {
                     **base,
@@ -276,6 +295,18 @@ def build_uni_api_ember_request_telemetry(
                     "upstream_ms": _int_text(_stage_delta_ms(spans, "upstream_headers_received", "upstream_send_start")),
                     "status_class": _status_class(status_code),
                     "request_kind": _safe_text(current_info.get("request_kind")),
+                    "stream_outcome": stream_outcome,
+                    "stream_error_status_code": _optional_int_text(
+                        stream_error_status_code
+                    ),
+                    "stream_error_after_response_start": _bool_text(
+                        _safe_bool(
+                            current_info.get("stream_error_after_response_start")
+                        )
+                    ),
+                    "downstream_disconnected": _bool_text(
+                        _safe_bool(current_info.get("downstream_disconnected"))
+                    ),
                 }
             ),
             "summary": _drop_empty(
@@ -283,9 +314,43 @@ def build_uni_api_ember_request_telemetry(
                     "message_roles": _safe_text(current_info.get("message_roles")),
                     "role_counts": _safe_text(current_info.get("role_counts")),
                     "client_pool_wait_ms": _int_text(_span_ms(spans, "upstream_pool_wait_ms")),
+                    "request_admission_wait_ms": _int_text(
+                        _span_ms(spans, "request_admission_wait_ms")
+                    ),
                     "event_loop_lag_ms": _int_text(_runtime_int(runtime_metrics, "event_loop_lag_ms")),
                     "inflight_requests": _int_text(_runtime_int(runtime_metrics, "inflight_requests")),
+                    "request_waiters": _int_text(_runtime_int(runtime_metrics, "request_waiters")),
+                    "request_body_reserved_weighted_bytes": _int_text(
+                        _runtime_int(
+                            runtime_metrics,
+                            "request_body_reserved_weighted_bytes",
+                        )
+                    ),
+                    "upstream_response_reserved_weighted_bytes": _int_text(
+                        _runtime_int(
+                            runtime_metrics,
+                            "upstream_response_reserved_weighted_bytes",
+                        )
+                    ),
+                    "request_retained_reserved_weighted_bytes": _int_text(
+                        _runtime_int(
+                            runtime_metrics,
+                            "request_retained_reserved_weighted_bytes",
+                        )
+                    ),
                     "waiting_first_byte": _int_text(_runtime_int(runtime_metrics, "waiting_first_byte")),
+                    "upstream_pool_in_use": _int_text(
+                        _runtime_int(runtime_metrics, "upstream_pool_in_use")
+                    ),
+                    "upstream_pool_waiters": _int_text(
+                        _runtime_int(runtime_metrics, "upstream_pool_waiters")
+                    ),
+                    "stream_queue_bytes": _int_text(
+                        _runtime_int(runtime_metrics, "stream_queue_bytes")
+                    ),
+                    "stream_queue_peak_bytes": _int_text(
+                        _safe_int(current_info.get("stream_queue_peak_bytes"), 0)
+                    ),
                 }
             ),
         }
@@ -323,15 +388,70 @@ def build_uni_api_ember_request_telemetry(
         route_id=route_id,
         values={
             "uniapi_ember_request_duration_ms": duration_ms,
+            "uniapi_ember_request_admission_wait_ms": _span_ms(
+                spans, "request_admission_wait_ms"
+            ),
             "uniapi_ember_request_ttfb_ms": ttft_ms,
             "uniapi_ember_inflight_requests": _runtime_int(runtime_metrics, "inflight_requests"),
+            "uniapi_ember_request_waiters": _runtime_int(runtime_metrics, "request_waiters"),
+            "uniapi_ember_request_body_reserved_weighted_bytes": _runtime_int(
+                runtime_metrics, "request_body_reserved_weighted_bytes"
+            ),
+            "uniapi_ember_upstream_response_reserved_weighted_bytes": _runtime_int(
+                runtime_metrics, "upstream_response_reserved_weighted_bytes"
+            ),
+            "uniapi_ember_request_retained_reserved_weighted_bytes": _runtime_int(
+                runtime_metrics, "request_retained_reserved_weighted_bytes"
+            ),
+            "uniapi_ember_request_deferred_memory_requests": _runtime_int(
+                runtime_metrics, "request_deferred_memory_requests"
+            ),
+            "uniapi_ember_request_deferred_memory_weighted_bytes": _runtime_int(
+                runtime_metrics, "request_deferred_memory_weighted_bytes"
+            ),
             "uniapi_ember_waiting_first_byte": _runtime_int(runtime_metrics, "waiting_first_byte"),
             "uniapi_ember_event_loop_lag_ms": _runtime_int(runtime_metrics, "event_loop_lag_ms"),
             "uniapi_ember_client_pool_in_use": _runtime_int(runtime_metrics, "upstream_pool_in_use"),
+            "uniapi_ember_client_pool_waiters": _runtime_int(
+                runtime_metrics, "upstream_pool_waiters"
+            ),
             "uniapi_ember_client_pool_wait_ms": _span_ms(spans, "upstream_pool_wait_ms"),
+            "uniapi_ember_stream_queue_bytes": _runtime_int(
+                runtime_metrics, "stream_queue_bytes"
+            ),
+            "uniapi_ember_stream_queue_waiting_putters": _runtime_int(
+                runtime_metrics, "stream_queue_waiting_putters"
+            ),
+            "uniapi_ember_stream_buffer_reserved_bytes": _runtime_int(
+                runtime_metrics, "stream_buffer_reserved_bytes"
+            ),
+            "uniapi_ember_stream_buffer_budget_waiters": _runtime_int(
+                runtime_metrics, "stream_buffer_budget_waiters"
+            ),
+            "uniapi_ember_stream_parser_reserved_bytes": _runtime_int(
+                runtime_metrics, "stream_parser_reserved_bytes"
+            ),
+            "uniapi_ember_stream_parser_rejected_total": _runtime_int(
+                runtime_metrics, "stream_parser_rejected_total"
+            ),
+            "uniapi_ember_stream_queue_peak_bytes": _safe_int(
+                current_info.get("stream_queue_peak_bytes"), 0
+            ),
             "uniapi_ember_retry_total": retry_count,
             "uniapi_ember_provider_cooldown_total": cooldown_count,
-            "uniapi_ember_upstream_errors_total": 1 if status_code >= 500 else 0,
+            "uniapi_ember_upstream_errors_total": _actual_upstream_error_count(
+                current_info
+            ),
+            "uniapi_ember_exposed_5xx_total": 1 if status_code >= 500 else 0,
+            "uniapi_ember_request_admission_rejected_total": 1
+            if _safe_bool(current_info.get("admission_rejected"))
+            else 0,
+            "uniapi_ember_stream_failures_total": 1
+            if _is_stream_failure(current_info)
+            else 0,
+            "uniapi_ember_downstream_disconnects_total": 1
+            if _safe_bool(current_info.get("downstream_disconnected"))
+            else 0,
         },
     )
     return {"logs": logs, "traces": traces, "metrics": metrics}
@@ -438,7 +558,7 @@ def _request_metric_events(
     route_id: str | None,
     values: dict[str, int | None],
 ) -> list[dict[str, Any]]:
-    base_attrs = _drop_empty(
+    request_attrs = _drop_empty(
         {
             **(identity_attrs or {}),
             "component": service_name,
@@ -447,6 +567,30 @@ def _request_metric_events(
             "status_class": _status_class(status_code),
         }
     )
+    global_attrs = _drop_empty(
+        {
+            **(identity_attrs or {}),
+            "component": service_name,
+        }
+    )
+    global_metrics = {
+        "uniapi_ember_inflight_requests",
+        "uniapi_ember_request_waiters",
+        "uniapi_ember_request_body_reserved_weighted_bytes",
+        "uniapi_ember_upstream_response_reserved_weighted_bytes",
+        "uniapi_ember_request_retained_reserved_weighted_bytes",
+        "uniapi_ember_request_deferred_memory_requests",
+        "uniapi_ember_request_deferred_memory_weighted_bytes",
+        "uniapi_ember_waiting_first_byte",
+        "uniapi_ember_event_loop_lag_ms",
+        "uniapi_ember_client_pool_in_use",
+        "uniapi_ember_client_pool_waiters",
+        "uniapi_ember_stream_queue_bytes",
+        "uniapi_ember_stream_queue_waiting_putters",
+        "uniapi_ember_stream_buffer_reserved_bytes",
+        "uniapi_ember_stream_buffer_budget_waiters",
+        "uniapi_ember_stream_parser_reserved_bytes",
+    }
     events = []
     for metric, value in values.items():
         if value is None:
@@ -459,10 +603,40 @@ def _request_metric_events(
                 "message": metric,
                 "metric": metric,
                 "value": max(0, int(value)),
-                "attributes": base_attrs,
+                "attributes": global_attrs if metric in global_metrics else request_attrs,
             }
         )
     return events
+
+
+def _actual_upstream_error_count(current_info: dict[str, Any]) -> int | None:
+    attempts = current_info.get("upstream_attempts")
+    if not isinstance(attempts, list):
+        # Legacy routes do not yet expose unified attempt facts.  Omitting the
+        # metric is truthful; emitting zero would silently claim knowledge we
+        # do not have.
+        return None
+    count = 0
+    for attempt in attempts[:16]:
+        if not isinstance(attempt, dict) or _safe_bool(attempt.get("success")):
+            continue
+        if _safe_bool(attempt.get("local_admission_rejected")):
+            continue
+        status_code = _safe_int(attempt.get("status_code"), 0)
+        error_type = _safe_text(attempt.get("error_type")) or ""
+        if error_type in {"UpstreamAdmissionRejected", "StreamBufferBudgetTimeout"}:
+            continue
+        if status_code >= 500:
+            count += 1
+    return count
+
+
+def _is_stream_failure(current_info: dict[str, Any]) -> bool:
+    outcome = _safe_text(current_info.get("stream_outcome")) or ""
+    return bool(
+        outcome
+        and outcome not in {"completed", "downstream_disconnected"}
+    )
 
 
 def _base_attrs(

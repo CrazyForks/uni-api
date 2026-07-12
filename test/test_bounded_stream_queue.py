@@ -2,6 +2,7 @@ import asyncio
 
 import pytest
 
+from uni_api.admission.memory import AdaptiveMemoryGovernor, ProcessMemorySample
 from uni_api.streaming.bounded_queue import (
     ByteBoundedQueue,
     RetainedByteBudget,
@@ -19,6 +20,12 @@ async def _consume_for_test(queue: ByteBoundedQueue):
     item = lease.item
     await lease.release()
     return item
+
+
+async def _wait_until(predicate, *, timeout=1.0):
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(0)
 
 
 def test_queue_applies_item_backpressure_without_dropping():
@@ -184,6 +191,69 @@ def test_process_wide_byte_budget_backpressures_independent_queues():
         assert budget.snapshot().used_bytes == 3
         assert await _consume_for_test(second) == b"tri"
         assert budget.snapshot().used_bytes == 0
+
+    asyncio.run(run())
+
+
+def test_stream_budget_competes_with_shared_adaptive_parent():
+    async def run():
+        governor = AdaptiveMemoryGovernor(
+            source=lambda: ProcessMemorySample(100, 1000, source="fake"),
+            guard_bytes=100,
+            guard_ratio=0,
+            sample_cache_seconds=0,
+        )
+        assert governor.reserve_nowait("request_body", 700)
+        budget = RetainedByteBudget(
+            capacity_bytes=800,
+            wait_timeout_seconds=1,
+            memory_governor=governor,
+        )
+        queue = ByteBoundedQueue(
+            max_items=2,
+            max_bytes=800,
+            retained_byte_budget=budget,
+        )
+
+        blocked = asyncio.create_task(queue.put(b"x" * 200))
+        await _wait_until(lambda: governor.snapshot().waiting_reservations == 1)
+        assert not blocked.done()
+
+        governor.release("request_body", 200)
+        await blocked
+        assert governor.snapshot().reservations == {
+            "request_body": 500,
+            "stream_buffer": 200,
+        }
+        assert await _consume_for_test(queue) == b"x" * 200
+        governor.release("request_body", 500)
+        assert governor.snapshot().reserved_bytes == 0
+
+    asyncio.run(run())
+
+
+def test_cancelled_parent_wait_rolls_back_local_stream_budget():
+    async def run():
+        governor = AdaptiveMemoryGovernor(
+            source=lambda: ProcessMemorySample(100, 1000, source="fake"),
+            guard_bytes=100,
+            guard_ratio=0,
+            sample_cache_seconds=0,
+        )
+        assert governor.reserve_nowait("request_body", 800)
+        budget = RetainedByteBudget(
+            capacity_bytes=800,
+            wait_timeout_seconds=1,
+            memory_governor=governor,
+        )
+        waiting = asyncio.create_task(budget.reserve(1))
+        await asyncio.sleep(0)
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(waiting, timeout=0.1)
+        assert budget.snapshot().used_bytes == 0
+        assert governor.snapshot().reservations == {"request_body": 800}
+        governor.release("request_body", 800)
 
     asyncio.run(run())
 

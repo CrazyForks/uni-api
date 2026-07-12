@@ -26,6 +26,12 @@ from uni_api.admission import (
     BoundedAdmissionGate,
     get_request_admission_lease,
 )
+from uni_api.admission.resources import (
+    cgroup_cpu_quota_millicores,
+    cgroup_cpu_weight,
+    process_cpu_affinity_count,
+    startup_active_limit,
+)
 from uni_api.streaming.cleanup import (
     await_isolated_transport_cleanup_safely,
     await_stream_cleanup_safely,
@@ -587,7 +593,7 @@ class _ManagedAsyncClient:
 class ClientPool:
     def __init__(
         self,
-        pool_size: int = 100,
+        pool_size: int | None = None,
         *,
         waiter_limit: int | None = None,
         wait_timeout_seconds: float = 5.0,
@@ -598,6 +604,12 @@ class ClientPool:
         end_upstream_pool: Callable[[], Any] | None = None,
         record_upstream_wait: Callable[[float], Any] | None = None,
     ) -> None:
+        if pool_size is None:
+            pool_size = startup_active_limit(
+                cpu_millicores=cgroup_cpu_quota_millicores(),
+                cpu_weight=cgroup_cpu_weight(),
+                cpu_affinity_count=process_cpu_affinity_count(),
+            )
         if pool_size <= 0:
             raise ValueError("pool_size must be greater than zero")
         resolved_waiter_limit = pool_size if waiter_limit is None else waiter_limit

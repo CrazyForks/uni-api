@@ -74,8 +74,19 @@ class RequestAdmissionMiddleware:
         self.on_early_response = on_early_response
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or self.bypass(scope):
+        if scope["type"] != "http":
             await self.app(scope, receive, send)
+            return
+        if self.bypass(scope):
+            # A bypassed request owns no admission lease.  Explicitly mask an
+            # inherited ContextVar value so health/observability work spawned
+            # from another request cannot charge a lease that is already in
+            # release.  Reset afterwards to preserve the caller's context.
+            bypass_context_token = bind_request_admission_lease(None)
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                reset_request_admission_lease(bypass_context_token)
             return
 
         response_started = False

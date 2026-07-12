@@ -1,0 +1,253 @@
+import asyncio
+
+from uni_api.admission.memory import (
+    AdaptiveMemoryGovernor,
+    CgroupMemorySource,
+    ProcessMemorySample,
+)
+
+
+class FakeMemory:
+    def __init__(
+        self,
+        *,
+        current: int | None,
+        limit: int | None,
+        high: int | None = None,
+    ) -> None:
+        self.current = current
+        self.limit = limit
+        self.high = high
+        self.events: dict[str, int] = {}
+
+    def sample(self) -> ProcessMemorySample:
+        return ProcessMemorySample(
+            current_bytes=self.current,
+            limit_bytes=self.limit,
+            high_bytes=self.high,
+            events=dict(self.events),
+            source="fake",
+        )
+
+
+def test_dynamic_parent_budget_uses_limit_current_reservations_and_guard():
+    memory = FakeMemory(current=100, limit=1000)
+    governor = AdaptiveMemoryGovernor(
+        source=memory.sample,
+        guard_bytes=100,
+        guard_ratio=0,
+        fallback_budget_bytes=50,
+        sample_cache_seconds=0,
+    )
+
+    snapshot = governor.snapshot()
+    assert snapshot.soft_limit_bytes == 900
+    assert snapshot.capacity_bytes == 800
+    assert snapshot.available_bytes == 800
+
+    assert governor.reserve_nowait("body", 500)
+    snapshot = governor.snapshot()
+    assert snapshot.reserved_bytes == 500
+    assert snapshot.available_bytes == 300
+    assert not governor.reserve_nowait("stream", 301)
+
+    memory.current = 700
+    snapshot = governor.snapshot(force=True)
+    assert snapshot.capacity_bytes == 500
+    assert snapshot.available_bytes == 0
+    assert not governor.reserve_nowait("body", 1)
+
+    governor.release("body", 500)
+    snapshot = governor.snapshot(force=True)
+    assert snapshot.reserved_bytes == 0
+    assert snapshot.available_bytes == 200
+
+
+def test_existing_reservations_survive_dynamic_downscale():
+    memory = FakeMemory(current=100, limit=1000)
+    governor = AdaptiveMemoryGovernor(
+        source=memory.sample,
+        guard_bytes=100,
+        guard_ratio=0,
+        sample_cache_seconds=0,
+    )
+    assert governor.reserve_nowait("body", 700)
+
+    memory.current = 950
+    snapshot = governor.snapshot(force=True)
+    assert snapshot.capacity_bytes == 700
+    assert snapshot.available_bytes == 0
+    assert snapshot.reservations == {"body": 700}
+
+    governor.release("body", 700)
+    assert governor.snapshot(force=True).reserved_bytes == 0
+
+
+def test_finite_memory_high_is_the_effective_parent_ceiling():
+    memory = FakeMemory(current=100, limit=2000, high=1000)
+    governor = AdaptiveMemoryGovernor(
+        source=memory.sample,
+        guard_bytes=100,
+        guard_ratio=0,
+        sample_cache_seconds=0,
+    )
+    snapshot = governor.snapshot()
+    assert snapshot.limit_bytes == 2000
+    assert snapshot.high_bytes == 1000
+    assert snapshot.soft_limit_bytes == 900
+    assert snapshot.capacity_bytes == 800
+
+
+def test_default_guard_scales_safely_across_small_and_production_limits():
+    mib = 1024 * 1024
+    expected = {
+        256: (128, 128, 52),
+        512: (256, 256, 180),
+        4032: (1008, 3024, 2948),
+    }
+    for limit_mib, (guard_mib, soft_mib, capacity_mib) in expected.items():
+        governor = AdaptiveMemoryGovernor(
+            source=lambda limit=limit_mib: ProcessMemorySample(
+                current_bytes=76 * mib,
+                limit_bytes=limit * mib,
+                source="fake",
+            ),
+            sample_cache_seconds=0,
+        )
+        snapshot = governor.snapshot()
+        assert snapshot.guard_bytes == guard_mib * mib
+        assert snapshot.soft_limit_bytes == soft_mib * mib
+        assert snapshot.capacity_bytes == capacity_mib * mib
+        assert governor.reserve_nowait("request_body", 1)
+        governor.release("request_body", 1)
+
+
+def test_resolves_nested_cgroup_v1_memory_controller(tmp_path):
+    nested = tmp_path / "memory" / "kubepods" / "pod" / "container"
+    nested.mkdir(parents=True)
+    proc_cgroup = tmp_path / "self.cgroup"
+    proc_cgroup.write_text(
+        "2:cpu,cpuacct:/kubepods/pod/container\n"
+        "3:memory:/kubepods/pod/container\n",
+        encoding="ascii",
+    )
+    (nested / "memory.usage_in_bytes").write_text("100\n", encoding="ascii")
+    (nested / "memory.limit_in_bytes").write_text("1000\n", encoding="ascii")
+    (nested / "memory.failcnt").write_text("7\n", encoding="ascii")
+
+    sample = CgroupMemorySource(tmp_path, proc_cgroup).sample()
+    assert sample.current_bytes == 100
+    assert sample.limit_bytes == 1000
+    assert sample.events == {"max": 7}
+    assert sample.source == "cgroup-v1"
+
+
+def test_unlimited_environment_preserves_finite_fallback_budget():
+    memory = FakeMemory(current=100, limit=None)
+    governor = AdaptiveMemoryGovernor(
+        source=memory.sample,
+        fallback_budget_bytes=256,
+        sample_cache_seconds=0,
+    )
+    assert governor.snapshot().capacity_bytes == 256
+    assert governor.reserve_nowait("body", 256)
+    assert not governor.reserve_nowait("body", 1)
+    governor.release("body", 256)
+
+
+def test_async_waiter_is_woken_by_cross_category_release():
+    async def scenario():
+        memory = FakeMemory(current=100, limit=1000)
+        governor = AdaptiveMemoryGovernor(
+            source=memory.sample,
+            guard_bytes=100,
+            guard_ratio=0,
+            sample_cache_seconds=0,
+        )
+        assert governor.reserve_nowait("body", 800)
+
+        waiting = asyncio.create_task(
+            governor.reserve("stream", 100, timeout_seconds=1)
+        )
+        await asyncio.sleep(0)
+        assert governor.snapshot().waiting_reservations == 1
+        governor.release("body", 100)
+        assert await waiting is True
+        assert governor.snapshot().reservations == {"body": 700, "stream": 100}
+        governor.release("stream", 100)
+        governor.release("body", 700)
+
+    asyncio.run(scenario())
+
+
+def test_async_waiter_timeout_does_not_leak_reservation():
+    async def scenario():
+        memory = FakeMemory(current=100, limit=1000)
+        governor = AdaptiveMemoryGovernor(
+            source=memory.sample,
+            guard_bytes=100,
+            guard_ratio=0,
+            sample_cache_seconds=0,
+        )
+        assert governor.reserve_nowait("body", 800)
+        assert not await governor.reserve("stream", 1, timeout_seconds=0.01)
+        snapshot = governor.snapshot()
+        assert snapshot.waiting_reservations == 0
+        assert snapshot.wait_timeouts == 1
+        assert snapshot.reservations == {"body": 800}
+        governor.release("body", 800)
+
+    asyncio.run(scenario())
+
+
+def test_async_waiter_observes_cgroup_memory_drop_without_tracked_release():
+    async def scenario():
+        memory = FakeMemory(current=100, limit=1000)
+        governor = AdaptiveMemoryGovernor(
+            source=memory.sample,
+            guard_bytes=100,
+            guard_ratio=0,
+            sample_cache_seconds=0,
+        )
+        assert governor.reserve_nowait("body", 800)
+        waiting = asyncio.create_task(
+            governor.reserve("stream", 50, timeout_seconds=1)
+        )
+        await asyncio.sleep(0)
+        memory.current = 0
+        assert await asyncio.wait_for(waiting, timeout=0.3) is True
+        governor.release("stream", 50)
+        governor.release("body", 800)
+
+    asyncio.run(scenario())
+
+
+def test_sampling_failure_preserves_existing_ownership_but_forbids_expansion():
+    class FailingMemory(FakeMemory):
+        fail = False
+
+        def sample(self) -> ProcessMemorySample:
+            if self.fail:
+                raise OSError("cgroup unavailable")
+            return super().sample()
+
+    memory = FailingMemory(current=100, limit=2000)
+    governor = AdaptiveMemoryGovernor(
+        source=memory.sample,
+        guard_bytes=100,
+        guard_ratio=0,
+        fallback_budget_bytes=256,
+        sample_cache_seconds=0,
+    )
+    assert governor.reserve_nowait("body", 300)
+    memory.fail = True
+    snapshot = governor.snapshot(force=True)
+    assert snapshot.sample_error == "OSError: cgroup unavailable"
+    assert snapshot.capacity_bytes == 300
+    assert snapshot.available_bytes == 0
+    assert not governor.reserve_nowait("body", 1)
+    governor.release("body", 300)
+
+    snapshot = governor.snapshot(force=True)
+    assert snapshot.capacity_bytes == 256
+    assert snapshot.available_bytes == 256

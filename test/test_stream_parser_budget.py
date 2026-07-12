@@ -9,6 +9,7 @@ from uni_api.admission import (
     bind_request_admission_lease,
     reset_request_admission_lease,
 )
+from uni_api.admission.memory import AdaptiveMemoryGovernor, ProcessMemorySample
 from uni_api.streaming.sse import (
     IncrementalLineParser,
     IncrementalSSEParser,
@@ -33,6 +34,38 @@ def test_incomplete_sse_frames_share_a_process_wide_byte_budget(monkeypatch):
     del first
     gc.collect()
     assert budget.snapshot()["used_bytes"] == 0
+
+
+def test_parser_budget_competes_with_adaptive_parent_and_releases_on_gc(
+    monkeypatch,
+):
+    governor = AdaptiveMemoryGovernor(
+        source=lambda: ProcessMemorySample(100, 1000, source="fake"),
+        guard_bytes=100,
+        guard_ratio=0,
+        sample_cache_seconds=0,
+    )
+    assert governor.reserve_nowait("request_body", 795)
+    budget = sse_module._StreamParserRetainedBudget(
+        800,
+        memory_governor=governor,
+    )
+    monkeypatch.setattr(sse_module, "_STREAM_PARSER_RETAINED_BUDGET", budget)
+
+    parser = IncrementalSSEParser()
+    assert parser.feed(b"data") == []
+    assert governor.snapshot().reservations == {
+        "request_body": 795,
+        "stream_parser": 4,
+    }
+    with pytest.raises(StreamParserBufferBudgetExhausted):
+        parser.feed(b"xx")
+
+    del parser
+    gc.collect()
+    assert governor.snapshot().reservations == {"request_body": 795}
+    governor.release("request_body", 795)
+    assert governor.snapshot().reserved_bytes == 0
 
 
 def test_emitted_sse_frame_owns_bytes_until_consumer_drops_it(monkeypatch):

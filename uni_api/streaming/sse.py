@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from uni_api.admission import AdmissionRejected, get_request_admission_lease
+from uni_api.admission.memory import AdaptiveMemoryGovernor, process_memory_governor
 from uni_api.admission.json_memory import JSONMemoryComplexityError
 from uni_api.admission.json_parsing import (
     OwnedJSONValue,
@@ -18,8 +19,8 @@ from uni_api.serialization import json
 
 
 # Image-generation Responses events can legitimately carry multi-megabyte
-# base64 payloads.  Eight MiB preserves that documented path while remaining
-# finite under the 64-request admission envelope.
+# base64 payloads. Eight MiB is a per-event protocol bound; aggregate parser
+# ownership is charged to the cgroup-aware process memory governor below.
 DEFAULT_MAX_PENDING_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_EVENT_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_EVENTS_PER_FEED = 4096
@@ -32,10 +33,17 @@ _SSE_JSON_MAX_ESTIMATED_BYTES = 64 * 1024 * 1024
 try:
     _STREAM_PARSER_RETAINED_BUDGET_BYTES = max(
         1,
-        int(os.getenv("STREAM_PARSER_RETAINED_BUDGET_BYTES", str(64 * 1024 * 1024))),
+        int(
+            os.getenv(
+                "STREAM_PARSER_RETAINED_BUDGET_BYTES",
+                str(process_memory_governor.maximum_capacity_bytes()),
+            )
+        ),
     )
 except (TypeError, ValueError):
-    _STREAM_PARSER_RETAINED_BUDGET_BYTES = 64 * 1024 * 1024
+    _STREAM_PARSER_RETAINED_BUDGET_BYTES = (
+        process_memory_governor.maximum_capacity_bytes()
+    )
 
 
 class StreamParserBufferBudgetExhausted(AdmissionRejected):
@@ -46,8 +54,16 @@ class StreamParserBufferBudgetExhausted(AdmissionRejected):
 
 
 class _StreamParserRetainedBudget:
-    def __init__(self, capacity_bytes: int) -> None:
+    def __init__(
+        self,
+        capacity_bytes: int,
+        *,
+        memory_governor: AdaptiveMemoryGovernor | None = None,
+        memory_category: str = "stream_parser",
+    ) -> None:
         self.capacity_bytes = int(capacity_bytes)
+        self.memory_governor = memory_governor
+        self.memory_category = str(memory_category or "stream_parser")
         self.used_bytes = 0
         self.peak_bytes = 0
         self.rejected = 0
@@ -56,9 +72,21 @@ class _StreamParserRetainedBudget:
     def reserve(self, size: int) -> None:
         if size <= 0:
             return
+        parent_reserved = False
+        if self.memory_governor is not None:
+            parent_reserved = self.memory_governor.reserve_nowait(
+                self.memory_category,
+                size,
+            )
+            if not parent_reserved:
+                with self._lock:
+                    self.rejected += 1
+                raise StreamParserBufferBudgetExhausted()
         with self._lock:
             if self.used_bytes + size > self.capacity_bytes:
                 self.rejected += 1
+                if parent_reserved and self.memory_governor is not None:
+                    self.memory_governor.release(self.memory_category, size)
                 raise StreamParserBufferBudgetExhausted()
             self.used_bytes += size
             self.peak_bytes = max(self.peak_bytes, self.used_bytes)
@@ -70,19 +98,28 @@ class _StreamParserRetainedBudget:
             if size > self.used_bytes:
                 raise RuntimeError("stream parser retained-byte budget underflow")
             self.used_bytes -= size
+        if self.memory_governor is not None:
+            self.memory_governor.release(self.memory_category, size)
 
     def snapshot(self) -> dict[str, int]:
         with self._lock:
+            effective_capacity = self.capacity_bytes
+            if self.memory_governor is not None:
+                effective_capacity = min(
+                    effective_capacity,
+                    self.memory_governor.snapshot().capacity_bytes,
+                )
             return {
                 "used_bytes": self.used_bytes,
                 "peak_bytes": self.peak_bytes,
-                "capacity_bytes": self.capacity_bytes,
+                "capacity_bytes": effective_capacity,
                 "rejected": self.rejected,
             }
 
 
 _STREAM_PARSER_RETAINED_BUDGET = _StreamParserRetainedBudget(
-    _STREAM_PARSER_RETAINED_BUDGET_BYTES
+    _STREAM_PARSER_RETAINED_BUDGET_BYTES,
+    memory_governor=process_memory_governor,
 )
 
 

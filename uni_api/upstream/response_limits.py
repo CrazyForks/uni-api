@@ -7,6 +7,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
+from uni_api.admission.resources import startup_cpu_worker_count
+
 
 DEFAULT_MAX_UPSTREAM_ERROR_BODY_BYTES = 256 * 1024
 DEFAULT_MAX_UPSTREAM_SUCCESS_BODY_BYTES = 64 * 1024 * 1024
@@ -17,15 +19,22 @@ UPSTREAM_JSON_MEMORY_RESERVATION_MULTIPLIER_ENV = (
 )
 _DECODE_CHUNK_BYTES = 64 * 1024
 _ENCODED_OVERHEAD_ALLOWANCE_BYTES = 64 * 1024
+_DEFAULT_UPSTREAM_RESPONSE_CPU_WORKERS = startup_cpu_worker_count()
 try:
-    _UPSTREAM_RESPONSE_CPU_WORKERS = max(
+    UPSTREAM_RESPONSE_CPU_WORKERS = max(
         1,
-        int(os.getenv("UPSTREAM_RESPONSE_CPU_WORKERS", "4") or "4"),
+        int(
+            os.getenv(
+                "UPSTREAM_RESPONSE_CPU_WORKERS",
+                str(_DEFAULT_UPSTREAM_RESPONSE_CPU_WORKERS),
+            )
+            or str(_DEFAULT_UPSTREAM_RESPONSE_CPU_WORKERS)
+        ),
     )
 except (TypeError, ValueError):
-    _UPSTREAM_RESPONSE_CPU_WORKERS = 4
+    UPSTREAM_RESPONSE_CPU_WORKERS = _DEFAULT_UPSTREAM_RESPONSE_CPU_WORKERS
 _UPSTREAM_RESPONSE_CPU_EXECUTOR = ThreadPoolExecutor(
-    max_workers=_UPSTREAM_RESPONSE_CPU_WORKERS,
+    max_workers=UPSTREAM_RESPONSE_CPU_WORKERS,
     thread_name_prefix="uni-api-upstream-body",
 )
 

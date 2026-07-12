@@ -677,6 +677,22 @@ def test_httpx_pool_timeout_is_explicit_and_not_the_connection_count(monkeypatch
     asyncio.run(run())
 
 
+def test_default_pool_size_is_startup_resource_derived(monkeypatch):
+    monkeypatch.setattr(
+        "uni_api.upstream.client_pool.cgroup_cpu_quota_millicores",
+        lambda: 1000,
+    )
+    monkeypatch.setattr(
+        "uni_api.upstream.client_pool.cgroup_cpu_weight",
+        lambda: 100,
+    )
+    monkeypatch.setattr(
+        "uni_api.upstream.client_pool.process_cpu_affinity_count",
+        lambda: 2,
+    )
+    assert ClientPool().pool_size == 137
+
+
 def test_close_racing_an_active_request_and_waiter_rejects_without_leaking():
     async def run():
         entered = asyncio.Event()

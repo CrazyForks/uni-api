@@ -26,13 +26,65 @@ class _MainModule(_types.ModuleType):
 _sys.modules[__name__].__class__ = _MainModule
 
 
-if __name__ == "__main__":
+def _run_uvicorn_cli(argv: list[str] | None = None) -> None:
+    """Run Uvicorn with dynamic safe defaults and compatible CLI overrides."""
+
+    import click
     import uvicorn
 
-    uvicorn.run(
+    arguments = [
         "uni_api.runtime:app",
-        host="0.0.0.0",
-        port=int(_os.getenv("PORT", "8000")),
-        limit_concurrency=1100,
-        backlog=256,
+        "--host",
+        str(_os.getenv("HOST", "0.0.0.0")),
+        "--port",
+        str(_os.getenv("PORT", "8000")),
+        "--backlog",
+        str(_runtime.UVICORN_BACKLOG),
+        *(list(argv) if argv is not None else _sys.argv[1:]),
+    ]
+    try:
+        with uvicorn.main.make_context("uvicorn", arguments) as context:
+            parameters = dict(context.params)
+    except click.exceptions.Exit as exc:
+        raise SystemExit(exc.exit_code) from None
+    except click.ClickException as exc:
+        exc.show()
+        raise SystemExit(exc.exit_code) from None
+
+    workers = parameters.get("workers")
+    if workers not in (None, 1):
+        raise SystemExit(
+            "uni-api uses one process-scoped memory/admission governor; "
+            "--workers must remain 1"
+        )
+    if parameters.get("reload"):
+        raise SystemExit(
+            "main.py does not support --reload with the process-scoped "
+            "production admission envelope"
+        )
+
+    requested_connection_limit = parameters.get("limit_concurrency")
+    connection_limit = _runtime.UVICORN_CONNECTION_LIMIT
+    if requested_connection_limit is not None:
+        requested_connection_limit = int(requested_connection_limit)
+        if not 1 <= requested_connection_limit <= connection_limit:
+            raise SystemExit(
+                "--limit-concurrency is treated as the accepted-connection "
+                "limit and must not exceed the startup resource envelope"
+            )
+        connection_limit = requested_connection_limit
+    protocol, protocol_stats = _runtime.build_bounded_h11_protocol(
+        connection_limit=connection_limit,
+        header_timeout_seconds=_runtime.UVICORN_HEADER_TIMEOUT_SECONDS,
     )
+    _runtime.UVICORN_CONNECTION_LIMIT = connection_limit
+    _runtime.UVICORN_HTTP_PROTOCOL = protocol
+    _runtime.BOUNDED_HTTP_PROTOCOL_STATS = protocol_stats
+    parameters["http"] = protocol
+    parameters["limit_concurrency"] = None
+    parameters["workers"] = 1
+    uvicorn.main.callback(**parameters)
+
+
+if __name__ == "__main__":
+    _run_uvicorn_cli()

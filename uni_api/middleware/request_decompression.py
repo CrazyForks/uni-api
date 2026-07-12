@@ -15,6 +15,7 @@ from uni_api.admission.json_memory import (
     IncrementalJSONMemoryEstimator,
     JSONMemoryComplexityError,
 )
+from uni_api.admission.resources import startup_cpu_worker_count
 from uni_api.http_content import is_json_media_type
 
 
@@ -51,13 +52,20 @@ JSON_BODY_PATHS = frozenset(
         "/v1/api_config/update",
     }
 )
+_DEFAULT_REQUEST_BODY_CPU_WORKERS = startup_cpu_worker_count()
 try:
     REQUEST_BODY_CPU_WORKERS = max(
         1,
-        int(os.getenv("REQUEST_BODY_CPU_WORKERS", "4") or "4"),
+        int(
+            os.getenv(
+                "REQUEST_BODY_CPU_WORKERS",
+                str(_DEFAULT_REQUEST_BODY_CPU_WORKERS),
+            )
+            or str(_DEFAULT_REQUEST_BODY_CPU_WORKERS)
+        ),
     )
 except (TypeError, ValueError):
-    REQUEST_BODY_CPU_WORKERS = 4
+    REQUEST_BODY_CPU_WORKERS = _DEFAULT_REQUEST_BODY_CPU_WORKERS
 _REQUEST_BODY_CPU_EXECUTOR = ThreadPoolExecutor(
     max_workers=REQUEST_BODY_CPU_WORKERS,
     thread_name_prefix="uni-api-body",

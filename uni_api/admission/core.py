@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from time import monotonic
 from typing import Any
 
+from uni_api.admission.memory import AdaptiveMemoryGovernor
+
 
 class AdmissionRejected(RuntimeError):
     """A bounded admission decision that callers can translate to HTTP."""
@@ -147,7 +149,6 @@ class BoundedAdmissionGate:
             raise ValueError("waiter_limit cannot be negative")
         if wait_timeout_seconds <= 0:
             raise ValueError("wait_timeout_seconds must be greater than zero")
-
         self.capacity = capacity
         self.waiter_limit = waiter_limit
         self.wait_timeout_seconds = wait_timeout_seconds
@@ -332,6 +333,7 @@ class BoundedAdmissionGate:
             "waiters": sum(waiter.state == "queued" for waiter in self._waiters),
             "capacity": self.capacity,
             "waiter_limit": self.waiter_limit,
+            "wait_timeout_seconds": self.wait_timeout_seconds,
             "acquired_total": self._acquired_total,
             "cancelled_total": self._cancelled_total,
             "rejected": dict(self._rejected),
@@ -632,6 +634,8 @@ class RequestAdmissionController:
         max_body_bytes: int,
         body_budget_bytes: int,
         max_response_bytes: int | None = None,
+        max_retained_bytes_per_request: int | None = None,
+        memory_governor: AdaptiveMemoryGovernor | None = None,
         clock: Callable[[], float] = monotonic,
     ) -> None:
         if max_body_bytes < 0:
@@ -646,6 +650,14 @@ class RequestAdmissionController:
         self.max_response_bytes = (
             max_body_bytes if max_response_bytes is None else max_response_bytes
         )
+        self.max_retained_bytes_per_request = (
+            max(self.max_body_bytes, self.max_response_bytes)
+            if max_retained_bytes_per_request is None
+            else int(max_retained_bytes_per_request)
+        )
+        if self.max_retained_bytes_per_request < 0:
+            raise ValueError("max_retained_bytes_per_request cannot be negative")
+        self._memory_governor = memory_governor
         self._active_gate = BoundedAdmissionGate(
             capacity,
             waiter_limit=waiter_limit,
@@ -761,6 +773,9 @@ class RequestAdmissionController:
             ):
                 self._body_rejected["body_budget_exhausted"] += 1
                 raise RequestBodyBudgetExhausted()
+            if not self._reserve_parent_memory("request_body", additional_bytes):
+                self._body_rejected["body_budget_exhausted"] += 1
+                raise RequestBodyBudgetExhausted()
             reservation._reserved_bytes = next_request_bytes
             self._reserved_body_bytes += additional_bytes
             self._pending_body_reserved_bytes += additional_bytes
@@ -797,6 +812,7 @@ class RequestAdmissionController:
                 raise RuntimeError("request body reservation underflow")
             self._pending_body_reserved_bytes -= released
             self._reserved_body_bytes -= released
+            self._release_parent_memory("request_body", released)
 
     async def _reserve_additional(
         self,
@@ -818,6 +834,15 @@ class RequestAdmissionController:
             ):
                 self._body_rejected["body_budget_exhausted"] += 1
                 raise RequestBodyBudgetExhausted()
+            if (
+                next_request_bytes + lease._reserved_response_bytes
+                > self.max_retained_bytes_per_request
+            ):
+                self._body_rejected["body_budget_exhausted"] += 1
+                raise RequestBodyBudgetExhausted()
+            if not self._reserve_parent_memory("request_body", additional_bytes):
+                self._body_rejected["body_budget_exhausted"] += 1
+                raise RequestBodyBudgetExhausted()
             lease._reserved_body_bytes = next_request_bytes
             self._reserved_body_bytes += additional_bytes
 
@@ -834,11 +859,24 @@ class RequestAdmissionController:
                 self._response_rejected["upstream_response_too_large"] += 1
                 raise UpstreamResponseBudgetExhausted()
             if (
+                lease._reserved_body_bytes + next_request_bytes
+                > self.max_retained_bytes_per_request
+            ):
+                self._response_rejected[
+                    "upstream_response_budget_exhausted"
+                ] += 1
+                raise UpstreamResponseBudgetExhausted()
+            if (
                 self._reserved_body_bytes
                 + self._reserved_response_bytes
                 + additional_bytes
                 > self.body_budget_bytes
             ):
+                self._response_rejected[
+                    "upstream_response_budget_exhausted"
+                ] += 1
+                raise UpstreamResponseBudgetExhausted()
+            if not self._reserve_parent_memory("buffered_response", additional_bytes):
                 self._response_rejected[
                     "upstream_response_budget_exhausted"
                 ] += 1
@@ -860,11 +898,24 @@ class RequestAdmissionController:
                 self._response_rejected["upstream_response_too_large"] += 1
                 raise UpstreamResponseBudgetExhausted()
             if (
+                lease._reserved_body_bytes + next_request_bytes
+                > self.max_retained_bytes_per_request
+            ):
+                self._response_rejected[
+                    "upstream_response_budget_exhausted"
+                ] += 1
+                raise UpstreamResponseBudgetExhausted()
+            if (
                 self._reserved_body_bytes
                 + self._reserved_response_bytes
                 + additional_bytes
                 > self.body_budget_bytes
             ):
+                self._response_rejected[
+                    "upstream_response_budget_exhausted"
+                ] += 1
+                raise UpstreamResponseBudgetExhausted()
+            if not self._reserve_parent_memory("buffered_response", additional_bytes):
                 self._response_rejected[
                     "upstream_response_budget_exhausted"
                 ] += 1
@@ -889,11 +940,24 @@ class RequestAdmissionController:
                 self._response_rejected["upstream_response_too_large"] += 1
                 raise UpstreamResponseBudgetExhausted()
             if (
+                lease._reserved_body_bytes + next_request_bytes
+                > self.max_retained_bytes_per_request
+            ):
+                self._response_rejected[
+                    "upstream_response_budget_exhausted"
+                ] += 1
+                raise UpstreamResponseBudgetExhausted()
+            if (
                 self._reserved_body_bytes
                 + self._reserved_response_bytes
                 + additional_bytes
                 > self.body_budget_bytes
             ):
+                self._response_rejected[
+                    "upstream_response_budget_exhausted"
+                ] += 1
+                raise UpstreamResponseBudgetExhausted()
+            if not self._reserve_parent_memory("buffered_response", additional_bytes):
                 self._response_rejected[
                     "upstream_response_budget_exhausted"
                 ] += 1
@@ -935,6 +999,7 @@ class RequestAdmissionController:
                 raise RuntimeError("upstream response reservation underflow")
             lease._reserved_response_bytes -= released_bytes
             self._reserved_response_bytes -= released_bytes
+            self._release_parent_memory("buffered_response", released_bytes)
             self._finish_memory_owner_locked(lease)
 
     async def _commit_temporary_response(
@@ -978,6 +1043,8 @@ class RequestAdmissionController:
             raise RuntimeError("upstream response reservation underflow")
         self._reserved_body_bytes -= reserved_body_bytes
         self._reserved_response_bytes -= reserved_response_bytes
+        self._release_parent_memory("request_body", reserved_body_bytes)
+        self._release_parent_memory("buffered_response", reserved_response_bytes)
         lease._reserved_body_bytes = 0
         lease._reserved_response_bytes = 0
         lease._memory_finalized = True
@@ -988,11 +1055,31 @@ class RequestAdmissionController:
         if normalized:
             self._body_rejected[normalized] += 1
 
+    def _reserve_parent_memory(self, category: str, size: int) -> bool:
+        if self._memory_governor is None:
+            return True
+        return self._memory_governor.reserve_nowait(category, size)
+
+    def _release_parent_memory(self, category: str, size: int) -> None:
+        if self._memory_governor is not None and size:
+            self._memory_governor.release(category, size)
+
     def snapshot(self) -> dict[str, Any]:
         gate_snapshot = self._active_gate.snapshot()
         rejected = Counter(gate_snapshot["rejected"])
         rejected.update(self._body_rejected)
         rejected.update(self._response_rejected)
+        parent_snapshot = (
+            self._memory_governor.snapshot()
+            if self._memory_governor is not None
+            else None
+        )
+        effective_body_budget = self.body_budget_bytes
+        if parent_snapshot is not None:
+            effective_body_budget = min(
+                effective_body_budget,
+                parent_snapshot.capacity_bytes,
+            )
         return {
             **gate_snapshot,
             "reserved_body_bytes": self._reserved_body_bytes,
@@ -1006,9 +1093,12 @@ class RequestAdmissionController:
                 lease._reserved_body_bytes + lease._reserved_response_bytes
                 for lease in self._deferred_memory_leases
             ),
-            "body_budget": self.body_budget_bytes,
+            "body_budget": effective_body_budget,
+            "body_budget_hard": self.body_budget_bytes,
             "max_body_bytes": self.max_body_bytes,
             "max_response_bytes": self.max_response_bytes,
+            "max_retained_bytes_per_request": self.max_retained_bytes_per_request,
+            "memory_parent": parent_snapshot,
             "rejected": dict(rejected),
         }
 
@@ -1019,7 +1109,7 @@ _current_request_admission_lease: contextvars.ContextVar[
 
 
 def bind_request_admission_lease(
-    lease: RequestAdmissionLease,
+    lease: RequestAdmissionLease | None,
 ) -> contextvars.Token[RequestAdmissionLease | None]:
     return _current_request_admission_lease.set(lease)
 

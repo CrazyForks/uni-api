@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from uni_api.admission.core import get_request_admission_lease
+from uni_api.admission.resources import startup_cpu_worker_count
 from uni_api.admission.json_memory import (
     JSONMemoryComplexityError,
     estimate_json_memory_bytes,
@@ -17,13 +18,20 @@ from uni_api.serialization import json
 
 DEFAULT_JSON_PARSE_MAX_ESTIMATED_BYTES = 64 * 1024 * 1024
 _JSON_PARSE_OFFLOAD_THRESHOLD_BYTES = 64 * 1024
+_DEFAULT_JSON_PARSE_CPU_WORKERS = startup_cpu_worker_count()
 try:
     JSON_PARSE_CPU_WORKERS = max(
         1,
-        int(os.getenv("JSON_PARSE_CPU_WORKERS", "4") or "4"),
+        int(
+            os.getenv(
+                "JSON_PARSE_CPU_WORKERS",
+                str(_DEFAULT_JSON_PARSE_CPU_WORKERS),
+            )
+            or str(_DEFAULT_JSON_PARSE_CPU_WORKERS)
+        ),
     )
 except (TypeError, ValueError):
-    JSON_PARSE_CPU_WORKERS = 4
+    JSON_PARSE_CPU_WORKERS = _DEFAULT_JSON_PARSE_CPU_WORKERS
 _JSON_PARSE_CPU_EXECUTOR = ThreadPoolExecutor(
     max_workers=JSON_PARSE_CPU_WORKERS,
     thread_name_prefix="uni-api-json",

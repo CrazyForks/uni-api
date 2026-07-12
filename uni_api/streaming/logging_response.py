@@ -435,7 +435,12 @@ class LoggingStreamingResponse(Response):
             try:
                 for raw_event in self._usage_sse_parser.feed(chunk):
                     await self._record_sse_usage_event(raw_event)
-            except (AdmissionRejected, SSEProtocolError, UnicodeError) as exc:
+            except (
+                AdmissionRejected,
+                SSEProtocolError,
+                UnicodeError,
+                RuntimeError,
+            ) as exc:
                 # Usage extraction is telemetry-only.  A malformed/oversized
                 # telemetry frame must not corrupt an otherwise valid response.
                 await self._disable_usage_parser(exc)
@@ -464,8 +469,12 @@ class LoggingStreamingResponse(Response):
                 # the separately-owned JSON graph is materialized.
                 await self._usage_json_reservation.reserve(len(chunk) * 8)
             self._usage_json_buffer.extend(chunk)
-        except AdmissionRejected as exc:
+        except (AdmissionRejected, RuntimeError) as exc:
             # Usage parsing is telemetry-only and must never alter the wire.
+            # A response running without request admission (or finishing
+            # during cancellation) can observe a lease whose release already
+            # started.  Treat that lifecycle race exactly like a telemetry
+            # budget rejection instead of truncating a committed response.
             await self._disable_usage_parser(exc)
 
     async def _finish_usage_observation(self) -> None:
@@ -475,7 +484,12 @@ class LoggingStreamingResponse(Response):
             try:
                 for raw_event in self._usage_sse_parser.finish():
                     await self._record_sse_usage_event(raw_event)
-            except (AdmissionRejected, SSEProtocolError, UnicodeError) as exc:
+            except (
+                AdmissionRejected,
+                SSEProtocolError,
+                UnicodeError,
+                RuntimeError,
+            ) as exc:
                 await self._disable_usage_parser(exc)
             return
         if self._usage_json_buffer:

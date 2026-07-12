@@ -10,6 +10,7 @@ from uni_api.admission import (
     RequestBodyTooLarge,
     UpstreamResponseBudgetExhausted,
 )
+from uni_api.admission.memory import AdaptiveMemoryGovernor, ProcessMemorySample
 
 
 async def _wait_until(predicate, *, timeout=1.0):
@@ -28,7 +29,19 @@ def test_gate_immediate_acquire_and_idempotent_release():
 
         lease = await gate.acquire()
         assert lease.wait_ms >= 0
-        assert gate.snapshot() == {
+        snapshot = gate.snapshot()
+        assert {
+            key: snapshot[key]
+            for key in (
+                "active",
+                "waiters",
+                "capacity",
+                "waiter_limit",
+                "acquired_total",
+                "cancelled_total",
+                "rejected",
+            )
+        } == {
             "active": 1,
             "waiters": 0,
             "capacity": 1,
@@ -381,6 +394,100 @@ def test_request_controller_enforces_global_body_budget_and_recovers_on_release(
         assert snapshot["reserved_body_bytes"] == 0
         assert snapshot["body_budget"] == 10
         assert snapshot["rejected"] == {"body_budget_exhausted": 1}
+
+    asyncio.run(run())
+
+
+def test_request_and_response_share_adaptive_parent_without_leaking():
+    async def run():
+        governor = AdaptiveMemoryGovernor(
+            source=lambda: ProcessMemorySample(100, 1000, source="fake"),
+            guard_bytes=100,
+            guard_ratio=0,
+            sample_cache_seconds=0,
+        )
+        controller = RequestAdmissionController(
+            capacity=2,
+            waiter_limit=0,
+            wait_timeout_seconds=1,
+            max_body_bytes=800,
+            body_budget_bytes=900,
+            max_response_bytes=800,
+            max_retained_bytes_per_request=800,
+            memory_governor=governor,
+        )
+        first = await controller.acquire(initial_body_bytes=500)
+        second = await controller.acquire()
+        await second.reserve_response_bytes(300)
+        assert governor.snapshot().reservations == {
+            "request_body": 500,
+            "buffered_response": 300,
+        }
+
+        with pytest.raises(UpstreamResponseBudgetExhausted):
+            await second.reserve_response_bytes(1)
+        assert second.reserved_response_bytes == 300
+
+        await first.release()
+        assert governor.snapshot().reservations == {"buffered_response": 300}
+        await second.release()
+        assert governor.snapshot().reserved_bytes == 0
+
+    asyncio.run(run())
+
+
+def test_pending_transfer_and_temporary_commit_do_not_double_charge_parent():
+    async def run():
+        governor = AdaptiveMemoryGovernor(
+            source=lambda: ProcessMemorySample(100, 1000, source="fake"),
+            guard_bytes=100,
+            guard_ratio=0,
+            sample_cache_seconds=0,
+        )
+        controller = RequestAdmissionController(
+            capacity=1,
+            waiter_limit=0,
+            wait_timeout_seconds=1,
+            max_body_bytes=800,
+            body_budget_bytes=900,
+            max_response_bytes=800,
+            memory_governor=governor,
+        )
+        pending = controller.pending_body_reservation()
+        await pending.reserve(200)
+        lease = await controller.acquire()
+        assert await pending.transfer_to(lease) == 200
+        assert governor.snapshot().reservations == {"request_body": 200}
+
+        temporary = await lease.reserve_temporary_response_bytes(300)
+        assert governor.snapshot().reserved_bytes == 500
+        await temporary.commit()
+        assert governor.snapshot().reserved_bytes == 500
+
+        await lease.release()
+        assert governor.snapshot().reserved_bytes == 0
+
+    asyncio.run(run())
+
+
+def test_per_request_body_and_response_total_remains_bounded():
+    async def run():
+        controller = RequestAdmissionController(
+            capacity=1,
+            waiter_limit=0,
+            wait_timeout_seconds=1,
+            max_body_bytes=100,
+            body_budget_bytes=200,
+            max_response_bytes=100,
+            max_retained_bytes_per_request=100,
+        )
+        lease = await controller.acquire(initial_body_bytes=60)
+        await lease.reserve_response_bytes(40)
+        with pytest.raises(UpstreamResponseBudgetExhausted):
+            await lease.reserve_response_bytes(1)
+        assert lease.reserved_body_bytes == 60
+        assert lease.reserved_response_bytes == 40
+        await lease.release()
 
     asyncio.run(run())
 

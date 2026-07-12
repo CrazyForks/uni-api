@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from time import monotonic
 from typing import Any, Deque
 
+from uni_api.admission.memory import AdaptiveMemoryGovernor
+
 
 class StreamQueueClosed(Exception):
     """Raised when a consumer reaches the end of a closed stream queue."""
@@ -36,6 +38,39 @@ class StreamBufferBudgetTimeout(RuntimeError):
     reason = "upstream_stream_buffer_budget_exhausted"
     retry_after_seconds = 1
     local_admission_rejection = True
+
+
+async def _reserve_adaptive_parent_safely(
+    governor: AdaptiveMemoryGovernor,
+    category: str,
+    size: int,
+    timeout_seconds: float,
+) -> bool:
+    """Own or release a same-turn parent reservation under cancellation."""
+
+    task = asyncio.create_task(
+        governor.reserve(
+            category,
+            size,
+            timeout_seconds=timeout_seconds,
+        )
+    )
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        task.cancel()
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+        try:
+            reserved = task.result()
+        except asyncio.CancelledError:
+            reserved = False
+        if reserved:
+            governor.release(category, size)
+        raise
 
 
 async def _release_leases_despite_cancellation(
@@ -148,6 +183,8 @@ class RetainedByteBudget:
         *,
         capacity_bytes: int,
         wait_timeout_seconds: float,
+        memory_governor: AdaptiveMemoryGovernor | None = None,
+        memory_category: str = "stream_buffer",
     ) -> None:
         if capacity_bytes <= 0:
             raise ValueError("capacity_bytes must be positive")
@@ -155,6 +192,8 @@ class RetainedByteBudget:
             raise ValueError("wait_timeout_seconds must be positive")
         self.capacity_bytes = int(capacity_bytes)
         self.wait_timeout_seconds = float(wait_timeout_seconds)
+        self.memory_governor = memory_governor
+        self.memory_category = str(memory_category or "stream_buffer")
         self._used_bytes = 0
         self._peak_bytes = 0
         self._waiting_reservations = 0
@@ -164,10 +203,16 @@ class RetainedByteBudget:
         self._condition = asyncio.Condition()
 
     def snapshot(self) -> RetainedByteBudgetSnapshot:
+        effective_capacity = self.capacity_bytes
+        if self.memory_governor is not None:
+            effective_capacity = min(
+                effective_capacity,
+                self.memory_governor.snapshot().capacity_bytes,
+            )
         return RetainedByteBudgetSnapshot(
             used_bytes=self._used_bytes,
             peak_bytes=self._peak_bytes,
-            capacity_bytes=self.capacity_bytes,
+            capacity_bytes=effective_capacity,
             waiting_reservations=self._waiting_reservations,
             blocked_reservations=self._blocked_reservations,
             wait_ms=self._wait_ms,
@@ -185,7 +230,7 @@ class RetainedByteBudget:
             )
         started_at = monotonic()
 
-        async def wait_and_reserve() -> RetainedByteLease:
+        async def wait_and_reserve_local() -> bool:
             async with self._condition:
                 blocked = self._used_bytes + size > self.capacity_bytes
                 if blocked:
@@ -203,11 +248,43 @@ class RetainedByteBudget:
                 self._peak_bytes = max(self._peak_bytes, self._used_bytes)
                 if blocked:
                     self._wait_ms += (monotonic() - started_at) * 1000.0
-                return RetainedByteLease(self, size)
+                return blocked
 
         try:
             async with asyncio.timeout(self.wait_timeout_seconds):
-                return await wait_and_reserve()
+                await wait_and_reserve_local()
+                parent_reserved = False
+                try:
+                    if self.memory_governor is not None:
+                        parent_started_at = monotonic()
+                        remaining = max(
+                            0.001,
+                            self.wait_timeout_seconds - (monotonic() - started_at),
+                        )
+                        parent_reserved = await _reserve_adaptive_parent_safely(
+                            self.memory_governor,
+                            self.memory_category,
+                            size,
+                            remaining,
+                        )
+                        if not parent_reserved:
+                            raise TimeoutError
+                        self._wait_ms += max(
+                            0.0,
+                            (monotonic() - parent_started_at) * 1000.0,
+                        )
+                    return RetainedByteLease(self, size)
+                except BaseException:
+                    if parent_reserved and self.memory_governor is not None:
+                        self.memory_governor.release(self.memory_category, size)
+                    async with self._condition:
+                        if size > self._used_bytes:
+                            raise RuntimeError(
+                                "stream retained-byte budget rollback underflow"
+                            )
+                        self._used_bytes -= size
+                        self._condition.notify_all()
+                    raise
         except TimeoutError as exc:
             self._timeouts += 1
             raise StreamBufferBudgetTimeout(
@@ -221,6 +298,8 @@ class RetainedByteBudget:
                 raise RuntimeError("stream retained-byte budget underflow")
             self._used_bytes -= size
             self._condition.notify_all()
+        if self.memory_governor is not None:
+            self.memory_governor.release(self.memory_category, size)
 
 
 class StreamQueueItemLease:

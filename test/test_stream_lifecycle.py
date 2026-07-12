@@ -59,6 +59,160 @@ async def _never_receive() -> dict:
     raise AssertionError("unreachable")
 
 
+def test_admission_bypass_masks_inherited_released_lease_and_preserves_json_wire():
+    async def scenario():
+        controller = RequestAdmissionController(
+            capacity=1,
+            waiter_limit=0,
+            wait_timeout_seconds=1,
+            max_body_bytes=1024,
+            body_budget_bytes=1024,
+        )
+        stale_lease = await controller.acquire()
+        await stale_lease.release()
+        token = bind_request_admission_lease(stale_lease)
+        payload = b'{"runtime":"ok"}'
+        sent = []
+
+        async def body():
+            yield payload
+
+        async def send(message):
+            sent.append(dict(message))
+
+        async def app(scope, receive, send):
+            assert get_request_admission_lease() is None
+            response = LoggingStreamingResponse(
+                body(),
+                media_type="application/json",
+                headers={"content-length": str(len(payload))},
+                current_info={"start_time": 0},
+            )
+            await response(scope, receive, send)
+
+        middleware = RequestAdmissionMiddleware(
+            app,
+            controller=controller,
+            bypass=lambda _scope: True,
+        )
+        try:
+            await middleware(
+                _scope(path="/v1/observability/runtime"),
+                _never_receive,
+                send,
+            )
+        finally:
+            reset_request_admission_lease(token)
+
+        body_messages = [
+            message
+            for message in sent
+            if message["type"] == "http.response.body"
+        ]
+        assert (
+            b"".join(message.get("body", b"") for message in body_messages)
+            == payload
+        )
+        assert body_messages[-1].get("more_body") is False
+
+    asyncio.run(scenario())
+
+
+def test_released_lease_cannot_make_usage_telemetry_truncate_json_wire():
+    async def scenario():
+        controller = RequestAdmissionController(
+            capacity=1,
+            waiter_limit=0,
+            wait_timeout_seconds=1,
+            max_body_bytes=1024,
+            body_budget_bytes=1024,
+        )
+        stale_lease = await controller.acquire()
+        await stale_lease.release()
+        token = bind_request_admission_lease(stale_lease)
+        payload = b'{"runtime":"ok"}'
+        sent = []
+        current_info = {"start_time": 0}
+
+        async def body():
+            yield payload
+
+        async def send(message):
+            sent.append(dict(message))
+
+        response = LoggingStreamingResponse(
+            body(),
+            media_type="application/json",
+            headers={"content-length": str(len(payload))},
+            current_info=current_info,
+        )
+        try:
+            await response(_scope(), _never_receive, send)
+        finally:
+            reset_request_admission_lease(token)
+
+        body_messages = [
+            message
+            for message in sent
+            if message["type"] == "http.response.body"
+        ]
+        assert (
+            b"".join(message.get("body", b"") for message in body_messages)
+            == payload
+        )
+        assert body_messages[-1].get("more_body") is False
+        assert current_info["usage_parse_error"] == "RuntimeError"
+
+    asyncio.run(scenario())
+
+
+def test_released_lease_cannot_make_usage_telemetry_replace_sse_wire():
+    async def scenario():
+        controller = RequestAdmissionController(
+            capacity=1,
+            waiter_limit=0,
+            wait_timeout_seconds=1,
+            max_body_bytes=1024,
+            body_budget_bytes=1024,
+        )
+        stale_lease = await controller.acquire()
+        await stale_lease.release()
+        token = bind_request_admission_lease(stale_lease)
+        payload = (
+            b'data: {"choices":[],"usage":{"prompt_tokens":1,'
+            b'"completion_tokens":1}}\n\n'
+        )
+        sent = []
+        current_info = {"start_time": 0}
+
+        async def body():
+            yield payload
+
+        async def send(message):
+            sent.append(dict(message))
+
+        response = LoggingStreamingResponse(
+            body(),
+            media_type="text/event-stream",
+            current_info=current_info,
+        )
+        try:
+            await response(_scope(), _never_receive, send)
+        finally:
+            reset_request_admission_lease(token)
+
+        wire = b"".join(
+            message.get("body", b"")
+            for message in sent
+            if message["type"] == "http.response.body"
+        )
+        assert wire == payload
+        assert b"event: error" not in wire
+        assert current_info["usage_parse_error"] == "RuntimeError"
+
+    asyncio.run(scenario())
+
+
 def test_logging_stream_disconnect_closes_iterator_and_lifecycle_once():
     async def scenario():
         first_body_sent = asyncio.Event()

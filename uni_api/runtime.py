@@ -142,9 +142,17 @@ from uni_api.admission import (
     RequestAdmissionController,
     get_request_admission_lease,
 )
-from uni_api.admission.json_parsing import run_json_cpu
+from uni_api.admission.json_parsing import JSON_PARSE_CPU_WORKERS, run_json_cpu
+from uni_api.admission.memory import process_memory_governor
+from uni_api.admission.resources import (
+    startup_concurrency_from_environment,
+    startup_per_request_memory_limit,
+)
 from uni_api.middleware.admission import RequestAdmissionMiddleware
-from uni_api.middleware.request_decompression import RequestBodyDecompressionMiddleware
+from uni_api.middleware.request_decompression import (
+    REQUEST_BODY_CPU_WORKERS,
+    RequestBodyDecompressionMiddleware,
+)
 from uni_api.persistence.repositories import StatsRepository
 from uni_api.providers import ProviderRegistry
 from uni_api.providers.execution import prepare_provider_request
@@ -185,8 +193,12 @@ from uni_api.streaming.sse import (
     parse_sse_event,
     stream_parser_retained_budget_snapshot,
 )
+from uni_api.server import build_bounded_h11_protocol
 from uni_api.upstream.client_pool import ClientPool
-from uni_api.upstream.response_limits import read_limited_response_body
+from uni_api.upstream.response_limits import (
+    UPSTREAM_RESPONSE_CPU_WORKERS,
+    read_limited_response_body,
+)
 from uni_api.upstream.urls import (
     lingjing_upstream_query,
     normalize_content_generation_tasks_upstream_url,
@@ -501,6 +513,7 @@ class RuntimeGauges:
             Callable[[], dict[str, int]]
         ] = None
         self._stream_stats_snapshot: Optional[Callable[[], dict[str, Any]]] = None
+        self._memory_parent_snapshot: Optional[Callable[[], Any]] = None
         self._network_sampler_task: Optional[asyncio.Task[None]] = None
         self._stream_queues: dict[int, ByteBoundedQueue] = {}
         self._retired_stream_queue_blocked_puts = 0
@@ -530,6 +543,10 @@ class RuntimeGauges:
 
     def attach_stream_stats(self, snapshot: Callable[[], dict[str, Any]]) -> None:
         self._stream_stats_snapshot = snapshot
+
+    def attach_memory_parent(self, snapshot: Callable[[], Any]) -> None:
+        self._memory_parent_snapshot = snapshot
+
 
     def register_stream_queue(self, queue: ByteBoundedQueue) -> None:
         self._stream_queues[id(queue)] = queue
@@ -664,6 +681,9 @@ class RuntimeGauges:
         if self._stream_stats_snapshot is not None:
             stream_stats = self._stream_stats_snapshot()
         timed_out_io = timed_out_io_task_snapshot()
+        memory_parent: Any = None
+        if self._memory_parent_snapshot is not None:
+            memory_parent = self._memory_parent_snapshot()
         stream_queue_blocked_puts = self._retired_stream_queue_blocked_puts + sum(
             snapshot.blocked_puts for snapshot in queue_snapshots
         )
@@ -681,9 +701,51 @@ class RuntimeGauges:
             "request_active": request_active,
             "request_waiters": request_waiters,
             "request_capacity": admission.get("capacity"),
+            "request_startup_cpu_millicores": REQUEST_ADMISSION_CPU_MILLICORES,
+            "request_startup_cpu_weight": REQUEST_ADMISSION_CPU_WEIGHT,
+            "request_startup_cpu_affinity_count": (
+                REQUEST_ADMISSION_CPU_AFFINITY_COUNT
+            ),
+            "request_startup_cpu_sizing_source": (
+                REQUEST_ADMISSION_CPU_SIZING_SOURCE
+            ),
+            "request_startup_cpu_active_limit": (
+                REQUEST_ADMISSION_CPU_ACTIVE_LIMIT
+            ),
+            "request_startup_resource_active_limit": (
+                REQUEST_ADMISSION_RESOURCE_ACTIVE_LIMIT
+            ),
+            "request_startup_memory_available_bytes": (
+                REQUEST_ADMISSION_STARTUP_MEMORY_AVAILABLE_BYTES
+            ),
+            "request_startup_control_memory_budget_bytes": (
+                REQUEST_ADMISSION_CONTROL_MEMORY_BUDGET_BYTES
+            ),
+            "request_startup_nofile_soft_limit": (
+                REQUEST_ADMISSION_NOFILE_SOFT_LIMIT
+            ),
+            "request_startup_open_fds": REQUEST_ADMISSION_STARTUP_OPEN_FDS,
+            "request_startup_ephemeral_port_count": (
+                REQUEST_ADMISSION_EPHEMERAL_PORT_COUNT
+            ),
+            "request_startup_ephemeral_port_occupancy": (
+                REQUEST_ADMISSION_EPHEMERAL_PORT_OCCUPANCY
+            ),
+            "request_startup_ephemeral_active_limit": (
+                REQUEST_ADMISSION_EPHEMERAL_ACTIVE_LIMIT
+            ),
             "request_waiter_limit": admission.get("waiter_limit"),
+            "request_wait_timeout_seconds": admission.get(
+                "wait_timeout_seconds"
+            ),
+            "request_total_limit": REQUEST_ADMISSION_TOTAL_LIMIT,
+            "uvicorn_limit_concurrency": None,
+            "uvicorn_connection_limit": UVICORN_CONNECTION_LIMIT,
+            "uvicorn_backlog": UVICORN_BACKLOG,
+            "uvicorn_http_protocol": BOUNDED_HTTP_PROTOCOL_STATS.snapshot(),
             # Admission charges conservative in-memory weights (for example
-            # JSON bytes x8), not raw wire bytes.  Keep that semantic explicit
+            # JSON raw bytes x5 plus structural token charges), not raw wire
+            # bytes. Keep that semantic explicit
             # so dashboards do not mislabel the values.
             "request_body_reserved_weighted_bytes": admission.get(
                 "reserved_body_bytes"
@@ -695,6 +757,20 @@ class RuntimeGauges:
                 "reserved_retained_bytes"
             ),
             "request_body_budget_bytes": admission.get("body_budget"),
+            "request_body_budget_hard_bytes": admission.get("body_budget_hard"),
+            "request_max_body_reserved_weighted_bytes": admission.get(
+                "max_body_bytes"
+            ),
+            "request_max_response_reserved_weighted_bytes": admission.get(
+                "max_response_bytes"
+            ),
+            "request_max_retained_weighted_bytes": admission.get(
+                "max_retained_bytes_per_request"
+            ),
+            "request_wire_body_max_bytes": REQUEST_WIRE_BODY_MAX_BYTES,
+            "json_parse_cpu_workers": JSON_PARSE_CPU_WORKERS,
+            "request_body_cpu_workers": REQUEST_BODY_CPU_WORKERS,
+            "upstream_response_cpu_workers": UPSTREAM_RESPONSE_CPU_WORKERS,
             "request_retained_budget_bytes": admission.get("body_budget"),
             "request_deferred_memory_requests": admission.get(
                 "deferred_memory_requests"
@@ -709,6 +785,45 @@ class RuntimeGauges:
             "middleware_inflight_requests": self.inflight_requests,
             "waiting_first_byte": len(self.waiting_first_byte_requests) + self.waiting_first_byte_untracked,
             "event_loop_lag_ms": self.event_loop_lag_ms,
+            "cgroup_memory_source": getattr(memory_parent, "source", None),
+            "cgroup_memory_current_bytes": getattr(
+                memory_parent, "current_bytes", None
+            ),
+            "cgroup_memory_limit_bytes": getattr(
+                memory_parent, "limit_bytes", None
+            ),
+            "cgroup_memory_high_bytes": getattr(memory_parent, "high_bytes", None),
+            "memory_soft_limit_bytes": getattr(
+                memory_parent, "soft_limit_bytes", None
+            ),
+            "memory_guard_bytes": getattr(memory_parent, "guard_bytes", None),
+            "memory_parent_capacity_bytes": getattr(
+                memory_parent, "capacity_bytes", None
+            ),
+            "memory_parent_available_bytes": getattr(
+                memory_parent, "available_bytes", None
+            ),
+            "memory_parent_reserved_bytes": getattr(
+                memory_parent, "reserved_bytes", None
+            ),
+            "memory_parent_peak_reserved_bytes": getattr(
+                memory_parent, "peak_reserved_bytes", None
+            ),
+            "memory_parent_reservations": getattr(
+                memory_parent, "reservations", {}
+            ),
+            "memory_parent_rejected": getattr(memory_parent, "rejected", {}),
+            "memory_parent_blocked_reservations": getattr(
+                memory_parent, "blocked_reservations", None
+            ),
+            "memory_parent_waiting_reservations": getattr(
+                memory_parent, "waiting_reservations", None
+            ),
+            "memory_parent_wait_timeouts": getattr(
+                memory_parent, "wait_timeouts", None
+            ),
+            "memory_events": getattr(memory_parent, "events", {}),
+            "memory_sample_error": getattr(memory_parent, "sample_error", None),
             "open_sockets": self.open_sockets,
             "tcp_states": dict(self.tcp_states),
             "tcp_close_wait": self.tcp_states.get("CLOSE_WAIT", 0),
@@ -780,32 +895,148 @@ class RuntimeGauges:
 
 
 runtime_gauges = RuntimeGauges()
+runtime_gauges.attach_memory_parent(process_memory_governor.snapshot)
 
-REQUEST_ADMISSION_ACTIVE_LIMIT = max(
-    1,
-    _env_int("REQUEST_ADMISSION_ACTIVE_LIMIT", 64),
+_startup_memory_snapshot = process_memory_governor.snapshot(force=True)
+_startup_memory_available = (
+    _startup_memory_snapshot.available_bytes
+    if _startup_memory_snapshot.sample_error is None
+    else None
 )
-REQUEST_ADMISSION_WAITER_LIMIT = max(
-    0,
-    _env_int("REQUEST_ADMISSION_WAITER_LIMIT", 936),
+STARTUP_CONCURRENCY_ENVELOPE = startup_concurrency_from_environment(
+    memory_available_bytes=_startup_memory_available,
+)
+REQUEST_ADMISSION_ACTIVE_LIMIT = STARTUP_CONCURRENCY_ENVELOPE.active_limit
+REQUEST_ADMISSION_WAITER_LIMIT = STARTUP_CONCURRENCY_ENVELOPE.waiter_limit
+REQUEST_ADMISSION_TOTAL_LIMIT = STARTUP_CONCURRENCY_ENVELOPE.total_limit
+REQUEST_ADMISSION_CPU_MILLICORES = STARTUP_CONCURRENCY_ENVELOPE.cpu_millicores
+REQUEST_ADMISSION_CPU_WEIGHT = STARTUP_CONCURRENCY_ENVELOPE.cpu_weight
+REQUEST_ADMISSION_CPU_AFFINITY_COUNT = (
+    STARTUP_CONCURRENCY_ENVELOPE.cpu_affinity_count
+)
+REQUEST_ADMISSION_CPU_SIZING_SOURCE = (
+    STARTUP_CONCURRENCY_ENVELOPE.cpu_sizing_source
+)
+REQUEST_ADMISSION_CPU_ACTIVE_LIMIT = (
+    STARTUP_CONCURRENCY_ENVELOPE.cpu_active_limit
+)
+REQUEST_ADMISSION_RESOURCE_ACTIVE_LIMIT = (
+    STARTUP_CONCURRENCY_ENVELOPE.resource_active_limit
+)
+REQUEST_ADMISSION_STARTUP_MEMORY_AVAILABLE_BYTES = (
+    STARTUP_CONCURRENCY_ENVELOPE.memory_available_bytes
+)
+REQUEST_ADMISSION_CONTROL_MEMORY_BUDGET_BYTES = (
+    STARTUP_CONCURRENCY_ENVELOPE.memory_control_budget_bytes
+)
+REQUEST_ADMISSION_NOFILE_SOFT_LIMIT = (
+    STARTUP_CONCURRENCY_ENVELOPE.nofile_soft_limit
+)
+REQUEST_ADMISSION_STARTUP_OPEN_FDS = STARTUP_CONCURRENCY_ENVELOPE.open_fds
+REQUEST_ADMISSION_EPHEMERAL_PORT_COUNT = (
+    STARTUP_CONCURRENCY_ENVELOPE.ephemeral_port_count
+)
+REQUEST_ADMISSION_EPHEMERAL_PORT_OCCUPANCY = (
+    STARTUP_CONCURRENCY_ENVELOPE.ephemeral_port_occupancy
+)
+REQUEST_ADMISSION_EPHEMERAL_ACTIVE_LIMIT = (
+    STARTUP_CONCURRENCY_ENVELOPE.ephemeral_active_limit
+)
+_uvicorn_connection_limit = _env_int(
+    "UVICORN_CONNECTION_LIMIT",
+    STARTUP_CONCURRENCY_ENVELOPE.uvicorn_limit_concurrency
+)
+if not 1 <= _uvicorn_connection_limit <= (
+    STARTUP_CONCURRENCY_ENVELOPE.uvicorn_limit_concurrency
+):
+    raise ValueError(
+        "UVICORN_CONNECTION_LIMIT must be positive and cannot exceed the "
+        "startup resource envelope"
+    )
+UVICORN_CONNECTION_LIMIT = _uvicorn_connection_limit
+# Deliberately disable Uvicorn's request-time limit. It counts all keep-alive
+# connections and produces false 503s. The custom protocol owns accepted
+# sockets; RequestAdmissionMiddleware owns active work and waiters.
+UVICORN_LIMIT_CONCURRENCY = None
+UVICORN_BACKLOG = STARTUP_CONCURRENCY_ENVELOPE.uvicorn_backlog
+UVICORN_HEADER_TIMEOUT_SECONDS = max(
+    0.1,
+    _env_float("UVICORN_HEADER_TIMEOUT_SECONDS", 5.0),
+)
+UVICORN_HTTP_PROTOCOL, BOUNDED_HTTP_PROTOCOL_STATS = build_bounded_h11_protocol(
+    connection_limit=UVICORN_CONNECTION_LIMIT,
+    header_timeout_seconds=UVICORN_HEADER_TIMEOUT_SECONDS,
+)
+_request_admission_burst_waves = (
+    REQUEST_ADMISSION_TOTAL_LIMIT + REQUEST_ADMISSION_ACTIVE_LIMIT - 1
+) // REQUEST_ADMISSION_ACTIVE_LIMIT
+_request_admission_default_wait_timeout = max(
+    5.0,
+    2.0 * _request_admission_burst_waves,
 )
 REQUEST_ADMISSION_WAIT_TIMEOUT_SECONDS = max(
     0.001,
-    _env_float("REQUEST_ADMISSION_WAIT_TIMEOUT_SECONDS", 5.0),
+    _env_float(
+        "REQUEST_ADMISSION_WAIT_TIMEOUT_SECONDS",
+        _request_admission_default_wait_timeout,
+    ),
+)
+_startup_process_memory_capacity = process_memory_governor.maximum_capacity_bytes()
+_startup_per_request_memory_limit = startup_per_request_memory_limit(
+    process_memory_capacity_bytes=_startup_process_memory_capacity,
+    active_limit=REQUEST_ADMISSION_ACTIVE_LIMIT,
 )
 REQUEST_BODY_RESERVATION_MAX_BYTES = max(
     1,
-    _env_int("REQUEST_BODY_RESERVATION_MAX_BYTES", 256 * 1024 * 1024),
+    _env_int(
+        "REQUEST_BODY_RESERVATION_MAX_BYTES",
+        _startup_per_request_memory_limit,
+    ),
+)
+_request_wire_body_default = max(1, REQUEST_BODY_RESERVATION_MAX_BYTES // 4)
+REQUEST_WIRE_BODY_MAX_BYTES = max(
+    1,
+    _env_int(
+        "REQUEST_MAX_BODY_BYTES",
+        _request_wire_body_default,
+    ),
+)
+_legacy_zstd_wire_body_max_bytes = max(
+    1,
+    _env_int("ZSTD_REQUEST_MAX_BODY_BYTES", _request_wire_body_default),
+)
+ZSTD_REQUEST_COMPRESSED_MAX_BYTES = max(
+    1,
+    _env_int(
+        "ZSTD_REQUEST_MAX_COMPRESSED_BODY_BYTES",
+        _legacy_zstd_wire_body_max_bytes,
+    ),
+)
+ZSTD_REQUEST_DECOMPRESSED_MAX_BYTES = max(
+    1,
+    _env_int(
+        "ZSTD_REQUEST_MAX_DECOMPRESSED_BODY_BYTES",
+        _legacy_zstd_wire_body_max_bytes,
+    ),
 )
 REQUEST_BODY_BUDGET_BYTES = max(
     1,
-    _env_int("REQUEST_BODY_BUDGET_BYTES", 256 * 1024 * 1024),
+    _env_int(
+        "REQUEST_BODY_BUDGET_BYTES",
+        process_memory_governor.maximum_capacity_bytes(),
+    ),
 )
 REQUEST_RESPONSE_RESERVATION_MAX_BYTES = max(
     1,
-    _env_int("REQUEST_RESPONSE_RESERVATION_MAX_BYTES", 256 * 1024 * 1024),
+    _env_int(
+        "REQUEST_RESPONSE_RESERVATION_MAX_BYTES",
+        _startup_per_request_memory_limit,
+    ),
 )
-UPSTREAM_POOL_SIZE = max(1, _env_int("UPSTREAM_POOL_SIZE", 100))
+UPSTREAM_POOL_SIZE = max(
+    1,
+    _env_int("UPSTREAM_POOL_SIZE", REQUEST_ADMISSION_ACTIVE_LIMIT),
+)
 UPSTREAM_POOL_WAITER_LIMIT = max(
     0,
     _env_int("UPSTREAM_POOL_WAITER_LIMIT", REQUEST_ADMISSION_ACTIVE_LIMIT),
@@ -826,6 +1057,7 @@ request_admission_controller = RequestAdmissionController(
     max_body_bytes=REQUEST_BODY_RESERVATION_MAX_BYTES,
     body_budget_bytes=REQUEST_BODY_BUDGET_BYTES,
     max_response_bytes=REQUEST_RESPONSE_RESERVATION_MAX_BYTES,
+    memory_governor=process_memory_governor,
 )
 runtime_gauges.attach_request_admission(request_admission_controller.snapshot)
 runtime_gauges.attach_stream_parser_budget(stream_parser_retained_budget_snapshot)
@@ -1596,7 +1828,6 @@ async def lifespan(app: FastAPI):
         await app.state.client_manager.init(default_config)
         runtime_gauges.attach_upstream_client(app.state.client_manager.snapshot)
 
-
     if app and not hasattr(app.state, "channel_manager"):
         if app.state.config and 'preferences' in app.state.config:
             COOLDOWN_PERIOD = app.state.config['preferences'].get('cooldown_period', 300)
@@ -1978,7 +2209,12 @@ app.add_middleware(
     ),
 )
 
-app.add_middleware(RequestBodyDecompressionMiddleware)
+app.add_middleware(
+    RequestBodyDecompressionMiddleware,
+    max_identity_body_bytes=REQUEST_WIRE_BODY_MAX_BYTES,
+    max_zstd_compressed_body_bytes=ZSTD_REQUEST_COMPRESSED_MAX_BYTES,
+    max_zstd_decompressed_body_bytes=ZSTD_REQUEST_DECOMPRESSED_MAX_BYTES,
+)
 
 @app.middleware("http")
 async def ensure_config(request: Request, call_next):
@@ -3862,9 +4098,24 @@ RESPONSES_STREAM_QUEUE_MAX_ITEMS = max(
     1,
     _env_int("RESPONSES_STREAM_QUEUE_MAX_ITEMS", 64),
 )
+_responses_stream_transient_guard_bytes = max(
+    1,
+    _startup_memory_snapshot.guard_bytes // 2,
+)
+_responses_stream_default_queue_bytes = max(
+    64 * 1024,
+    min(
+        2 * 1024 * 1024,
+        _responses_stream_transient_guard_bytes
+        // REQUEST_ADMISSION_ACTIVE_LIMIT,
+    ),
+)
 RESPONSES_STREAM_QUEUE_MAX_BYTES = max(
     1,
-    _env_int("RESPONSES_STREAM_QUEUE_MAX_BYTES", 2 * 1024 * 1024),
+    _env_int(
+        "RESPONSES_STREAM_QUEUE_MAX_BYTES",
+        _responses_stream_default_queue_bytes,
+    ),
 )
 RESPONSES_STREAM_QUEUE_PUT_TIMEOUT_SECONDS = max(
     0.001,
@@ -3872,7 +4123,10 @@ RESPONSES_STREAM_QUEUE_PUT_TIMEOUT_SECONDS = max(
 )
 RESPONSES_STREAM_GLOBAL_BUDGET_BYTES = max(
     1,
-    _env_int("RESPONSES_STREAM_GLOBAL_BUDGET_BYTES", 64 * 1024 * 1024),
+    _env_int(
+        "RESPONSES_STREAM_GLOBAL_BUDGET_BYTES",
+        process_memory_governor.maximum_capacity_bytes(),
+    ),
 )
 RESPONSES_STREAM_GLOBAL_BUDGET_WAIT_TIMEOUT_SECONDS = max(
     0.001,
@@ -3893,6 +4147,7 @@ RESPONSES_STREAM_PRECOMMIT_MAX_BYTES = max(
 responses_stream_byte_budget = RetainedByteBudget(
     capacity_bytes=RESPONSES_STREAM_GLOBAL_BUDGET_BYTES,
     wait_timeout_seconds=RESPONSES_STREAM_GLOBAL_BUDGET_WAIT_TIMEOUT_SECONDS,
+    memory_governor=process_memory_governor,
 )
 runtime_gauges.attach_stream_byte_budget(responses_stream_byte_budget.snapshot)
 RESPONSES_STREAM_STATS_QUEUE_MAX_ITEMS = max(
@@ -8021,7 +8276,8 @@ if __name__ == '__main__':
         reload_includes=["*.py", "api.yaml"],
         reload_excludes=["./data"],
         ws="none",
-        limit_concurrency=1100,
-        backlog=256,
+        http=UVICORN_HTTP_PROTOCOL,
+        limit_concurrency=None,
+        backlog=UVICORN_BACKLOG,
         # log_level="warning"
     )

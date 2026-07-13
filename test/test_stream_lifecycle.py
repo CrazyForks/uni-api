@@ -1951,7 +1951,7 @@ def test_responses_generic_postcommit_error_is_observed_before_base_http_eof(
 
     import main
     from core.models import ResponsesRequest
-    from test.test_responses_retry import (
+    from test_responses_retry import (
         DummyClientManager,
         DummyStreamingUpstreamResponse,
         _configure_responses_test,

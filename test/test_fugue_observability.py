@@ -54,6 +54,13 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
             "message_roles": "system/user",
             "role_counts": "system:1,user:1",
             "retry_count": 1,
+            "attempt_count": 2,
+            "retry_decision_count": 1,
+            "retry_transition_count": 1,
+            "planned_attempt_count": 12,
+            "planned_retry_count": 10,
+            "matching_provider_count": 2,
+            "routing_attempts_omitted_count": 0,
             "cooldown_count": 1,
             "timing_spans": {
                 "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
@@ -153,6 +160,42 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
                     },
                 }
             ],
+            "routing_attempts": [
+                {
+                    "index": 1,
+                    "provider": "fugue-codex",
+                    "model": "gpt-5.4",
+                    "actual_model": "gpt-5.4",
+                    "started_ms": 30,
+                    "duration_ms": 61,
+                    "semantic_status_code": 503,
+                    "outcome": "retry_decided",
+                    "success": False,
+                    "error_type": "ReadTimeout",
+                    "error_message_sha256": "9" * 64,
+                    "error_message": "Bearer ember-secret-token",
+                    "retry_decision": True,
+                    "retry_reason": "http_503:ReadTimeout",
+                    "retry_transition_to_index": 2,
+                },
+                {
+                    "index": 2,
+                    "provider": "oaix",
+                    "model": "gpt-5.4",
+                    "actual_model": "gpt-5.4",
+                    "started_ms": 92,
+                    "duration_ms": 1158,
+                    "wire_status_code": 200,
+                    "semantic_status_code": 400,
+                    "terminal_event_type": "error",
+                    "outcome": "semantic_failure_terminal",
+                    "success": False,
+                    "error_code": "context_length_exceeded",
+                    "error_type": "invalid_request_error",
+                    "error_message_sha256": "8" * 64,
+                    "retry_decision": False,
+                },
+            ],
             "responses_stream_diagnostics": {
                 "semantic_status": "error",
                 "diagnosis": "responses_partial_event_abort",
@@ -221,6 +264,10 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
     assert log_event["path"] == "/v1/responses"
     assert log_event["status_code"] == 200
     summary = log_event["summary"]
+    assert summary["attempt_count"] == "2"
+    assert summary["retry_decision_count"] == "1"
+    assert summary["retry_transition_count"] == "1"
+    assert summary["planned_attempt_count"] == "12"
     assert summary["wire_status_code"] == "200"
     assert summary["semantic_status"] == "error"
     assert summary["upstream_terminal_seen"] == "false"
@@ -247,6 +294,21 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
     assert attempt_attrs["exception_chain_depth"] == "3"
     assert "ConnectionResetError" in attempt_attrs["exception_chain_json"]
     assert attempt_attrs["cleanup_owner"] == "responses_proxy_finally"
+    routing_events = [
+        event for event in telemetry["logs"] if event["event"] == "routing_attempt"
+    ]
+    assert len(routing_events) == 2
+    first_routing = routing_events[0]["attributes"]
+    assert first_routing["attempt_index"] == "1"
+    assert first_routing["semantic_status_code"] == "503"
+    assert first_routing["retry_decision"] == "true"
+    assert first_routing["retry_transition_to_index"] == "2"
+    assert first_routing["error_message_sha256"] == "9" * 64
+    second_routing = routing_events[1]["attributes"]
+    assert second_routing["wire_status_code"] == "200"
+    assert second_routing["semantic_status_code"] == "400"
+    assert second_routing["terminal_event_type"] == "error"
+    assert second_routing["attempt_error_code"] == "context_length_exceeded"
 
     stages = {
         event["attributes"]["stage"]
@@ -280,6 +342,10 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
 
     metrics = {event["metric"]: event for event in telemetry["metrics"]}
     assert metrics["uniapi_ember_upstream_errors_total"]["value"] == 1
+    assert metrics["uniapi_ember_attempt_total"]["value"] == 2
+    assert metrics["uniapi_ember_retry_decision_total"]["value"] == 1
+    assert metrics["uniapi_ember_retry_transition_total"]["value"] == 1
+    assert metrics["uniapi_ember_retry_total"]["value"] == 1
     assert metrics["uniapi_ember_exposed_5xx_total"]["value"] == 0
     assert (
         metrics["uniapi_ember_request_body_reserved_weighted_bytes"]["value"]

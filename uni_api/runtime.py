@@ -65,6 +65,8 @@ from upstream import (
     UPSTREAM_NETWORK_ERRORS,
     UpstreamRunner,
     build_upstream_error_response,
+    finalize_latest_routing_attempt,
+    finalize_routing_attempt,
 )
 from fugue_observability import (
     start_fugue_observability_from_env,
@@ -226,7 +228,10 @@ from uni_api.config.legacy_loader import (
 from uni_api.persistence.key_stats import get_sorted_api_keys, query_channel_key_stats
 from uni_api.rate_limit.memory import InMemoryRateLimiter
 from uni_api.upstream.error_handling import error_handling_wrapper
-from uni_api.upstream.responses_errors import ResponsesSemanticError
+from uni_api.upstream.responses_errors import (
+    ResponsesSemanticError,
+    responses_failure_error,
+)
 from core.utils import safe_get
 
 from sqlalchemy import inspect, text
@@ -1481,7 +1486,14 @@ def _record_plan_observability(current_info: dict[str, Any], plan: RoutingPlan) 
         return
     current_info["role"] = plan.role
     current_info["planned_retry_count"] = max(0, int(plan.retry_count or 0))
-    current_info["matching_provider_count"] = max(0, int(plan.num_matching_providers or 0))
+    matching_provider_count = max(0, int(plan.num_matching_providers or 0))
+    current_info["matching_provider_count"] = matching_provider_count
+    current_info["planned_attempt_count"] = (
+        matching_provider_count + current_info["planned_retry_count"]
+    )
+    current_info.setdefault("attempt_count", 0)
+    current_info.setdefault("retry_decision_count", 0)
+    current_info.setdefault("retry_transition_count", 0)
 
 
 def _record_retry_observability(attempt: Any, status_code: int, error_message: Any) -> None:
@@ -1490,6 +1502,12 @@ def _record_retry_observability(attempt: Any, status_code: int, error_message: A
         return
     retry_count = int(info.get("retry_count") or 0) + 1
     info["retry_count"] = retry_count
+    # Preserve the legacy counter while exposing its exact meaning.  The
+    # runner owns this counter too, so max() keeps callbacks idempotent.
+    info["retry_decision_count"] = max(
+        retry_count,
+        int(info.get("retry_decision_count") or 0),
+    )
     info["error_type"] = type(error_message).__name__ if not isinstance(error_message, str) else "upstream_retry"
     _mark_current_info_stage(info, "retry_started")
     _add_current_info_trace_ms(info, "retry_count", retry_count)
@@ -2645,6 +2663,20 @@ async def _track_legacy_stream_outcome(
         except (asyncio.CancelledError, GeneratorExit):
             # A downstream close is not a provider failure.  The outer ASGI
             # lifecycle records the client disconnect separately.
+            disconnect_event = current_info.get("disconnect_event")
+            downstream_disconnected = bool(
+                disconnect_event is not None
+                and disconnect_event.is_set()
+            )
+            finalize_latest_routing_attempt(
+                current_info,
+                outcome=(
+                    "downstream_disconnected"
+                    if downstream_disconnected
+                    else "cancelled_or_consumer_closed"
+                ),
+                success=None,
+            )
             raise
         except BaseException as exc:
             current_info["success"] = False
@@ -2668,6 +2700,30 @@ async def _track_legacy_stream_outcome(
                 current_info["stream_outcome"] = "upstream_stream_abort"
                 current_info["stream_error_status_code"] = 502
             current_info["error_type"] = type(exc).__name__
+            finalize_latest_routing_attempt(
+                current_info,
+                outcome=(
+                    "semantic_failure_terminal"
+                    if semantic_failure
+                    else "local_admission_rejected"
+                    if local_admission
+                    else "stream_failed"
+                ),
+                success=False,
+                semantic_status_code=int(
+                    getattr(
+                        exc,
+                        "status_code",
+                        current_info.get("stream_error_status_code") or 502,
+                    )
+                ),
+                terminal_event_type=getattr(exc, "event_type", None),
+                error_code=getattr(exc, "error_code", None),
+                error_type=(
+                    getattr(exc, "error_type", None) or type(exc).__name__
+                ),
+                error_message=exc,
+            )
             if not local_admission and not _is_request_scoped_semantic_error(exc):
                 _schedule_channel_stats_bounded(
                     current_info["request_id"],
@@ -2678,10 +2734,28 @@ async def _track_legacy_stream_outcome(
                     provider_api_key=provider_api_key,
                     fallback_background_tasks=fallback_background_tasks,
                 )
+            if semantic_failure:
+                # Starlette's BaseHTTPMiddleware transports an inner streaming
+                # response through an in-memory ASGI channel.  Exceptions that
+                # occur after response.start are re-raised only after that
+                # channel has reached EOF, which is too late for the outer
+                # response wrapper to append a protocol-valid terminal.  Turn
+                # a provider-declared Responses failure into the downstream
+                # Chat SSE terminal while we still own the body iterator.
+                yield (
+                    "event: error\n"
+                    f"data: {json.dumps(exc.sse_payload, ensure_ascii=False)}\n\n"
+                )
+                return
             raise
         else:
             current_info["success"] = True
             current_info["provider"] = channel_id
+            finalize_latest_routing_attempt(
+                current_info,
+                outcome="stream_completed",
+                success=True,
+            )
             _schedule_channel_stats_bounded(
                 current_info["request_id"],
                 channel_id,
@@ -3017,6 +3091,7 @@ class ModelRequestHandler:
             endpoint=endpoint,
             debug=is_debug,
             clear_provider_auth_cache=lambda provider_api_key_raw: _codex_oauth_cache.pop(provider_api_key_raw, None),
+            observability_context=current_info,
         )
         async def before_next_attempt():
             if disconnect_event is not None and disconnect_event.is_set():
@@ -4450,37 +4525,6 @@ async def _stop_responses_stream_stats_workers(*, timeout: float) -> None:
             queue.task_done()
     responses_stream_stats_queue = None
 
-RESPONSES_FAILURE_STATUS_BY_CODE = {
-    "account_deactivated": 403,
-    "account_disabled": 403,
-    "account_suspended": 403,
-    "authentication_error": 401,
-    "billing_hard_limit_reached": 429,
-    "context_length_exceeded": 400,
-    "deactivated_workspace": 403,
-    "incorrect_api_key_provided": 401,
-    "insufficient_quota": 429,
-    "invalid_api_key": 401,
-    "invalid_request_error": 400,
-    "invalid_type": 400,
-    "model_not_found": 404,
-    "not_found_error": 404,
-    "permission_denied": 403,
-    "rate_limit_exceeded": 429,
-    "unsupported_parameter": 400,
-    "user_deactivated": 403,
-    "user_suspended": 403,
-}
-
-RESPONSES_FAILURE_STATUS_BY_TYPE = {
-    "authentication_error": 401,
-    "invalid_request_error": 400,
-    "not_found_error": 404,
-    "permission_error": 403,
-    "rate_limit_error": 429,
-    "tokens": 429,
-}
-
 def _extract_responses_stream_event(raw_event: str) -> tuple[str, Any]:
     return parse_sse_event(raw_event)
 
@@ -4701,39 +4745,23 @@ def _validate_responses_terminal_payload(event_type: str, payload: Any) -> None:
             "Responses upstream error payload is missing error"
         )
 
-def _responses_error_status_code(error_obj: Any) -> int:
-    if isinstance(error_obj, dict):
-        raw_status = error_obj.get("status_code") or error_obj.get("status")
-        try:
-            status_code = int(raw_status)
-        except (TypeError, ValueError):
-            status_code = None
-        if status_code is not None and 100 <= status_code <= 599:
-            return status_code
+def _responses_failure_http_exception(
+    payload: Any,
+    *,
+    event_type: Optional[str] = None,
+    wire_status_code: Optional[int] = None,
+) -> Optional[ResponsesSemanticError]:
+    normalized = responses_failure_error(
+        payload,
+        event_type=event_type,
+        wire_status_code=wire_status_code,
+        preserve_error_body=True,
+    )
+    if normalized is not None:
+        return normalized
 
-        error_code = str(error_obj.get("code") or "").strip().lower()
-        if error_code in RESPONSES_FAILURE_STATUS_BY_CODE:
-            return RESPONSES_FAILURE_STATUS_BY_CODE[error_code]
-
-        error_type = str(error_obj.get("type") or "").strip().lower()
-        if error_type in RESPONSES_FAILURE_STATUS_BY_TYPE:
-            return RESPONSES_FAILURE_STATUS_BY_TYPE[error_type]
-
-        message = str(error_obj.get("message") or "").lower()
-        if "rate limit" in message or "too many requests" in message:
-            return 429
-        if "invalid" in message or "unsupported" in message:
-            return 400
-        if "not found" in message:
-            return 404
-        if "permission" in message or "forbidden" in message:
-            return 403
-        if "auth" in message or "api key" in message or "unauthorized" in message:
-            return 401
-
-    return 500
-
-def _responses_failure_http_exception(payload: Any) -> Optional[HTTPException]:
+    # Preserve the legacy fallback for unusual non-terminal JSON payloads
+    # that contain an explicit error object but no event/status discriminator.
     if not isinstance(payload, dict):
         return None
 
@@ -4759,15 +4787,21 @@ def _responses_failure_http_exception(payload: Any) -> Optional[HTTPException]:
     if error_obj is None:
         return None
 
-    error_body = {"error": error_obj}
-    return HTTPException(
-        status_code=_responses_error_status_code(error_obj),
-        detail=json.dumps(error_body, ensure_ascii=False),
+    fallback_payload = {
+        "type": "error",
+        "error": error_obj,
+    }
+    return responses_failure_error(
+        fallback_payload,
+        event_type="error",
+        wire_status_code=wire_status_code,
+        preserve_error_body=True,
     )
 
 async def _prime_responses_upstream_stream(
     upstream_iter,
     *,
+    upstream_status_code: Optional[int] = None,
     disconnect_event: Optional[asyncio.Event] = None,
     commit_policy: str = "real_output",
     precommit_keepalive_callback: Optional[Callable[[Optional[bytes]], Awaitable[bool]]] = None,
@@ -4917,7 +4951,11 @@ async def _prime_responses_upstream_stream(
                             status_code=502,
                             detail=f"Invalid upstream SSE stream: {exc}",
                         ) from exc
-                    semantic_failure = _responses_failure_http_exception(event_payload)
+                    semantic_failure = _responses_failure_http_exception(
+                        event_payload,
+                        event_type=event_type,
+                        wire_status_code=upstream_status_code,
+                    )
                     if semantic_failure is not None:
                         semantic_outcome = "failed"
                     elif event_type == "response.completed":
@@ -5191,6 +5229,7 @@ class ResponsesRequestExecution:
             endpoint=endpoint,
             debug=is_debug,
             clear_provider_auth_cache=lambda provider_api_key_raw: _codex_oauth_cache.pop(provider_api_key_raw, None),
+            observability_context=current_info,
         )
         return cls(
             handler=handler,
@@ -5820,7 +5859,21 @@ class ResponsesRequestExecution:
         status_code: int,
         success: bool,
         error_type: Optional[str] = None,
+        terminal_event_type: Optional[str] = None,
+        error_code: Optional[str] = None,
+        error_message: Any = None,
     ) -> None:
+        finalize_routing_attempt(
+            attempt,
+            outcome="succeeded" if success else "failed",
+            success=success,
+            wire_status_code=status_code if success else None,
+            semantic_status_code=None if success else status_code,
+            terminal_event_type=terminal_event_type,
+            error_code=error_code,
+            error_type=error_type,
+            error_message=error_message,
+        )
         attempts = self.current_info.get("upstream_attempts")
         index = attempt.state.get("observability_attempt_index")
         if not isinstance(attempts, list) or not isinstance(index, int) or index < 0 or index >= len(attempts):
@@ -5956,6 +6009,9 @@ class ResponsesRequestExecution:
             raise
         _mark_current_info_stage(self.current_info, "upstream_headers_received")
         diagnostics.capture_response(upstream_resp)
+        attempt.state["routing_wire_status_code"] = int(
+            upstream_resp.status_code
+        )
         if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
             runtime_gauges.end_waiting_first_byte(self.current_info)
             raw = await read_limited_response_body(upstream_resp)
@@ -5990,6 +6046,7 @@ class ResponsesRequestExecution:
             buffered_chunks, stream_committed = await _await_first_byte_deadline(
                 _prime_responses_upstream_stream(
                     upstream_iter,
+                    upstream_status_code=upstream_resp.status_code,
                     disconnect_event=self.disconnect_event,
                     commit_policy=attempt.state.get("responses_stream_commit_policy", "real_output"),
                     precommit_keepalive_callback=precommit_keepalive_callback,
@@ -6025,16 +6082,15 @@ class ResponsesRequestExecution:
                 stage="before-stream-commit",
             )
             return Response(content="", status_code=499)
-        except HTTPException as exc:
+        except (HTTPException, ResponsesSemanticError) as exc:
             runtime_gauges.end_waiting_first_byte(self.current_info)
             semantic_failure_terminal = (
                 diagnostics.facts.get("semantic_terminal_outcome") == "failed"
             )
             if semantic_failure_terminal:
-                # This HTTPException is the deliberate status mapping of a
-                # parsed provider failure terminal, not a second transport or
-                # protocol exception.  Preserve the terminal diagnosis and its
-                # independent consistency facts.
+                # This exception is the deliberate status mapping of a parsed
+                # provider failure terminal, not a second transport or protocol
+                # exception. Preserve its independent consistency facts.
                 diagnostics.mark_local_end(
                     origin="precommit_semantic_failure_terminal"
                 )
@@ -6333,7 +6389,9 @@ class ResponsesRequestExecution:
                             output_seen = True
 
                         semantic_failure = _responses_failure_http_exception(
-                            event_payload
+                            event_payload,
+                            event_type=event_type,
+                            wire_status_code=upstream_resp.status_code,
                         )
                         if semantic_failure is not None:
                             semantic_outcome = "failed"
@@ -6352,7 +6410,7 @@ class ResponsesRequestExecution:
                         if semantic_failure is not None:
                             failure = SSEProtocolError(
                                 "Responses upstream emitted a failure terminal: "
-                                f"{str(semantic_failure.detail)[:1000]}"
+                                f"{semantic_failure.detail_json[:1000]}"
                             )
                             self.current_info["stream_error_status_code"] = int(
                                 semantic_failure.status_code
@@ -6361,8 +6419,29 @@ class ResponsesRequestExecution:
                                 "upstream_failure_terminal"
                             )
                             self.current_info["error_type"] = "UpstreamSemanticFailure"
+                            self.current_info["stream_error_code"] = (
+                                semantic_failure.error_code
+                            )
+                            self.current_info["stream_error_type"] = (
+                                semantic_failure.error_type
+                            )
+                            self.current_info["stream_error_event_type"] = (
+                                semantic_failure.event_type
+                            )
                             self.current_info["success"] = False
-                            self._finalize_stream_attempt_failure(attempt, failure)
+                            if semantic_failure.status_code in (400, 413):
+                                attempt.state["track_channel_stats"] = False
+                            self._finalize_stream_attempt_failure(
+                                attempt,
+                                failure,
+                                status_code=int(semantic_failure.status_code),
+                                error_type=(
+                                    semantic_failure.error_type
+                                    or "UpstreamSemanticFailure"
+                                ),
+                                terminal_event_type=event_type,
+                                error_code=semantic_failure.error_code,
+                            )
                             # Preserve the provider's structured terminal.
                             if reservation is not None:
                                 transferred = reservation
@@ -6504,6 +6583,11 @@ class ResponsesRequestExecution:
                                 # shutdown or another local reason.  Do not
                                 # fabricate a peer disconnect/provider fault.
                                 attempt.state["stream_attempt_finalized"] = True
+                                finalize_routing_attempt(
+                                    attempt,
+                                    outcome="consumer_or_shutdown_unknown",
+                                    success=None,
+                                )
                         terminal_or_usage_missing = (
                             not (completed_seen or incomplete_seen)
                             or not usage_seen
@@ -6573,15 +6657,23 @@ class ResponsesRequestExecution:
         self,
         attempt: Any,
         exc: BaseException,
+        *,
+        status_code: int = 502,
+        error_type: Optional[str] = None,
+        terminal_event_type: Optional[str] = None,
+        error_code: Optional[str] = None,
     ) -> None:
         if attempt.state.get("stream_attempt_finalized"):
             return
         attempt.state["stream_attempt_finalized"] = True
         self._record_upstream_attempt_result(
             attempt,
-            status_code=502,
+            status_code=status_code,
             success=False,
-            error_type=type(exc).__name__,
+            error_type=error_type or type(exc).__name__,
+            terminal_event_type=terminal_event_type,
+            error_code=error_code,
+            error_message=exc,
         )
         if attempt.state.get("track_channel_stats"):
             self._schedule_channel_stats(
@@ -6696,12 +6788,21 @@ class ResponsesRequestExecution:
                 stage="non-stream-upstream-response",
             )
             return Response(content="", status_code=499)
+        attempt.state["routing_wire_status_code"] = int(
+            upstream_resp.status_code
+        )
         if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
             raw = await read_limited_response_body(upstream_resp)
             raise HTTPException(status_code=upstream_resp.status_code, detail=raw.text())
 
         data = await run_json_cpu(json.loads, upstream_resp.content)
-        semantic_failure = _responses_failure_http_exception(data)
+        semantic_failure = _responses_failure_http_exception(
+            data,
+            event_type=str(data.get("type") or "")
+            if isinstance(data, dict)
+            else None,
+            wire_status_code=upstream_resp.status_code,
+        )
         if semantic_failure is not None:
             raise semantic_failure
 
@@ -6723,11 +6824,20 @@ class ResponsesRequestExecution:
 
     def _after_failure(self, attempt: Any, exc: Exception, status_code: int, error_message: Any) -> None:
         _record_local_admission_rejection(self.current_info, exc)
+        self.last_error_response.clear()
+        if (
+            isinstance(exc, ResponsesSemanticError)
+            and isinstance(exc.passthrough_error_body, dict)
+        ):
+            self.last_error_response.update(exc.passthrough_error_body)
         self._record_upstream_attempt_result(
             attempt,
             status_code=status_code,
             success=False,
             error_type=type(exc).__name__,
+            terminal_event_type=getattr(exc, "event_type", None),
+            error_code=getattr(exc, "error_code", None),
+            error_message=error_message,
         )
         if attempt.state.get("track_channel_stats"):
             self._schedule_channel_stats(
@@ -6786,6 +6896,11 @@ class ResponsesRequestExecution:
         self.current_info["first_response_time"] = -1
         self.current_info["success"] = False
         self.current_info["provider"] = None
+        if self.last_error_response:
+            return JSONResponse(
+                status_code=status_code,
+                content=self.last_error_response,
+            )
         return build_upstream_error_response(
             status_code=status_code,
             error_message=error_message,
@@ -6843,6 +6958,7 @@ class MessagesPassthroughHandler:
             plan,
             endpoint=endpoint,
             debug=is_debug,
+            observability_context=current_info,
         )
         ctx = {
             "http_request": http_request,
@@ -7800,6 +7916,7 @@ class VideoTaskHandler:
             plan,
             endpoint=CONTENT_GENERATION_TASKS_ENDPOINT,
             debug=is_debug,
+            observability_context=current_info,
         )
         ctx = {
             "config": config,
@@ -8170,6 +8287,7 @@ class LingjingOpenapiHandler:
             plan,
             endpoint=endpoint,
             debug=is_debug,
+            observability_context=current_info,
         )
         ctx = {
             "http_request": http_request,

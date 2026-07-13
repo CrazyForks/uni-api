@@ -542,6 +542,13 @@ def test_model_request_semantic_context_error_returns_400_without_retry_or_coold
     }
     assert process_calls == ["provider-a"]
     assert current_info.get("retry_count", 0) == 0
+    assert current_info["attempt_count"] == 1
+    assert current_info["retry_decision_count"] == 0
+    assert current_info["retry_transition_count"] == 0
+    assert current_info["routing_attempts"][0]["semantic_status_code"] == 400
+    assert current_info["routing_attempts"][0]["retry_decision"] is False
+    assert current_info["routing_attempts"][0]["error_code"] == "oaix_gateway_error"
+    assert "error_message" not in current_info["routing_attempts"][0]
     assert channel_manager.excluded == []
     assert all(not circular_list.cooling_calls for circular_list in lists.values())
 

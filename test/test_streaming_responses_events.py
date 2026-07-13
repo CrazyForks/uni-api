@@ -445,6 +445,7 @@ def test_responses_failure_terminals_never_synthesize_partial_success(
         async for chunk in stream_responses_to_chat_completions(
             upstream_iter(),
             request_model="gpt-test",
+            upstream_status_code=200,
         ):
             emitted.append(chunk)
 
@@ -455,6 +456,7 @@ def test_responses_failure_terminals_never_synthesize_partial_success(
     assert exc_info.value.event_type == event_type
     assert exc_info.value.error_code == expected_code
     assert exc_info.value.error_type == expected_type
+    assert exc_info.value.wire_status_code == 200
     assert exc_info.value.error_body["error"]["status_code"] == 400
 
     body = "".join(emitted)

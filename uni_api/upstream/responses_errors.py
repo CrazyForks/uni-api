@@ -136,6 +136,8 @@ class ResponsesSemanticError(Exception):
         error_code: str | None,
         error_type: str | None,
         param: str | None,
+        wire_status_code: int | None = None,
+        passthrough_error_body: dict[str, Any] | None = None,
     ) -> None:
         self.status_code = int(status_code)
         self.event_type = event_type
@@ -143,6 +145,12 @@ class ResponsesSemanticError(Exception):
         self.error_code = error_code
         self.error_type = error_type
         self.param = param
+        self.wire_status_code = (
+            int(wire_status_code)
+            if isinstance(wire_status_code, int)
+            else None
+        )
+        self.passthrough_error_body = passthrough_error_body
 
         normalized_error: dict[str, Any] = {
             "message": self.message,
@@ -169,6 +177,8 @@ def responses_failure_error(
     payload: Any,
     *,
     event_type: str | None = None,
+    wire_status_code: int | None = None,
+    preserve_error_body: bool = False,
 ) -> ResponsesSemanticError | None:
     if not isinstance(payload, dict):
         return None
@@ -228,6 +238,15 @@ def responses_failure_error(
     )
     if not is_failure:
         return None
+    if (
+        normalized_event_type == "response.failed"
+        and error_obj is None
+        and response_status
+        and response_status != "failed"
+    ):
+        # A contradictory label without failure semantics is a protocol
+        # problem, not a provider-declared semantic failure.
+        return None
 
     if isinstance(error_obj, dict):
         message = _bounded_optional_text(error_obj.get("message"), limit_bytes=4096)
@@ -250,4 +269,10 @@ def responses_failure_error(
         error_code=error_code,
         error_type=error_type,
         param=param,
+        wire_status_code=wire_status_code,
+        passthrough_error_body=(
+            {"error": error_obj}
+            if preserve_error_body and error_obj is not None
+            else None
+        ),
     )

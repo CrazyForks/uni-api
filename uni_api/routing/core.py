@@ -901,7 +901,10 @@ class RoutingPlan:
         )
 
     async def next_provider(self) -> Optional[ProviderAttempt]:
-        while self.index <= self.num_matching_providers + self.retry_count:
+        # ``retry_count`` is the number of attempts in addition to the first
+        # pass over the matching providers.  Keep the total hard boundary at
+        # N + R; using ``<=`` here silently admitted one extra attempt.
+        while self.index < self.num_matching_providers + self.retry_count:
             current_index = (self.start_index + self.index) % self.num_matching_providers
             self._state.index += 1
             provider = self._state.matching_providers[current_index]

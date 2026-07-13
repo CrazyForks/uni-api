@@ -87,6 +87,7 @@ def test_responses_semantic_error_bounds_attacker_sized_message():
     assert len(error.message.encode("utf-8")) <= 4096
     assert len(error.detail_json.encode("utf-8")) < 8192
     assert error.message.endswith(" [truncated]")
+    assert error.passthrough_error_body is None
 
 
 def test_retry_policy_does_not_retry_missing_persisted_response_item():

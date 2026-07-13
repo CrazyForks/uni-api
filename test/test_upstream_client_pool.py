@@ -17,6 +17,7 @@ from uni_api.upstream.client_pool import (
     UpstreamResponseJSONEncodingUnsupported,
     UpstreamUnsupportedContentEncoding,
 )
+from uni_api.upstream.responses_errors import responses_failure_error
 from upstream import UpstreamAttemptContext, UpstreamRunner
 
 
@@ -922,5 +923,66 @@ def test_local_upstream_admission_does_not_cool_or_mark_channel_failure(monkeypa
             result.response.headers["x-uni-api-admission-reason"]
             == "upstream_wait_timeout"
         )
+
+    asyncio.run(run())
+
+
+def test_request_scoped_semantic_error_does_not_cool_or_mark_channel_failure(
+    monkeypatch,
+):
+    async def run():
+        after_failure_states = []
+
+        class Plan:
+            auto_retry = True
+
+            def record_failure(self, status_code, _error_message):
+                assert status_code == 400
+
+        error = responses_failure_error(
+            {
+                "type": "error",
+                "error": {
+                    "message": "context window exceeded",
+                    "code": "context_length_exceeded",
+                    "type": "invalid_request_error",
+                },
+            },
+            event_type="error",
+        )
+        assert error is not None
+
+        async def fail_if_cooled(*_args, **_kwargs):
+            raise AssertionError("request-scoped errors must not cool a key")
+
+        monkeypatch.setattr("upstream.maybe_cool_provider_api_key", fail_if_cooled)
+        attempt = UpstreamAttemptContext(
+            plan=Plan(),
+            provider={
+                "base_url": "https://models.inference.ai.azure.com/v1/responses",
+                "preferences": {"api_key_cooldown_period": 300},
+            },
+            provider_name="provider-a",
+            original_model="model-a",
+            provider_api_key_raw="provider-key",
+            state={"track_channel_stats": True},
+        )
+        result = await UpstreamRunner(attempt.plan)._handle_failure(
+            attempt,
+            error,
+            after_failure=lambda item, *_args: after_failure_states.append(
+                dict(item.state)
+            ),
+            build_error_response=lambda status, message: httpx.Response(
+                status,
+                json={"error": message},
+            ),
+            should_cool_down=lambda *_args: True,
+            prepare_failure=False,
+        )
+
+        assert result.response.status_code == 400
+        assert after_failure_states[0]["track_channel_stats"] is False
+        assert result.should_retry is False
 
     asyncio.run(run())

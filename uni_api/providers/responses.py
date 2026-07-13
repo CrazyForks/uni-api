@@ -1092,6 +1092,7 @@ async def fetch_gpt_response_stream(client, url, headers, payload, timeout, resp
                 async for chunk in _stream_responses_to_chat_completions(
                     response.aiter_bytes(),
                     request_model=payload["model"],
+                    upstream_status_code=response.status_code,
                 ):
                     yield chunk
                 completed_normally = True

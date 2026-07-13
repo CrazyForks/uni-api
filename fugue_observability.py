@@ -252,6 +252,19 @@ def build_uni_api_ember_request_telemetry(
         current_info.get("stream_error_status_code"), 0
     )
     retry_count = _safe_int(current_info.get("retry_count"), 0)
+    attempt_count = _safe_int(current_info.get("attempt_count"), 0)
+    retry_decision_count = _safe_int(
+        current_info.get("retry_decision_count"),
+        retry_count,
+    )
+    retry_transition_count = _safe_int(
+        current_info.get("retry_transition_count"),
+        0,
+    )
+    planned_attempt_count = _safe_int(
+        current_info.get("planned_attempt_count"),
+        0,
+    )
     cooldown_count = _safe_int(current_info.get("cooldown_count"), 0)
     is_stream = _safe_bool(current_info.get("stream"))
     api_key_hash = _secret_hash(current_info.get("api_key"))
@@ -277,6 +290,16 @@ def build_uni_api_ember_request_telemetry(
         retry_count=retry_count,
         cooldown_count=cooldown_count,
         api_key_hash=api_key_hash,
+    )
+    base.update(
+        _drop_empty(
+            {
+                "attempt_count": _int_text(attempt_count),
+                "retry_decision_count": _int_text(retry_decision_count),
+                "retry_transition_count": _int_text(retry_transition_count),
+                "planned_attempt_count": _int_text(planned_attempt_count),
+            }
+        )
     )
 
     logs = [
@@ -335,6 +358,24 @@ def build_uni_api_ember_request_telemetry(
                 {
                     "message_roles": _safe_text(current_info.get("message_roles")),
                     "role_counts": _safe_text(current_info.get("role_counts")),
+                    "attempt_count": _int_text(attempt_count),
+                    "retry_decision_count": _int_text(retry_decision_count),
+                    "retry_transition_count": _int_text(
+                        retry_transition_count
+                    ),
+                    "planned_attempt_count": _int_text(planned_attempt_count),
+                    "planned_retry_count": _int_text(
+                        _safe_int(current_info.get("planned_retry_count"), 0)
+                    ),
+                    "matching_provider_count": _int_text(
+                        _safe_int(current_info.get("matching_provider_count"), 0)
+                    ),
+                    "routing_attempts_omitted_count": _int_text(
+                        _safe_int(
+                            current_info.get("routing_attempts_omitted_count"),
+                            0,
+                        )
+                    ),
                     "client_pool_wait_ms": _int_text(_span_ms(spans, "upstream_pool_wait_ms")),
                     "request_admission_wait_ms": _int_text(
                         _span_ms(spans, "request_admission_wait_ms")
@@ -525,6 +566,7 @@ def build_uni_api_ember_request_telemetry(
         }
     ]
     logs.extend(_upstream_attempt_log_events(now, service_name, base, current_info))
+    logs.extend(_routing_attempt_log_events(now, service_name, base, current_info))
 
     traces = []
     for stage, stage_ms, stage_attrs in _stage_rows(spans, duration_ms):
@@ -607,6 +649,9 @@ def build_uni_api_ember_request_telemetry(
                 current_info.get("stream_queue_peak_bytes"), 0
             ),
             "uniapi_ember_retry_total": retry_count,
+            "uniapi_ember_attempt_total": attempt_count,
+            "uniapi_ember_retry_decision_total": retry_decision_count,
+            "uniapi_ember_retry_transition_total": retry_transition_count,
             "uniapi_ember_provider_cooldown_total": cooldown_count,
             "uniapi_ember_upstream_errors_total": _actual_upstream_error_count(
                 current_info
@@ -624,6 +669,118 @@ def build_uni_api_ember_request_telemetry(
         },
     )
     return {"logs": logs, "traces": traces, "metrics": metrics}
+
+
+def _routing_attempt_log_events(
+    timestamp: datetime,
+    service_name: str,
+    base: dict[str, str],
+    current_info: dict[str, Any],
+) -> list[dict[str, Any]]:
+    attempts = current_info.get("routing_attempts")
+    if not isinstance(attempts, list):
+        return []
+
+    events: list[dict[str, Any]] = []
+    for raw_attempt in attempts[:32]:
+        if not isinstance(raw_attempt, dict):
+            continue
+        semantic_status = _safe_int(
+            raw_attempt.get("semantic_status_code"),
+            0,
+        )
+        wire_status = _safe_int(raw_attempt.get("wire_status_code"), 0)
+        effective_status = semantic_status or wire_status
+        provider = _safe_text(raw_attempt.get("provider"))
+        events.append(
+            {
+                "timestamp": _iso_timestamp(timestamp),
+                "level": _event_level(effective_status),
+                "service": service_name,
+                "trace_id": base.get("trace_id"),
+                "request_id": base.get("request_id"),
+                "event": "routing_attempt",
+                "event_type": "routing_attempt",
+                "source": service_name,
+                "message": "uni-api-ember routing attempt",
+                "attributes": _drop_empty(
+                    {
+                        **base,
+                        "provider": provider,
+                        "channel": provider,
+                        "model": _safe_text(raw_attempt.get("model"))
+                        or base.get("model"),
+                        "actual_model": _safe_text(
+                            raw_attempt.get("actual_model")
+                        ),
+                        "attempt_index": _int_text(
+                            _safe_int(raw_attempt.get("index"), 0)
+                        ),
+                        "attempt_outcome": _safe_text(
+                            raw_attempt.get("outcome"),
+                            max_len=80,
+                        ),
+                        "attempt_success": _bool_text(
+                            _safe_bool(raw_attempt.get("success"))
+                        )
+                        if "success" in raw_attempt
+                        else None,
+                        "wire_status_code": _optional_int_text(
+                            raw_attempt.get("wire_status_code")
+                        ),
+                        "semantic_status_code": _optional_int_text(
+                            raw_attempt.get("semantic_status_code")
+                        ),
+                        "terminal_event_type": _safe_text(
+                            raw_attempt.get("terminal_event_type"),
+                            max_len=128,
+                        ),
+                        "attempt_error_code": _safe_text(
+                            raw_attempt.get("error_code"),
+                            max_len=128,
+                        ),
+                        "attempt_error_type": _safe_text(
+                            raw_attempt.get("error_type"),
+                            max_len=128,
+                        ),
+                        "error_message_sha256": _safe_text(
+                            raw_attempt.get("error_message_sha256"),
+                            max_len=64,
+                        ),
+                        "error_message_hash_scope": _safe_text(
+                            raw_attempt.get("error_message_hash_scope"),
+                            max_len=80,
+                        ),
+                        "retry_decision": _bool_text(
+                            _safe_bool(raw_attempt.get("retry_decision"))
+                        )
+                        if "retry_decision" in raw_attempt
+                        else None,
+                        "retry_reason": _safe_text(
+                            raw_attempt.get("retry_reason"),
+                            max_len=128,
+                        ),
+                        "retry_transition_to_index": _optional_int_text(
+                            raw_attempt.get("retry_transition_to_index")
+                        ),
+                        "local_admission_rejected": _bool_text(
+                            _safe_bool(
+                                raw_attempt.get("local_admission_rejected")
+                            )
+                        )
+                        if "local_admission_rejected" in raw_attempt
+                        else None,
+                        "started_ms": _optional_int_text(
+                            raw_attempt.get("started_ms")
+                        ),
+                        "duration_ms": _optional_int_text(
+                            raw_attempt.get("duration_ms")
+                        ),
+                    }
+                ),
+            }
+        )
+    return events
 
 
 def _upstream_attempt_log_events(

@@ -477,6 +477,7 @@ async def _stream_responses_to_chat_completions_impl(
     text_iterator,
     *,
     request_model: str,
+    upstream_status_code: int | None = None,
     max_collected_output_items: int = DEFAULT_MAX_COLLECTED_OUTPUT_ITEMS,
     max_collected_output_bytes: int = DEFAULT_MAX_COLLECTED_OUTPUT_BYTES,
     _collector_holder: list[ResponsesOutputItemCollector],
@@ -705,6 +706,7 @@ async def _stream_responses_to_chat_completions_impl(
                         semantic_error = responses_failure_error(
                             event_payload,
                             event_type=event_type,
+                            wire_status_code=upstream_status_code,
                         )
                         if semantic_error is None:
                             raise SSEProtocolError(
@@ -717,6 +719,7 @@ async def _stream_responses_to_chat_completions_impl(
                         semantic_error = responses_failure_error(
                             event_payload,
                             event_type=event_type,
+                            wire_status_code=upstream_status_code,
                         )
                         if semantic_error is None:
                             raise SSEProtocolError(
@@ -825,6 +828,7 @@ async def stream_responses_to_chat_completions(
     text_iterator,
     *,
     request_model: str,
+    upstream_status_code: int | None = None,
     max_collected_output_items: int = DEFAULT_MAX_COLLECTED_OUTPUT_ITEMS,
     max_collected_output_bytes: int = DEFAULT_MAX_COLLECTED_OUTPUT_BYTES,
 ):
@@ -834,6 +838,7 @@ async def stream_responses_to_chat_completions(
     implementation = _stream_responses_to_chat_completions_impl(
         text_iterator,
         request_model=request_model,
+        upstream_status_code=upstream_status_code,
         max_collected_output_items=max_collected_output_items,
         max_collected_output_bytes=max_collected_output_bytes,
         _collector_holder=collector_holder,

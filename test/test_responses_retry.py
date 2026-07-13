@@ -501,13 +501,12 @@ def test_responses_bad_request_does_not_retry_all_keys(monkeypatch):
     main.app.state.provider_timeouts = {"global": {"default": 30}}
     main.app.state.client_manager = client_manager
 
-    request_token = main.request_info.set(
-        {
-            "request_id": "req-test",
-            "api_key": "sk-test",
-            "disconnect_event": None,
-        }
-    )
+    current_info = {
+        "request_id": "req-test",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+    request_token = main.request_info.set(current_info)
     try:
         handler = main.ResponsesRequestHandler()
         request = ResponsesRequest(model="gpt-5.4", input=["hello world"], stream=True)
@@ -2021,6 +2020,63 @@ def test_responses_failure_terminal_is_forwarded_at_event_boundaries(
     assert current_info["stream_outcome"] == "upstream_failure_terminal"
 
 
+def test_responses_request_scoped_failure_terminal_does_not_mark_channel_failure(
+    monkeypatch,
+):
+    _configure_responses_test(monkeypatch, engine="codex")
+    channel_results = []
+
+    def record(*_args, success, **_kwargs):
+        channel_results.append(success)
+
+    monkeypatch.setattr(main, "_schedule_channel_stats_bounded", record)
+    main.app.state.client_manager = DummyClientManager(
+        DummyStreamingUpstreamResponse(
+            chunks=[
+                _responses_sse(
+                    "response.output_text.delta",
+                    {"type": "response.output_text.delta", "delta": "partial"},
+                ),
+                _responses_sse(
+                    "error",
+                    {
+                        "type": "error",
+                        "error": {
+                            "code": "context_length_exceeded",
+                            "type": "invalid_request_error",
+                            "message": "context window exceeded",
+                        },
+                    },
+                ),
+            ]
+        )
+    )
+    current_info = {
+        "request_id": "request-scoped-failure-terminal",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info=current_info,
+    )
+
+    assert response.status_code == 200
+    assert "context_length_exceeded" in body
+    assert channel_results == []
+    assert current_info["stream_error_status_code"] == 400
+    assert current_info["stream_error_code"] == "context_length_exceeded"
+    assert current_info["stream_error_type"] == "invalid_request_error"
+    assert current_info["stream_error_event_type"] == "error"
+    routing_attempt = current_info["routing_attempts"][-1]
+    assert routing_attempt["wire_status_code"] == 200
+    assert routing_attempt["semantic_status_code"] == 400
+    assert routing_attempt["terminal_event_type"] == "error"
+    assert routing_attempt["error_code"] == "context_length_exceeded"
+    assert routing_attempt["error_type"] == "invalid_request_error"
+
+
 def test_responses_malformed_terminal_payload_is_protocol_failure(monkeypatch):
     _configure_responses_test(monkeypatch, engine="codex")
     main.app.state.client_manager = DummyClientManager(
@@ -2359,13 +2415,12 @@ def test_responses_stream_closes_upstream_when_downstream_closes_after_commit(mo
     }
     main.app.state.provider_timeouts = {"global": {"default": 30}}
     main.app.state.client_manager = DummyClientManager(upstream)
-    request_token = main.request_info.set(
-        {
-            "request_id": "req-test",
-            "api_key": "sk-test",
-            "disconnect_event": None,
-        }
-    )
+    current_info = {
+        "request_id": "req-test",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+    request_token = main.request_info.set(current_info)
 
     async def _run():
         handler = main.ResponsesRequestHandler()
@@ -2398,6 +2453,10 @@ def test_responses_stream_closes_upstream_when_downstream_closes_after_commit(mo
     assert upstream.close_calls == 1
     assert upstream.context_exit_calls == 1
     assert upstream.close_events[-2:] == ["response_aclose", "context_exit"]
+    assert current_info["routing_attempts"][-1]["outcome"] == (
+        "consumer_or_shutdown_unknown"
+    )
+    assert "success" not in current_info["routing_attempts"][-1]
 
 
 def test_responses_stream_retry_closes_failed_upstream_response(monkeypatch):

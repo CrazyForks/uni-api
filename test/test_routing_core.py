@@ -315,6 +315,237 @@ def test_compute_retry_count_uses_provider_key_counts(monkeypatch):
     assert compute_retry_count([{"provider": "provider-a"}]) == 3
 
 
+async def _routing_plan_with_retry_count(monkeypatch, retry_count):
+    providers = []
+    for provider_name in ("provider-a", "provider-b"):
+        monkeypatch.setitem(
+            provider_api_circular_list,
+            provider_name,
+            _ProviderKeys(),
+        )
+        providers.append(
+            {
+                "provider": provider_name,
+                "_model_dict_cache": {"gpt-4.1": "gpt-4.1"},
+                "base_url": f"https://{provider_name}.example/v1/chat/completions",
+                "api": [f"{provider_name}-key"],
+                "preferences": {},
+            }
+        )
+
+    async def resolver(*_args, **_kwargs):
+        return providers
+
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            config={
+                "api_keys": [
+                    {
+                        "api": "sk-test",
+                        "model": ["gpt-4.1"],
+                        "preferences": {"AUTO_RETRY": True},
+                    }
+                ]
+            },
+            api_list=["sk-test"],
+            models_list={"sk-test": ["gpt-4.1"]},
+            channel_manager=None,
+        )
+    )
+    plan = await RoutingPlan.create(
+        app,
+        "gpt-4.1",
+        0,
+        {},
+        {},
+        provider_resolver=resolver,
+    )
+    plan._state.retry_count = retry_count
+    return plan
+
+
+@pytest.mark.parametrize(
+    ("retry_count", "expected_attempts"),
+    [(0, 2), (10, 12)],
+)
+def test_routing_plan_attempt_boundary_is_providers_plus_retries(
+    monkeypatch,
+    retry_count,
+    expected_attempts,
+):
+    async def run():
+        plan = await _routing_plan_with_retry_count(monkeypatch, retry_count)
+        attempts = []
+        while True:
+            attempt = await plan.next_provider()
+            if attempt is None:
+                break
+            attempts.append(attempt)
+        assert len(attempts) == expected_attempts
+        assert plan.index == expected_attempts
+
+    asyncio.run(run())
+
+
+def test_upstream_runner_stops_after_success_at_exact_attempt_boundary(
+    monkeypatch,
+):
+    async def run():
+        plan = await _routing_plan_with_retry_count(monkeypatch, 1)
+        calls = []
+        current_info = {}
+
+        async def execute_attempt(attempt):
+            calls.append(attempt.provider_name)
+            if len(calls) < 3:
+                raise RuntimeError("retryable upstream failure")
+            return SimpleNamespace(status_code=200)
+
+        monkeypatch.setattr(
+            "upstream.should_retry_provider",
+            lambda *_args, **_kwargs: True,
+        )
+        response = await UpstreamRunner(
+            plan,
+            observability_context=current_info,
+        ).run(execute_attempt)
+
+        assert response.status_code == 200
+        assert calls == ["provider-a", "provider-b", "provider-a"]
+        assert current_info["attempt_count"] == 3
+        assert current_info["retry_decision_count"] == 2
+        assert current_info["retry_transition_count"] == 2
+        assert [
+            item.get("retry_transition_to_index")
+            for item in current_info["routing_attempts"]
+        ] == [2, 3, None]
+        assert current_info["routing_attempts"][-1]["outcome"] == "succeeded"
+
+    asyncio.run(run())
+
+
+def test_retry_decision_without_an_available_attempt_is_not_a_transition(
+    monkeypatch,
+):
+    async def run():
+        plan = await _routing_plan_with_retry_count(monkeypatch, 1)
+        current_info = {}
+
+        async def execute_attempt(_attempt):
+            raise RuntimeError("retryable upstream failure")
+
+        monkeypatch.setattr(
+            "upstream.should_retry_provider",
+            lambda *_args, **_kwargs: True,
+        )
+        response = await UpstreamRunner(
+            plan,
+            observability_context=current_info,
+        ).run(execute_attempt)
+
+        assert response.status_code == 500
+        assert current_info["attempt_count"] == 3
+        assert current_info["retry_decision_count"] == 3
+        assert current_info["retry_transition_count"] == 2
+        assert (
+            "retry_transition_to_index"
+            not in current_info["routing_attempts"][-1]
+        )
+        assert current_info["routing_attempts"][-1]["outcome"] == "retry_exhausted"
+
+    asyncio.run(run())
+
+
+def test_routing_attempt_ledger_keeps_first_and_last_sixteen(monkeypatch):
+    async def run():
+        attempts = [
+            SimpleNamespace(
+                provider={"preferences": {}},
+                provider_name=f"provider-{index}",
+                original_model="gpt-4.1",
+            )
+            for index in range(1, 41)
+        ]
+
+        class Plan:
+            auto_retry = True
+            api_list = ()
+            request_model_name = "gpt-4.1"
+            status_code = 500
+            error_message = "failed"
+
+            async def next_provider(self):
+                return attempts.pop(0) if attempts else None
+
+            def record_failure(self, status_code, error_message):
+                self.status_code = status_code
+                self.error_message = error_message
+
+        async def execute_attempt(_attempt):
+            raise RuntimeError("retryable failure")
+
+        monkeypatch.setattr(
+            "upstream.should_retry_provider",
+            lambda *_args, **_kwargs: True,
+        )
+        current_info = {}
+        response = await UpstreamRunner(
+            Plan(),
+            observability_context=current_info,
+        ).run(execute_attempt)
+
+        assert response.status_code == 500
+        assert current_info["attempt_count"] == 40
+        assert current_info["routing_attempts_omitted_count"] == 8
+        assert [item["index"] for item in current_info["routing_attempts"]] == [
+            *range(1, 17),
+            *range(25, 41),
+        ]
+        assert current_info["retry_decision_count"] == 40
+        assert current_info["retry_transition_count"] == 39
+
+    asyncio.run(run())
+
+
+def test_routing_attempt_ledger_fingerprints_nested_api_key_provider():
+    async def run():
+        secret_provider = "sk-nested-provider-secret"
+        attempts = [
+            SimpleNamespace(
+                provider={"preferences": {}},
+                provider_name=secret_provider,
+                original_model="gpt-4.1",
+            )
+        ]
+
+        class Plan:
+            auto_retry = False
+            api_list = (secret_provider,)
+            request_model_name = "gpt-4.1"
+
+            async def next_provider(self):
+                return attempts.pop(0) if attempts else None
+
+            def record_failure(self, _status_code, _error_message):
+                raise AssertionError("the successful attempt must not fail")
+
+        async def execute_attempt(_attempt):
+            return SimpleNamespace(status_code=200)
+
+        current_info = {}
+        response = await UpstreamRunner(
+            Plan(),
+            observability_context=current_info,
+        ).run(execute_attempt)
+
+        assert response.status_code == 200
+        recorded_provider = current_info["routing_attempts"][0]["provider"]
+        assert recorded_provider.startswith("local-api-key:")
+        assert secret_provider not in recorded_provider
+
+    asyncio.run(run())
+
+
 def test_provider_package_does_not_depend_on_global_app_state():
     provider_root = pathlib.Path(__file__).resolve().parents[1] / "uni_api" / "providers"
     offenders = []

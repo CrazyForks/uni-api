@@ -1,7 +1,9 @@
 import asyncio
+import hashlib
 import inspect
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -24,6 +26,27 @@ UPSTREAM_NETWORK_ERRORS = (
 _PROVIDER_ERROR_CLASSIFIER = ProviderErrorClassifier(safe_get=safe_get)
 _RETRY_POLICY = RetryPolicy(_PROVIDER_ERROR_CLASSIFIER, get_engine=get_engine)
 _COOLDOWN_POLICY = CooldownPolicy(_PROVIDER_ERROR_CLASSIFIER, get_engine=get_engine)
+
+_ROUTING_ATTEMPT_HEAD = 16
+_ROUTING_ATTEMPT_TAIL = 16
+_ROUTING_ATTEMPT_LIMIT = _ROUTING_ATTEMPT_HEAD + _ROUTING_ATTEMPT_TAIL
+_ROUTING_ERROR_HASH_TEXT_LIMIT = 4096
+_ROUTING_ERROR_HASH_SCOPE = "unicode_text_prefix_4096_chars_utf8_v1"
+
+
+def _routing_error_sha256(value: Any) -> str:
+    text = str(value)[:_ROUTING_ERROR_HASH_TEXT_LIMIT]
+    return hashlib.sha256(
+        text.encode("utf-8", errors="replace")
+    ).hexdigest()
+
+
+def _observable_provider_name(value: Any) -> str:
+    text = str(value or "")
+    if text.startswith("sk-"):
+        fingerprint = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+        return f"local-api-key:{fingerprint}"
+    return text[:256]
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -253,6 +276,71 @@ class UpstreamAttemptResult:
     local_admission_retry_after: Optional[int] = None
 
 
+def finalize_routing_attempt_entry(
+    entry: Any,
+    *,
+    outcome: str,
+    success: Optional[bool] = None,
+    wire_status_code: Optional[int] = None,
+    semantic_status_code: Optional[int] = None,
+    terminal_event_type: Optional[str] = None,
+    error_code: Optional[str] = None,
+    error_type: Optional[str] = None,
+    error_message: Any = None,
+) -> None:
+    """Finalize a routing fact without retaining provider error contents."""
+
+    if not isinstance(entry, dict):
+        return
+    started_monotonic = entry.pop("_started_monotonic", None)
+    if isinstance(started_monotonic, (int, float)):
+        entry["duration_ms"] = max(
+            0,
+            int((time.monotonic() - float(started_monotonic)) * 1000),
+        )
+    entry["outcome"] = str(outcome)[:80]
+    if success is not None:
+        entry["success"] = bool(success)
+    if wire_status_code is not None:
+        entry["wire_status_code"] = int(wire_status_code)
+    if semantic_status_code is not None:
+        entry["semantic_status_code"] = int(semantic_status_code)
+    if terminal_event_type:
+        entry["terminal_event_type"] = str(terminal_event_type)[:128]
+    if error_code:
+        entry["error_code"] = str(error_code)[:128]
+    if error_type:
+        entry["error_type"] = str(error_type)[:128]
+    if error_message is not None:
+        entry["error_message_sha256"] = _routing_error_sha256(error_message)
+        entry["error_message_hash_scope"] = _ROUTING_ERROR_HASH_SCOPE
+
+
+def finalize_routing_attempt(
+    attempt: Any,
+    **kwargs: Any,
+) -> None:
+    state = getattr(attempt, "state", None)
+    if not isinstance(state, dict):
+        return
+    finalize_routing_attempt_entry(
+        state.get("_routing_attempt_entry"),
+        **kwargs,
+    )
+
+
+def finalize_latest_routing_attempt(
+    current_info: Any,
+    **kwargs: Any,
+) -> None:
+    if not isinstance(current_info, dict):
+        return
+    attempts = current_info.get("routing_attempts")
+    if not isinstance(attempts, list) or not attempts:
+        return
+    finalize_routing_attempt_entry(attempts[-1], **kwargs)
+
+
 class UpstreamRunner:
     def __init__(
         self,
@@ -262,13 +350,168 @@ class UpstreamRunner:
         debug: bool = False,
         provider_api_key_selector=None,
         clear_provider_auth_cache: Optional[Callable[[str], Any]] = None,
+        observability_context: Optional[dict[str, Any]] = None,
     ):
         self.plan = plan
         self.endpoint = endpoint
         self.debug = debug
         self.provider_api_key_selector = provider_api_key_selector or select_provider_api_key_raw
         self.clear_provider_auth_cache = clear_provider_auth_cache
+        self.observability_context = (
+            observability_context
+            if isinstance(observability_context, dict)
+            else None
+        )
         self.runtime_api_list = list(getattr(plan, "api_list", ()) or ())
+
+    def _start_routing_attempt(
+        self,
+        attempt: UpstreamAttemptContext,
+    ) -> Optional[dict[str, Any]]:
+        info = self.observability_context
+        if info is None:
+            return None
+
+        attempt_index = max(0, int(info.get("attempt_count") or 0)) + 1
+        info["attempt_count"] = attempt_index
+        entry: dict[str, Any] = {
+            "index": attempt_index,
+            "provider": _observable_provider_name(attempt.provider_name),
+            "model": str(
+                getattr(self.plan, "request_model_name", "") or ""
+            )[:256],
+            "actual_model": str(attempt.original_model or "")[:256],
+            "outcome": "started",
+            "_started_monotonic": time.monotonic(),
+        }
+        started_at = info.get("start_time")
+        if isinstance(started_at, (int, float)):
+            entry["started_ms"] = max(
+                0,
+                int((time.time() - float(started_at)) * 1000),
+            )
+
+        attempts = info.get("routing_attempts")
+        if not isinstance(attempts, list):
+            attempts = []
+            info["routing_attempts"] = attempts
+        if len(attempts) < _ROUTING_ATTEMPT_LIMIT:
+            attempts.append(entry)
+        else:
+            # Preserve the first failures and the most recent failures.  The
+            # omitted middle is counted explicitly instead of silently lost.
+            attempts.pop(_ROUTING_ATTEMPT_HEAD)
+            attempts.append(entry)
+            info["routing_attempts_omitted_count"] = max(
+                0,
+                int(info.get("routing_attempts_omitted_count") or 0),
+            ) + 1
+        attempt.state["_routing_attempt_entry"] = entry
+        return entry
+
+    def _record_retry_transition(
+        self,
+        previous_entry: Optional[dict[str, Any]],
+        next_entry: Optional[dict[str, Any]],
+    ) -> None:
+        info = self.observability_context
+        if info is None or previous_entry is None or next_entry is None:
+            return
+        previous_entry["retry_transition_to_index"] = int(
+            next_entry.get("index") or 0
+        )
+        info["retry_transition_count"] = max(
+            0,
+            int(info.get("retry_transition_count") or 0),
+        ) + 1
+
+    def _record_routing_failure(
+        self,
+        attempt: UpstreamAttemptContext,
+        exc: Exception,
+        *,
+        status_code: int,
+        error_message: Any,
+        retry_decision: bool,
+        local_admission_rejection: bool,
+    ) -> None:
+        attempt.state["_routing_failure"] = {
+            "wire_status_code": (
+                getattr(exc, "wire_status_code", None)
+                or attempt.state.get("routing_wire_status_code")
+            ),
+            "semantic_status_code": int(status_code),
+            "terminal_event_type": str(
+                getattr(exc, "event_type", None) or ""
+            )[:128]
+            or None,
+            "error_code": str(
+                getattr(exc, "error_code", None) or ""
+            )[:128]
+            or None,
+            "error_type": str(
+                getattr(exc, "error_type", None) or type(exc).__name__
+            )[:128],
+            "error_message_sha256": _routing_error_sha256(error_message),
+            "error_message_hash_scope": _ROUTING_ERROR_HASH_SCOPE,
+            "retry_decision": bool(retry_decision),
+            "retry_reason": (
+                f"http_{int(status_code)}:{type(exc).__name__}"
+            )[:128],
+            "local_admission_rejected": bool(local_admission_rejection),
+        }
+        if retry_decision and self.observability_context is not None:
+            info = self.observability_context
+            info["retry_decision_count"] = max(
+                0,
+                int(info.get("retry_decision_count") or 0),
+            ) + 1
+
+    @staticmethod
+    def _finish_routing_attempt(
+        attempt: UpstreamAttemptContext,
+        result: UpstreamAttemptResult,
+    ) -> Optional[dict[str, Any]]:
+        entry = attempt.state.get("_routing_attempt_entry")
+        if not isinstance(entry, dict):
+            return None
+
+        started_monotonic = entry.get("_started_monotonic")
+        if isinstance(started_monotonic, (int, float)):
+            entry["duration_ms"] = max(
+                0,
+                int((time.monotonic() - float(started_monotonic)) * 1000),
+            )
+
+        failure = attempt.state.get("_routing_failure")
+        if isinstance(failure, dict):
+            entry.update(failure)
+            entry["success"] = False
+            entry["outcome"] = (
+                "retry_decided"
+                if bool(failure.get("retry_decision"))
+                else "failed"
+            )
+            entry.pop("_started_monotonic", None)
+            return entry
+
+        response = result.response
+        response_status = getattr(response, "status_code", None)
+        if isinstance(response_status, int):
+            entry["wire_status_code"] = int(response_status)
+        if response is not None and hasattr(response, "body_iterator"):
+            entry["outcome"] = "stream_pending"
+            return entry
+
+        success = bool(
+            response is not None
+            and isinstance(response_status, int)
+            and response_status < 400
+        )
+        entry["success"] = success
+        entry["outcome"] = "succeeded" if success else "finished"
+        entry.pop("_started_monotonic", None)
+        return entry
 
     def _runtime_api_list(self) -> list[str]:
         return list(self.runtime_api_list)
@@ -310,15 +553,26 @@ class UpstreamRunner:
     ) -> Any:
         final_local_admission_reason: Optional[str] = None
         final_local_admission_retry_after: Optional[int] = None
+        pending_retry_entry: Optional[dict[str, Any]] = None
         while True:
             if before_next_attempt is not None:
                 maybe_response = await _maybe_await(before_next_attempt())
                 if maybe_response is not None:
+                    if pending_retry_entry is not None:
+                        pending_retry_entry["outcome"] = (
+                            "retry_aborted_before_transition"
+                        )
                     return maybe_response
 
             attempt = await self.next_attempt()
             if attempt is None:
+                if pending_retry_entry is not None:
+                    pending_retry_entry["outcome"] = "retry_exhausted"
                 break
+
+            attempt_entry = self._start_routing_attempt(attempt)
+            self._record_retry_transition(pending_retry_entry, attempt_entry)
+            pending_retry_entry = None
 
             result = await self._run_attempt(
                 attempt,
@@ -333,11 +587,13 @@ class UpstreamRunner:
                 on_retry=on_retry,
                 on_cooldown=on_cooldown,
             )
+            completed_entry = self._finish_routing_attempt(attempt, result)
             final_local_admission_reason = result.local_admission_reason
             final_local_admission_retry_after = (
                 result.local_admission_retry_after
             )
             if result.should_retry:
+                pending_retry_entry = completed_entry
                 continue
             if result.finalize:
                 break
@@ -454,6 +710,12 @@ class UpstreamRunner:
                 error_message,
             )
         )
+        semantic_request_failure = bool(
+            getattr(exc, "upstream_semantic_error", False)
+            and status_code in (400, 413)
+        )
+        if request_scoped_failure:
+            attempt.state["track_channel_stats"] = False
         if (
             allow_channel_exclusion
             and not prepare_failure
@@ -468,7 +730,6 @@ class UpstreamRunner:
                 debug=self.debug,
             )
 
-        should_cool_key = not local_admission_rejection
         force_cool_key = _is_codex_chatgpt_model_unsupported_error(
             status_code,
             error_message,
@@ -476,10 +737,20 @@ class UpstreamRunner:
             self.endpoint,
             attempt.original_model,
         )
+        should_cool_key = bool(
+            not local_admission_rejection
+            and (force_cool_key or not request_scoped_failure)
+        )
         if should_cool_down is not None and not local_admission_rejection:
             should_cool_key = force_cool_key or bool(
-                await _maybe_await(
-                    should_cool_down(exc, status_code, error_message, attempt)
+                not request_scoped_failure
+                and await _maybe_await(
+                    should_cool_down(
+                        exc,
+                        status_code,
+                        error_message,
+                        attempt,
+                    )
                 )
             )
         if should_cool_key:
@@ -517,7 +788,20 @@ class UpstreamRunner:
             await _maybe_await(after_failure(attempt, exc, status_code, error_message))
 
         if prepare_failure:
-            if self.plan.auto_retry and not local_admission_rejection:
+            retry_decision = bool(
+                self.plan.auto_retry
+                and not local_admission_rejection
+                and not semantic_request_failure
+            )
+            self._record_routing_failure(
+                attempt,
+                exc,
+                status_code=status_code,
+                error_message=error_message,
+                retry_decision=retry_decision,
+                local_admission_rejection=local_admission_rejection,
+            )
+            if retry_decision:
                 if on_retry is not None:
                     await _maybe_await(on_retry(attempt, status_code, error_message))
                 return UpstreamAttemptResult(
@@ -531,14 +815,27 @@ class UpstreamRunner:
                 local_admission_retry_after=local_admission_retry_after,
             )
 
-        if not local_admission_rejection and should_retry_provider(
-            self.plan.auto_retry,
-            status_code,
-            attempt.provider,
+        retry_decision = bool(
+            not local_admission_rejection
+            and not semantic_request_failure
+            and should_retry_provider(
+                self.plan.auto_retry,
+                status_code,
+                attempt.provider,
+                error_message=error_message,
+                endpoint=self.endpoint,
+                original_model=attempt.original_model,
+            )
+        )
+        self._record_routing_failure(
+            attempt,
+            exc,
+            status_code=status_code,
             error_message=error_message,
-            endpoint=self.endpoint,
-            original_model=attempt.original_model,
-        ):
+            retry_decision=retry_decision,
+            local_admission_rejection=local_admission_rejection,
+        )
+        if retry_decision:
             if on_retry is not None:
                 await _maybe_await(on_retry(attempt, status_code, error_message))
             return UpstreamAttemptResult(

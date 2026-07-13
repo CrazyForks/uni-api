@@ -784,6 +784,7 @@ def test_legacy_stream_channel_result_is_finalized_only_at_terminal_outcome(
         completed_info = {
             "request_id": "completed",
             "api_key": "key",
+            "routing_attempts": [{"index": 1, "outcome": "stream_pending"}],
         }
         completed = runtime._track_legacy_stream_outcome(
             completed_source(),
@@ -796,12 +797,18 @@ def test_legacy_stream_channel_result_is_finalized_only_at_terminal_outcome(
         assert [chunk async for chunk in completed] == [b"one", b"two"]
         assert recorded == [True]
         assert completed_info["success"] is True
+        assert completed_info["routing_attempts"][0]["outcome"] == "stream_completed"
+        assert completed_info["routing_attempts"][0]["success"] is True
 
         async def failed_source():
             yield b"first"
             raise RuntimeError("midstream abort")
 
-        failed_info = {"request_id": "failed", "api_key": "key"}
+        failed_info = {
+            "request_id": "failed",
+            "api_key": "key",
+            "routing_attempts": [{"index": 1, "outcome": "stream_pending"}],
+        }
         failed = runtime._track_legacy_stream_outcome(
             failed_source(),
             current_info=failed_info,
@@ -816,12 +823,69 @@ def test_legacy_stream_channel_result_is_finalized_only_at_terminal_outcome(
         assert recorded == [True, False]
         assert failed_info["success"] is False
         assert failed_info["stream_outcome"] == "upstream_stream_abort"
+        assert failed_info["routing_attempts"][0]["outcome"] == "stream_failed"
+        assert failed_info["routing_attempts"][0]["semantic_status_code"] == 502
+
+        semantic_error = responses_failure_error(
+            {
+                "type": "error",
+                "error": {
+                    "message": "context window exceeded",
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
+                },
+            },
+            event_type="error",
+        )
+        assert semantic_error is not None
+
+        async def semantic_failed_source():
+            yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+            raise semantic_error
+
+        semantic_info = {
+            "request_id": "semantic-failed",
+            "api_key": "key",
+            "routing_attempts": [
+                {
+                    "index": 1,
+                    "wire_status_code": 200,
+                    "outcome": "stream_pending",
+                }
+            ],
+        }
+        semantic_failed = runtime._track_legacy_stream_outcome(
+            semantic_failed_source(),
+            current_info=semantic_info,
+            channel_id="provider",
+            model="model",
+            provider_api_key="provider-key",
+            fallback_background_tasks=None,
+        )
+        assert b"partial" in await anext(semantic_failed)
+        semantic_terminal = await anext(semantic_failed)
+        assert semantic_terminal.startswith("event: error\n")
+        assert '"status_code": 400' in semantic_terminal
+        assert '"code": "context_length_exceeded"' in semantic_terminal
+        with pytest.raises(StopAsyncIteration):
+            await anext(semantic_failed)
+        semantic_attempt = semantic_info["routing_attempts"][0]
+        assert semantic_attempt["wire_status_code"] == 200
+        assert semantic_attempt["semantic_status_code"] == 400
+        assert semantic_attempt["terminal_event_type"] == "error"
+        assert semantic_attempt["error_code"] == "context_length_exceeded"
+        assert semantic_attempt["outcome"] == "semantic_failure_terminal"
+        assert recorded == [True, False]
 
         async def abandoned_source():
             yield b"first"
             await asyncio.Event().wait()
 
-        abandoned_info = {"request_id": "abandoned", "api_key": "key"}
+        abandoned_info = {
+            "request_id": "abandoned",
+            "api_key": "key",
+            "routing_attempts": [{"index": 1, "outcome": "stream_pending"}],
+        }
         abandoned = runtime._track_legacy_stream_outcome(
             abandoned_source(),
             current_info=abandoned_info,
@@ -833,6 +897,10 @@ def test_legacy_stream_channel_result_is_finalized_only_at_terminal_outcome(
         assert await anext(abandoned) == b"first"
         await abandoned.aclose()
         assert recorded == [True, False]
+        assert abandoned_info["routing_attempts"][0]["outcome"] == (
+            "cancelled_or_consumer_closed"
+        )
+        assert "success" not in abandoned_info["routing_attempts"][0]
 
     asyncio.run(scenario())
 

@@ -29,6 +29,7 @@ from uni_api.streaming.sse import (
     SSEProtocolError,
     parse_owned_sse_event,
 )
+from uni_api.upstream.responses_errors import ResponsesSemanticError
 
 
 AsyncCloseCallback = Callable[[dict[str, Any]], Awaitable[None]]
@@ -789,18 +790,25 @@ class LoggingStreamingResponse(Response):
                 "partial_or_unknown_frame_boundary"
             )
             return
-        summary = error_summary or bounded_stream_error_text(exc)
-        error_data = json.dumps(
-            {
-                "type": "error",
-                "error": {
-                    "message": bounded_stream_error_text(
-                        f"Streaming error: {summary}"
-                    ),
-                    "type": "stream_error",
+        if isinstance(exc, ResponsesSemanticError):
+            self.current_info["stream_error_status_code"] = exc.status_code
+            self.current_info["stream_error_code"] = exc.error_code
+            self.current_info["stream_error_type"] = exc.error_type
+            self.current_info["stream_error_event_type"] = exc.event_type
+            error_data = json.dumps(exc.sse_payload, ensure_ascii=False)
+        else:
+            summary = error_summary or bounded_stream_error_text(exc)
+            error_data = json.dumps(
+                {
+                    "type": "error",
+                    "error": {
+                        "message": bounded_stream_error_text(
+                            f"Streaming error: {summary}"
+                        ),
+                        "type": "stream_error",
+                    }
                 }
-            }
-        )
+            )
         self._wire_sse_boundary_known = False
         await self._send_with_deadline(
             send,
@@ -1071,7 +1079,13 @@ class LoggingStreamingResponse(Response):
             )
             should_send_final_body = not disconnected
             self._record_stream_failure(
-                outcome="downstream_disconnected" if disconnected else "error",
+                outcome=(
+                    "downstream_disconnected"
+                    if disconnected
+                    else "upstream_failure_terminal"
+                    if isinstance(exc, ResponsesSemanticError)
+                    else "error"
+                ),
                 error=None if disconnected else exc,
                 downstream_disconnected=disconnected,
             )

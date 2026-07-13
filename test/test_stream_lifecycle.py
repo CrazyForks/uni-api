@@ -33,6 +33,7 @@ from uni_api.streaming.logging_response import (
 )
 from uni_api.streaming.sse import IncrementalSSEParser, SSEProtocolError
 from uni_api.upstream.client_pool import UpstreamAdmissionRejected
+from uni_api.upstream.responses_errors import responses_failure_error
 import uni_api.runtime as runtime
 import uni_api.streaming.cleanup as stream_cleanup
 
@@ -1020,6 +1021,68 @@ def test_sse_stream_error_uses_a_well_formed_error_event_and_records_failure():
         assert current_info["status_code"] == 200
         assert current_info["stream_outcome"] == "error"
         assert current_info["error_type"] == "RuntimeError"
+        assert current_info["success"] is False
+
+    asyncio.run(scenario())
+
+
+def test_sse_semantic_error_preserves_status_and_error_envelope_after_commit():
+    async def scenario():
+        sent = []
+        semantic_error = responses_failure_error(
+            {
+                "type": "error",
+                "error": {
+                    "message": "Your input exceeds the context window of this model.",
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
+                    "param": "input",
+                },
+            },
+            event_type="error",
+        )
+        assert semantic_error is not None
+
+        async def body():
+            yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+            raise semantic_error
+
+        async def send(message):
+            sent.append(message)
+
+        current_info = {"start_time": 0, "success": True}
+        response = LoggingStreamingResponse(
+            body(),
+            media_type="text/event-stream",
+            current_info=current_info,
+        )
+        await response(_scope(), _never_receive, send)
+
+        starts = [message for message in sent if message["type"] == "http.response.start"]
+        assert [message["status"] for message in starts] == [200]
+        bodies = [
+            message.get("body", b"")
+            for message in sent
+            if message["type"] == "http.response.body"
+        ]
+        error_frame = next(body for body in bodies if body.startswith(b"event: error"))
+        payload = json.loads(error_frame.split(b"data: ", 1)[1].strip())
+        assert payload == {
+            "type": "error",
+            "error": {
+                "message": "Your input exceeds the context window of this model.",
+                "status_code": 400,
+                "type": "invalid_request_error",
+                "code": "context_length_exceeded",
+                "param": "input",
+            },
+        }
+        assert b"Streaming error" not in error_frame
+        assert b"data: [DONE]" not in b"".join(bodies)
+        assert current_info["wire_status_code"] == 200
+        assert current_info["stream_error_status_code"] == 400
+        assert current_info["stream_error_code"] == "context_length_exceeded"
+        assert current_info["stream_outcome"] == "upstream_failure_terminal"
         assert current_info["success"] is False
 
     asyncio.run(scenario())

@@ -18,6 +18,7 @@ from uni_api.streaming.responses_events import (
     stream_responses_to_chat_completions,
 )
 from uni_api.streaming.sse import SSEBufferOverflowError, SSEProtocolError
+from uni_api.upstream.responses_errors import ResponsesSemanticError
 
 
 def test_responses_event_parser_reads_named_event_and_payload():
@@ -374,7 +375,7 @@ def test_responses_stream_rejects_partial_eof_without_terminal_event():
 
 
 @pytest.mark.parametrize(
-    ("event_type", "payload"),
+    ("event_type", "payload", "expected_code", "expected_type"),
     [
         (
             "response.failed",
@@ -382,19 +383,37 @@ def test_responses_stream_rejects_partial_eof_without_terminal_event():
                 "type": "response.failed",
                 "response": {
                     "status": "failed",
-                    "error": {"code": "server_error", "message": "failed"},
+                    "error": {
+                        "code": "context_length_exceeded",
+                        "type": "invalid_request_error",
+                        "message": "Your input exceeds the context window of this model.",
+                        "param": "input",
+                    },
                 },
             },
+            "context_length_exceeded",
+            "invalid_request_error",
         ),
         (
             "error",
-            {"type": "error", "error": {"message": "failed"}},
+            {
+                "error": {
+                    "code": "oaix_gateway_error",
+                    "type": "gateway_error",
+                    "status": 400,
+                    "message": "Your input exceeds the context window of this model.",
+                }
+            },
+            "oaix_gateway_error",
+            "gateway_error",
         ),
     ],
 )
 def test_responses_failure_terminals_never_synthesize_partial_success(
     event_type,
     payload,
+    expected_code,
+    expected_type,
 ):
     emitted = []
 
@@ -429,12 +448,58 @@ def test_responses_failure_terminals_never_synthesize_partial_success(
         ):
             emitted.append(chunk)
 
-    with pytest.raises(SSEProtocolError, match="upstream emitted"):
+    with pytest.raises(ResponsesSemanticError) as exc_info:
         asyncio.run(run())
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.event_type == event_type
+    assert exc_info.value.error_code == expected_code
+    assert exc_info.value.error_type == expected_type
+    assert exc_info.value.error_body["error"]["status_code"] == 400
 
     body = "".join(emitted)
     assert "finish_reason" not in body
     assert "data: [DONE]" not in body
+
+
+def test_responses_flattened_data_only_error_is_normalized():
+    async def upstream_iter():
+        yield (
+            b'data: {"type":"error","message":"context length exceeded",'
+            b'"code":"context_length_exceeded","error_type":"invalid_request_error"}\n\n'
+        )
+
+    async def run():
+        async for _chunk in stream_responses_to_chat_completions(
+            upstream_iter(),
+            request_model="gpt-test",
+        ):
+            pass
+
+    with pytest.raises(ResponsesSemanticError) as exc_info:
+        asyncio.run(run())
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.error_code == "context_length_exceeded"
+    assert exc_info.value.error_type == "invalid_request_error"
+
+
+def test_responses_error_terminal_without_error_semantics_is_protocol_error():
+    async def upstream_iter():
+        yield b'event: error\ndata: {"type":"error"}\n\n'
+
+    async def run():
+        async for _chunk in stream_responses_to_chat_completions(
+            upstream_iter(),
+            request_model="gpt-test",
+        ):
+            pass
+
+    with pytest.raises(
+        SSEProtocolError,
+        match="error terminal has no error semantics",
+    ):
+        asyncio.run(run())
 
 
 @pytest.mark.parametrize(

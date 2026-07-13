@@ -447,7 +447,19 @@ class UpstreamRunner:
             attempt.state["local_admission_rejected"] = True
             attempt.state["track_channel_stats"] = False
 
-        if allow_channel_exclusion and not prepare_failure and not local_admission_rejection:
+        request_scoped_failure = status_code in (400, 413) or (
+            status_code == 404
+            and _is_missing_persisted_responses_item_error(
+                status_code,
+                error_message,
+            )
+        )
+        if (
+            allow_channel_exclusion
+            and not prepare_failure
+            and not local_admission_rejection
+            and not request_scoped_failure
+        ):
             await maybe_exclude_failed_channel(
                 self.plan,
                 attempt.provider_name,

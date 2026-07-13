@@ -309,6 +309,18 @@ def build_uni_api_ember_request_telemetry(
                     "stream_error_status_code": _optional_int_text(
                         stream_error_status_code
                     ),
+                    "stream_error_code": _safe_text(
+                        current_info.get("stream_error_code"),
+                        max_len=128,
+                    ),
+                    "stream_error_type": _safe_text(
+                        current_info.get("stream_error_type"),
+                        max_len=128,
+                    ),
+                    "stream_error_event_type": _safe_text(
+                        current_info.get("stream_error_event_type"),
+                        max_len=128,
+                    ),
                     "stream_error_after_response_start": _bool_text(
                         _safe_bool(
                             current_info.get("stream_error_after_response_start")

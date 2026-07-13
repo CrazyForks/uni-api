@@ -226,6 +226,7 @@ from uni_api.config.legacy_loader import (
 from uni_api.persistence.key_stats import get_sorted_api_keys, query_channel_key_stats
 from uni_api.rate_limit.memory import InMemoryRateLimiter
 from uni_api.upstream.error_handling import error_handling_wrapper
+from uni_api.upstream.responses_errors import ResponsesSemanticError
 from core.utils import safe_get
 
 from sqlalchemy import inspect, text
@@ -2651,18 +2652,23 @@ async def _track_legacy_stream_outcome(
                 current_info,
                 exc,
             )
-            current_info["stream_outcome"] = (
-                "local_backpressure_abort"
-                if local_admission
-                else "upstream_stream_abort"
-            )
-            current_info["stream_error_status_code"] = (
-                int(getattr(exc, "status_code", 503))
-                if local_admission
-                else 502
-            )
+            semantic_failure = isinstance(exc, ResponsesSemanticError)
+            if local_admission:
+                current_info["stream_outcome"] = "local_backpressure_abort"
+                current_info["stream_error_status_code"] = int(
+                    getattr(exc, "status_code", 503)
+                )
+            elif semantic_failure:
+                current_info["stream_outcome"] = "upstream_failure_terminal"
+                current_info["stream_error_status_code"] = exc.status_code
+                current_info["stream_error_code"] = exc.error_code
+                current_info["stream_error_type"] = exc.error_type
+                current_info["stream_error_event_type"] = exc.event_type
+            else:
+                current_info["stream_outcome"] = "upstream_stream_abort"
+                current_info["stream_error_status_code"] = 502
             current_info["error_type"] = type(exc).__name__
-            if not local_admission:
+            if not local_admission and not _is_request_scoped_semantic_error(exc):
                 _schedule_channel_stats_bounded(
                     current_info["request_id"],
                     channel_id,
@@ -2700,6 +2706,13 @@ def _record_local_admission_rejection(
         current_info["error_type"] = reason
         current_info["success"] = False
     return True
+
+
+def _is_request_scoped_semantic_error(exc: BaseException) -> bool:
+    return (
+        isinstance(exc, ResponsesSemanticError)
+        and exc.status_code in (400, 413)
+    )
 
 
 # 在 process_request 函数中更新成功和失败计数
@@ -2929,6 +2942,7 @@ async def process_request(
         )
         if not (
             local_admission_rejection
+            or _is_request_scoped_semantic_error(e)
             or isinstance(e, asyncio.CancelledError)
             or (
                 isinstance(disconnect_event, asyncio.Event)
@@ -3183,6 +3197,21 @@ class ModelRequestHandler:
 
                 traceback.print_exc()
 
+        def should_cool_down(exc, status_code, error_message, attempt):
+            _ = error_message, attempt
+            return not isinstance(exc, ValueError) and status_code not in (400, 413)
+
+        def build_error_response(status_code, error_message):
+            if isinstance(current_info, dict):
+                current_info["first_response_time"] = -1
+                current_info["success"] = False
+                current_info["provider"] = None
+            return build_upstream_error_response(
+                status_code=status_code,
+                error_message=error_message,
+                fallback_prefix="Error: Current provider response failed",
+            )
+
         def build_final_response(completed_plan):
             if isinstance(current_info, dict):
                 current_info["first_response_time"] = -1
@@ -3197,10 +3226,12 @@ class ModelRequestHandler:
             execute_attempt,
             before_next_attempt=before_next_attempt,
             after_failure=after_failure,
+            build_error_response=build_error_response,
             build_final_response=build_final_response,
             exclude_error_substrings=exclude_error_rate_limit,
             rollback_rate_limit_errors=exclude_error_rate_limit,
             allow_channel_exclusion=True,
+            should_cool_down=should_cool_down,
             on_retry=_record_retry_observability,
             on_cooldown=_record_cooldown_observability,
         )

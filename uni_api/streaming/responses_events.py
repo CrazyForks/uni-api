@@ -11,6 +11,7 @@ from typing import Any
 from core.utils import end_of_line, parse_sse_event, safe_get
 from uni_api.admission.json_parsing import run_json_cpu
 from uni_api.serialization import json
+from uni_api.upstream.responses_errors import responses_failure_error
 
 from .chat_completion_events import (
     build_chat_completion_chunk_sse,
@@ -637,7 +638,6 @@ async def _stream_responses_to_chat_completions_impl(
             event_owner = await parse_owned_sse_event(raw_event)
             event_payload = None
             event_type = None
-            error_detail = None
             delta_text = None
             synthetic_completed_payload = None
             completed_chunk = None
@@ -646,7 +646,7 @@ async def _stream_responses_to_chat_completions_impl(
 
             @asynccontextmanager
             async def clear_event_aliases_before_owner_release():
-                nonlocal event_payload, event_type, error_detail, delta_text
+                nonlocal event_payload, event_type, delta_text
                 nonlocal synthetic_completed_payload, raw_event
                 nonlocal completed_chunk, content_chunk, reasoning_chunk
                 try:
@@ -654,7 +654,6 @@ async def _stream_responses_to_chat_completions_impl(
                 finally:
                     event_payload = None
                     event_type = None
-                    error_detail = None
                     delta_text = None
                     synthetic_completed_payload = None
                     completed_chunk = None
@@ -703,27 +702,27 @@ async def _stream_responses_to_chat_completions_impl(
 
                     if event_type == "error":
                         error_seen = True
-                        raise SSEProtocolError(
-                            "Responses upstream emitted an error terminal: "
-                            f"{str(event_payload)[:1000]}"
+                        semantic_error = responses_failure_error(
+                            event_payload,
+                            event_type=event_type,
                         )
+                        if semantic_error is None:
+                            raise SSEProtocolError(
+                                "Responses upstream error terminal has no error semantics"
+                            )
+                        raise semantic_error
 
                     if event_type == "response.failed":
                         error_seen = True
-                        error_detail = (
-                            safe_get(
-                                event_payload,
-                                "response",
-                                "error",
-                                default=None,
+                        semantic_error = responses_failure_error(
+                            event_payload,
+                            event_type=event_type,
+                        )
+                        if semantic_error is None:
+                            raise SSEProtocolError(
+                                "Responses upstream response.failed terminal has no error semantics"
                             )
-                            if isinstance(event_payload, dict)
-                            else event_payload
-                        )
-                        raise SSEProtocolError(
-                            f"Responses upstream emitted {event_type}: "
-                            f"{str(error_detail or event_payload)[:1000]}"
-                        )
+                        raise semantic_error
 
                     if event_type == "response.incomplete" and isinstance(
                         event_payload,

@@ -11,6 +11,8 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import HTTPException
 
+from uni_api.upstream.responses_errors import ResponsesSemanticError
+
 
 NETWORK_ERRORS = (
     httpx.ReadError,
@@ -52,6 +54,8 @@ class ProviderErrorClassifier:
         )
 
     def normalize_exception(self, exc: Exception) -> tuple[int, str]:
+        if isinstance(exc, ResponsesSemanticError):
+            return exc.status_code, exc.detail_json
         # Local admission errors deliberately expose a bounded HTTP outcome.
         # Recognize the small protocol by attributes to avoid coupling this
         # policy module back to the client-pool implementation.

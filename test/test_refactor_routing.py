@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import json
 import os
 import sys
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from fastapi import HTTPException
 from starlette.responses import Response, StreamingResponse
 from core.models import RequestModel
 from routing import RoutingPlan, build_api_key_models_map, get_right_order_providers
+from uni_api.upstream.responses_errors import responses_failure_error
 
 
 def test_build_api_key_models_map_resolves_nested_api_keys():
@@ -387,6 +389,161 @@ def test_model_request_handler_passes_selected_provider_key(monkeypatch):
         assert response.status_code == 200
 
     asyncio.run(run_test())
+
+
+def test_model_request_semantic_context_error_returns_400_without_retry_or_cooldown(
+    monkeypatch,
+):
+    provider_names = ["provider-a", "provider-b"]
+    process_calls = []
+
+    class DummyCircularList:
+        def __init__(self, key):
+            self.key = key
+            self.cooling_calls = []
+
+        async def is_all_rate_limited(self, model):
+            return False
+
+        async def next(self, model):
+            return self.key
+
+        def get_items_count(self):
+            return 1
+
+        async def set_cooling(self, item, cooling_time):
+            self.cooling_calls.append((item, cooling_time))
+
+    class ChannelManager:
+        cooldown_period = 300
+
+        def __init__(self):
+            self.excluded = []
+
+        async def exclude_model(self, provider, model):
+            self.excluded.append((provider, model))
+
+    lists = {
+        provider_name: DummyCircularList(f"{provider_name}-key")
+        for provider_name in provider_names
+    }
+    for provider_name, circular_list in lists.items():
+        monkeypatch.setitem(
+            main.provider_api_circular_list,
+            provider_name,
+            circular_list,
+        )
+
+    async def fake_get_right_order_providers(
+        request_model_name,
+        config,
+        api_index,
+        scheduling_algorithm,
+    ):
+        _ = config, api_index, scheduling_algorithm
+        return [
+            {
+                "provider": provider_name,
+                "_model_dict_cache": {request_model_name: request_model_name},
+                "base_url": f"https://{provider_name}.example/v1/responses",
+                "api": [f"{provider_name}-key"],
+                "preferences": {"api_key_cooldown_period": 300},
+            }
+            for provider_name in provider_names
+        ]
+
+    async def fake_process_request(
+        request,
+        provider,
+        background_tasks,
+        endpoint=None,
+        role=None,
+        timeout_value=0,
+        keepalive_interval=None,
+        provider_api_key_raw=None,
+        current_info=None,
+        http_request=None,
+    ):
+        _ = (
+            request,
+            background_tasks,
+            endpoint,
+            role,
+            timeout_value,
+            keepalive_interval,
+            provider_api_key_raw,
+            current_info,
+            http_request,
+        )
+        process_calls.append(provider["provider"])
+        error = responses_failure_error(
+            {
+                "error": {
+                    "code": "oaix_gateway_error",
+                    "message": "Your input exceeds the context window of this model.",
+                    "status": 400,
+                    "type": "gateway_error",
+                }
+            },
+            event_type="error",
+        )
+        assert error is not None
+        raise error
+
+    channel_manager = ChannelManager()
+    monkeypatch.setattr(
+        main,
+        "get_right_order_providers",
+        fake_get_right_order_providers,
+    )
+    monkeypatch.setattr(main, "process_request", fake_process_request)
+    main.app.state.config = {
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["gpt-5.5"],
+                "preferences": {"AUTO_RETRY": True},
+            }
+        ]
+    }
+    main.app.state.provider_timeouts = {"global": {"default": 30}}
+    main.app.state.keepalive_interval = {"global": {"default": 99999}}
+    main.app.state.channel_manager = channel_manager
+
+    current_info = {
+        "request_id": "semantic-context-error",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+
+    async def run_test():
+        handler = main.ModelRequestHandler()
+        return await handler.request_model(
+            RequestModel(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=True,
+            ),
+            0,
+            BackgroundTasks(),
+            current_info=current_info,
+        )
+
+    response = asyncio.run(run_test())
+
+    assert response.status_code == 400
+    assert json.loads(response.body) == {
+        "error": {
+            "message": "Your input exceeds the context window of this model.",
+            "status_code": 400,
+            "type": "gateway_error",
+            "code": "oaix_gateway_error",
+        }
+    }
+    assert process_calls == ["provider-a"]
+    assert current_info.get("retry_count", 0) == 0
+    assert channel_manager.excluded == []
+    assert all(not circular_list.cooling_calls for circular_list in lists.values())
 
 
 def test_model_request_same_turn_disconnect_closes_completed_stream_result(

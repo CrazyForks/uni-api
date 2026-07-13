@@ -2,6 +2,7 @@ import httpx
 from fastapi import HTTPException
 
 from uni_api.upstream.policies import CooldownPolicy, ProviderErrorClassifier, RetryPolicy
+from uni_api.upstream.responses_errors import responses_failure_error
 
 
 def _safe_get(data, *keys, default=None):
@@ -39,6 +40,53 @@ def test_provider_error_classifier_preserves_local_upstream_admission_503():
         503,
         "upstream_wait_timeout",
     )
+
+
+def test_provider_error_classifier_preserves_responses_semantic_400():
+    classifier = ProviderErrorClassifier(_safe_get)
+    retry_policy = RetryPolicy(classifier, _get_engine)
+    error = responses_failure_error(
+        {
+            "error": {
+                "code": "oaix_gateway_error",
+                "message": "Your input exceeds the context window of this model.",
+                "status": 400,
+                "type": "gateway_error",
+            }
+        },
+        event_type="error",
+    )
+
+    assert error is not None
+    status_code, detail = classifier.normalize_exception(error)
+    assert status_code == 400
+    assert '"code":"oaix_gateway_error"' in detail
+    assert retry_policy.should_retry(
+        True,
+        status_code,
+        {"base_url": "https://example.com/v1/responses"},
+        error_message=detail,
+        endpoint="/v1/chat/completions",
+        original_model="gpt-5.5",
+    ) is False
+
+
+def test_responses_semantic_error_bounds_attacker_sized_message():
+    error = responses_failure_error(
+        {
+            "type": "error",
+            "error": {
+                "code": "server_error",
+                "message": "x" * (1024 * 1024),
+            },
+        },
+        event_type="error",
+    )
+
+    assert error is not None
+    assert len(error.message.encode("utf-8")) <= 4096
+    assert len(error.detail_json.encode("utf-8")) < 8192
+    assert error.message.endswith(" [truncated]")
 
 
 def test_retry_policy_does_not_retry_missing_persisted_response_item():

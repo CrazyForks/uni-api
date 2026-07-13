@@ -61,6 +61,7 @@ from uni_api.streaming.chat_completion_events import (
     responses_usage_to_chat_completion_usage as _responses_usage_to_chat_completion_usage,
 )
 from uni_api.streaming.responses_events import (
+    chat_completion_tool_calls_from_responses_output as _chat_completion_tool_calls_from_responses_output,
     mime_type_from_output_format as _mime_type_from_output_format,
     normalize_optional_text as _normalize_optional_text,
     stream_responses_to_chat_completions as _stream_responses_to_chat_completions,
@@ -2279,6 +2280,9 @@ async def _yield_responses_api_chat_completion(response, model):
         safe_get(usage, "total_tokens", default=0)
     )
     content, reasoning_content = _responses_output_to_text(response_json)
+    tool_calls = _chat_completion_tool_calls_from_responses_output(
+        safe_get(response_json, "output", default=[])
+    )
     timestamp = safe_get(response_json, "created", default=int(datetime.timestamp(datetime.now())))
     yield await generate_no_stream_response(
         timestamp,
@@ -2295,6 +2299,8 @@ async def _yield_responses_api_chat_completion(response, model):
         completion_audio_tokens=_coerce_token_count(safe_get(usage, "completion_tokens_details", "audio_tokens", default=0)),
         accepted_prediction_tokens=_coerce_token_count(safe_get(usage, "completion_tokens_details", "accepted_prediction_tokens", default=0)),
         rejected_prediction_tokens=_coerce_token_count(safe_get(usage, "completion_tokens_details", "rejected_prediction_tokens", default=0)),
+        tool_calls_list=tool_calls,
+        preserve_content_with_tool_calls=True,
     )
 
 

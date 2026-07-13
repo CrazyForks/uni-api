@@ -119,6 +119,7 @@ async def generate_no_stream_response(
     accepted_prediction_tokens=0,
     rejected_prediction_tokens=0,
     tool_calls_list=None,
+    preserve_content_with_tool_calls=False,
 ):
     """Legacy-compatible non-stream builder with bounded CPU ownership."""
 
@@ -204,7 +205,7 @@ async def generate_no_stream_response(
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": None,
+                        "content": content if preserve_content_with_tool_calls else None,
                         "tool_calls": tool_calls_list,
                         "refusal": None,
                     },

@@ -1426,6 +1426,130 @@ async def get_aws_payload(request, engine, provider, api_key=None):
 
     return url, headers, payload
 
+def _provider_tools_enabled(provider: dict) -> bool:
+    return provider.get("tools") is not False
+
+
+def _responses_function_tools(request: RequestModel) -> list[dict]:
+    tools: list[dict] = []
+    for tool in request.tools or []:
+        if getattr(tool, "type", None) != "function":
+            tools.append(tool.model_dump(exclude_unset=True, by_alias=True))
+            continue
+
+        function = getattr(tool, "function", None)
+        if function is None:
+            continue
+
+        item = {
+            "type": "function",
+            "name": function.name,
+        }
+        if function.description is not None:
+            item["description"] = function.description
+        if function.parameters is not None:
+            item["parameters"] = function.parameters.model_dump(
+                exclude_none=True,
+                by_alias=True,
+            )
+        tools.append(item)
+    return tools
+
+
+def _responses_tool_choice(tool_choice):
+    if isinstance(tool_choice, str):
+        return tool_choice
+
+    choice_type = getattr(tool_choice, "type", None)
+    if choice_type == "function":
+        function = getattr(tool_choice, "function", None)
+        name = getattr(function, "name", None) if function is not None else None
+        choice = {"type": "function"}
+        if name:
+            choice["name"] = name
+        return choice
+    if choice_type:
+        return {"type": choice_type}
+    return None
+
+
+async def _gpt_responses_input(request: RequestModel, engine: str, provider: dict, original_model: str) -> list[dict]:
+    input_items: list[dict] = []
+    tools_enabled = _provider_tools_enabled(provider)
+
+    for msg in request.messages:
+        role = msg.role
+        if role == "tool":
+            if not tools_enabled:
+                continue
+            output = msg.content
+            if isinstance(output, list):
+                text_parts = [
+                    str(item.text)
+                    for item in output
+                    if item.type == "text" and item.text is not None
+                ]
+                output = "\n".join(text_parts) if text_parts else json.dumps(
+                    [item.model_dump(exclude_unset=True) for item in output],
+                    ensure_ascii=False,
+                )
+            input_items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": msg.tool_call_id,
+                    "output": "" if output is None else output,
+                }
+            )
+            continue
+
+        content = msg.content
+        if isinstance(content, list):
+            content_parts = []
+            text_type = "output_text" if role == "assistant" else "input_text"
+            for item in content:
+                if item.type == "text":
+                    text_message = await get_text_message(item.text, engine)
+                    text_message["type"] = text_type
+                    text_message.update(_get_extra_fields(item))
+                    content_parts.append(text_message)
+                elif item.type == "image_url" and provider.get("image", True):
+                    image_message = await build_image_message(item.image_url.url, engine)
+                    image_message = {
+                        "type": "input_image",
+                        "image_url": image_message["image_url"]["url"],
+                    }
+                    image_message.update(_get_extra_fields(item))
+                    content_parts.append(image_message)
+                elif item.type == "input_audio":
+                    audio_item = _build_input_audio_item(item)
+                    if audio_item:
+                        audio_item.update(_get_extra_fields(item))
+                        content_parts.append(audio_item)
+            content = content_parts
+        elif role == "system" and "o3-mini" in original_model and content and not content.startswith("Formatting re-enabled"):
+            content = "Formatting re-enabled. " + content
+
+        if content is not None:
+            message = {"role": role, "content": content}
+            message.update(_get_extra_fields(msg))
+            input_items.append(message)
+
+        if tools_enabled and role == "assistant":
+            for tool_call in msg.tool_calls or []:
+                if tool_call.type != "function":
+                    continue
+                input_items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": tool_call.id,
+                        "name": tool_call.function.name,
+                        "arguments": tool_call.function.arguments,
+                    }
+                )
+
+    return input_items
+
+
 async def get_gpt_payload(request, engine, provider, api_key=None):
     headers = {
         'Content-Type': 'application/json',
@@ -1441,67 +1565,65 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
         headers['HTTP-Referer'] = "https://github.com/yym68686/uni-api"
         headers['X-Title'] = "Uni API"
 
-    messages = []
-    for msg in request.messages:
-        tool_calls = None
-        tool_call_id = None
-        if isinstance(msg.content, list):
-            content = []
-            for item in msg.content:
-                if item.type == "text":
-                    text_message = await get_text_message(item.text, engine)
-                    if use_responses_api:
-                        text_message["type"] = "input_text"
-                    text_message.update(_get_extra_fields(item))
-                    content.append(text_message)
-                elif item.type == "image_url" and provider.get("image", True):
-                    image_message = await build_image_message(item.image_url.url, engine)
-                    if use_responses_api:
-                        image_message = {
-                            "type": "input_image",
-                            "image_url": image_message["image_url"]["url"]
-                        }
-                    image_message.update(_get_extra_fields(item))
-                    content.append(image_message)
-                elif item.type == "input_audio":
-                    audio_item = _build_input_audio_item(item)
-                    if audio_item:
-                        audio_item.update(_get_extra_fields(item))
-                        content.append(audio_item)
-        else:
-            content = msg.content
-            if msg.role == "system" and "o3-mini" in original_model and not content.startswith("Formatting re-enabled"):
-                content = "Formatting re-enabled. " + content
-            tool_calls = msg.tool_calls
-            tool_call_id = msg.tool_call_id
-
-        if tool_calls:
-            tool_calls_list = []
-            for tool_call in tool_calls:
-                tool_calls_list.append({
-                    "id": tool_call.id,
-                    "type": tool_call.type,
-                    "function": {
-                        "name": tool_call.function.name,
-                        "arguments": tool_call.function.arguments
-                    }
-                })
-                if provider.get("tools"):
-                    messages.append({"role": msg.role, "tool_calls": tool_calls_list})
-        elif tool_call_id:
-            if provider.get("tools"):
-                messages.append({"role": msg.role, "tool_call_id": tool_call_id, "content": content})
-        else:
-            msg_dict = {"role": msg.role, "content": content}
-            msg_dict.update(_get_extra_fields(msg))
-            messages.append(msg_dict)
-
     if use_responses_api:
         payload = {
             "model": original_model,
-            "input": messages,
+            "input": await _gpt_responses_input(request, engine, provider, original_model),
         }
     else:
+        messages = []
+        tools_enabled = _provider_tools_enabled(provider)
+        for msg in request.messages:
+            tool_calls = msg.tool_calls
+            tool_call_id = msg.tool_call_id
+            if isinstance(msg.content, list):
+                content = []
+                for item in msg.content:
+                    if item.type == "text":
+                        text_message = await get_text_message(item.text, engine)
+                        text_message.update(_get_extra_fields(item))
+                        content.append(text_message)
+                    elif item.type == "image_url" and provider.get("image", True):
+                        image_message = await build_image_message(item.image_url.url, engine)
+                        image_message.update(_get_extra_fields(item))
+                        content.append(image_message)
+                    elif item.type == "input_audio":
+                        audio_item = _build_input_audio_item(item)
+                        if audio_item:
+                            audio_item.update(_get_extra_fields(item))
+                            content.append(audio_item)
+            else:
+                content = msg.content
+                if msg.role == "system" and "o3-mini" in original_model and content and not content.startswith("Formatting re-enabled"):
+                    content = "Formatting re-enabled. " + content
+
+            if tool_calls:
+                if not tools_enabled:
+                    continue
+                tool_calls_list = [
+                    {
+                        "id": tool_call.id,
+                        "type": tool_call.type,
+                        "function": {
+                            "name": tool_call.function.name,
+                            "arguments": tool_call.function.arguments,
+                        },
+                    }
+                    for tool_call in tool_calls
+                ]
+                message = {"role": msg.role, "tool_calls": tool_calls_list}
+                if content is not None:
+                    message["content"] = content
+                message.update(_get_extra_fields(msg))
+                messages.append(message)
+            elif tool_call_id:
+                if tools_enabled:
+                    messages.append({"role": msg.role, "tool_call_id": tool_call_id, "content": content})
+            else:
+                msg_dict = {"role": msg.role, "content": content}
+                msg_dict.update(_get_extra_fields(msg))
+                messages.append(msg_dict)
+
         payload = {
             "model": original_model,
             "messages": messages,
@@ -1511,6 +1633,8 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
         'model',
         'messages',
     ]
+    if use_responses_api:
+        miss_fields.extend(['tools', 'tool_choice'])
 
     for field, value in request.model_dump(exclude_unset=True).items():
         if field not in miss_fields and value is not None:
@@ -1521,7 +1645,16 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
             else:
                 payload[field] = value
 
-    if provider.get("tools") is False or "chatgpt-4o-latest" in original_model or "grok" in original_model:
+    if use_responses_api and _provider_tools_enabled(provider):
+        tools = _responses_function_tools(request)
+        if tools:
+            payload["tools"] = tools
+        if request.tool_choice is not None:
+            tool_choice = _responses_tool_choice(request.tool_choice)
+            if tool_choice is not None:
+                payload["tool_choice"] = tool_choice
+
+    if provider.get("tools") is False or "chatgpt-4o-latest" in original_model:
         payload.pop("tools", None)
         payload.pop("tool_choice", None)
 
@@ -2021,8 +2154,8 @@ async def get_azure_payload(request, engine, provider, api_key=None):
 
     messages = []
     for msg in request.messages:
-        tool_calls = None
-        tool_call_id = None
+        tool_calls = msg.tool_calls
+        tool_call_id = msg.tool_call_id
         if isinstance(msg.content, list):
             content = []
             for item in msg.content:
@@ -2041,8 +2174,6 @@ async def get_azure_payload(request, engine, provider, api_key=None):
                         content.append(audio_item)
         else:
             content = msg.content
-            tool_calls = msg.tool_calls
-            tool_call_id = msg.tool_call_id
 
         if tool_calls:
             tool_calls_list = []
@@ -2055,10 +2186,14 @@ async def get_azure_payload(request, engine, provider, api_key=None):
                         "arguments": tool_call.function.arguments
                     }
                 })
-                if provider.get("tools"):
-                    messages.append({"role": msg.role, "tool_calls": tool_calls_list})
+            if _provider_tools_enabled(provider):
+                message = {"role": msg.role, "tool_calls": tool_calls_list}
+                if content is not None:
+                    message["content"] = content
+                message.update(_get_extra_fields(msg))
+                messages.append(message)
         elif tool_call_id:
-            if provider.get("tools"):
+            if _provider_tools_enabled(provider):
                 messages.append({"role": msg.role, "tool_call_id": tool_call_id, "content": content})
         else:
             msg_dict = {"role": msg.role, "content": content}
@@ -2084,7 +2219,7 @@ async def get_azure_payload(request, engine, provider, api_key=None):
             else:
                 payload[field] = value
 
-    if provider.get("tools") is False or "chatgpt-4o-latest" in original_model or "grok" in original_model:
+    if provider.get("tools") is False or "chatgpt-4o-latest" in original_model:
         payload.pop("tools", None)
         payload.pop("tool_choice", None)
 
@@ -2106,8 +2241,8 @@ async def get_azure_databricks_payload(request, engine, provider, api_key=None):
 
     messages = []
     for msg in request.messages:
-        tool_calls = None
-        tool_call_id = None
+        tool_calls = msg.tool_calls
+        tool_call_id = msg.tool_call_id
         if isinstance(msg.content, list):
             content = []
             for item in msg.content:
@@ -2126,8 +2261,6 @@ async def get_azure_databricks_payload(request, engine, provider, api_key=None):
                         content.append(audio_item)
         else:
             content = msg.content
-            tool_calls = msg.tool_calls
-            tool_call_id = msg.tool_call_id
 
         if tool_calls:
             tool_calls_list = []
@@ -2140,10 +2273,14 @@ async def get_azure_databricks_payload(request, engine, provider, api_key=None):
                         "arguments": tool_call.function.arguments
                     }
                 })
-                if provider.get("tools"):
-                    messages.append({"role": msg.role, "tool_calls": tool_calls_list})
+            if _provider_tools_enabled(provider):
+                message = {"role": msg.role, "tool_calls": tool_calls_list}
+                if content is not None:
+                    message["content"] = content
+                message.update(_get_extra_fields(msg))
+                messages.append(message)
         elif tool_call_id:
-            if provider.get("tools"):
+            if _provider_tools_enabled(provider):
                 messages.append({"role": msg.role, "tool_call_id": tool_call_id, "content": content})
         else:
             msg_dict = {"role": msg.role, "content": content}
@@ -2184,7 +2321,7 @@ async def get_azure_databricks_payload(request, engine, provider, api_key=None):
             else:
                 payload[field] = value
 
-    if provider.get("tools") is False or "chatgpt-4o-latest" in original_model or "grok" in original_model:
+    if provider.get("tools") is False or "chatgpt-4o-latest" in original_model:
         payload.pop("tools", None)
         payload.pop("tool_choice", None)
 
@@ -2233,8 +2370,8 @@ async def get_openrouter_payload(request, engine, provider, api_key=None):
 
     messages = []
     for msg in request.messages:
-        tool_calls = None
-        tool_call_id = None
+        tool_calls = msg.tool_calls
+        tool_call_id = msg.tool_call_id
         if isinstance(msg.content, list):
             content = []
             for item in msg.content:
@@ -2253,8 +2390,6 @@ async def get_openrouter_payload(request, engine, provider, api_key=None):
                         content.append(audio_item)
         else:
             content = msg.content
-            tool_calls = msg.tool_calls
-            tool_call_id = msg.tool_call_id
 
         if tool_calls:
             tool_calls_list = []
@@ -2267,10 +2402,14 @@ async def get_openrouter_payload(request, engine, provider, api_key=None):
                         "arguments": tool_call.function.arguments
                     }
                 })
-                if provider.get("tools"):
-                    messages.append({"role": msg.role, "tool_calls": tool_calls_list})
+            if _provider_tools_enabled(provider):
+                message = {"role": msg.role, "tool_calls": tool_calls_list}
+                if content is not None:
+                    message["content"] = content
+                message.update(_get_extra_fields(msg))
+                messages.append(message)
         elif tool_call_id:
-            if provider.get("tools"):
+            if _provider_tools_enabled(provider):
                 messages.append({"role": msg.role, "tool_call_id": tool_call_id, "content": content})
         else:
             # print("content", content)
@@ -2306,6 +2445,10 @@ async def get_openrouter_payload(request, engine, provider, api_key=None):
     for field, value in request.model_dump(exclude_unset=True).items():
         if field not in miss_fields and value is not None:
             payload[field] = value
+
+    if provider.get("tools") is False:
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
 
     apply_post_body_parameter_overrides(payload, provider, request.model)
 

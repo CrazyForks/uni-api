@@ -6473,7 +6473,26 @@ class ResponsesRequestExecution:
                                 # shutdown or another local reason.  Do not
                                 # fabricate a peer disconnect/provider fault.
                                 attempt.state["stream_attempt_finalized"] = True
-                        if not (completed_seen or incomplete_seen) or not usage_seen:
+                        terminal_or_usage_missing = (
+                            not (completed_seen or incomplete_seen)
+                            or not usage_seen
+                        )
+                        if (
+                            terminal_or_usage_missing
+                            and diagnostics.facts.get("downstream_disconnected")
+                        ):
+                            trace_logger.info(
+                                "%s upstream read cancelled after downstream disconnect before completed usage request_id=%s model=%s provider=%s output_seen=%s completed_seen=%s usage_seen=%s upstream_url=%s",
+                                self.endpoint,
+                                self.request_id,
+                                self.request_model_name,
+                                attempt.provider_name,
+                                output_seen,
+                                completed_seen or incomplete_seen,
+                                usage_seen,
+                                attempt.state["upstream_url"],
+                            )
+                        elif terminal_or_usage_missing:
                             trace_logger.warning(
                                 "%s upstream stream finished without completed usage request_id=%s model=%s provider=%s output_seen=%s completed_seen=%s usage_seen=%s upstream_url=%s",
                                 self.endpoint,

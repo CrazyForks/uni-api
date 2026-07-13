@@ -2152,10 +2152,15 @@ def test_responses_postcommit_abort_records_only_channel_failure(
 ):
     _configure_responses_test(monkeypatch, engine="codex")
     channel_results = []
+    warning_logs = []
+
+    def record_warning(message, *args, **_kwargs):
+        warning_logs.append(message % args if args else message)
 
     def record(*_args, success, **_kwargs):
         channel_results.append(success)
 
+    monkeypatch.setattr(main.trace_logger, "warning", record_warning)
     monkeypatch.setattr(main, "_schedule_channel_stats_bounded", record)
     main.app.state.client_manager = DummyClientManager(
         DummyStreamingUpstreamResponse(
@@ -2193,6 +2198,10 @@ def test_responses_postcommit_abort_records_only_channel_failure(
         "RuntimeError",
         "SSEProtocolError",
     }
+    assert any(
+        "upstream stream finished without completed usage" in message
+        for message in warning_logs
+    )
 
 
 def test_responses_postcommit_partial_terminal_read_error_is_fully_diagnostic(
@@ -3220,10 +3229,20 @@ def test_responses_live_disconnect_does_not_rewrite_client_close_as_sse_502(
 ):
     _configure_responses_test(monkeypatch, engine="codex")
     channel_results = []
+    info_logs = []
+    warning_logs = []
+
+    def record_info(message, *args, **_kwargs):
+        info_logs.append(message % args if args else message)
+
+    def record_warning(message, *args, **_kwargs):
+        warning_logs.append(message % args if args else message)
 
     def record(*_args, success, **_kwargs):
         channel_results.append(success)
 
+    monkeypatch.setattr(main.trace_logger, "info", record_info)
+    monkeypatch.setattr(main.trace_logger, "warning", record_warning)
     monkeypatch.setattr(main, "_schedule_channel_stats_bounded", record)
     disconnect_event = asyncio.Event()
     upstream_response = DisconnectingLiveStreamingUpstreamResponse(
@@ -3269,6 +3288,15 @@ def test_responses_live_disconnect_does_not_rewrite_client_close_as_sse_502(
     assert diagnostics["downstream_disconnect_stage"] == "after-stream-commit"
     assert diagnostics["diagnosis"] == "responses_downstream_disconnect"
     assert diagnostics["cleanup_trigger"] == "downstream_disconnect"
+    assert any(
+        "upstream read cancelled after downstream disconnect before completed usage"
+        in message
+        for message in info_logs
+    )
+    assert not any(
+        "upstream stream finished without completed usage" in message
+        for message in warning_logs
+    )
 
 
 def test_responses_stream_emits_oaix_keepalive_before_real_output(monkeypatch):

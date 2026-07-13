@@ -32,6 +32,10 @@ from uni_api.admission.resources import (
     process_cpu_affinity_count,
     startup_active_limit,
 )
+from uni_api.observability.responses_stream import (
+    observe_client_pool_shutdown_connection,
+    observe_client_pool_shutdown_completed,
+)
 from uni_api.streaming.cleanup import (
     await_isolated_transport_cleanup_safely,
     await_stream_cleanup_safely,
@@ -960,10 +964,33 @@ class ClientPool:
                 )
 
         for client in clients:
+            shutdown_trackers = []
             try:
+                transport = getattr(client, "_transport", None)
+                pool = getattr(transport, "_pool", None)
+                connections = getattr(pool, "_connections", None)
+                if isinstance(connections, list):
+                    for connection in list(connections):
+                        for tracker in observe_client_pool_shutdown_connection(
+                            connection
+                        ):
+                            if all(
+                                existing is not tracker
+                                for existing in shutdown_trackers
+                            ):
+                                shutdown_trackers.append(tracker)
                 await client.aclose()
             except Exception:
+                observe_client_pool_shutdown_completed(
+                    shutdown_trackers,
+                    succeeded=False,
+                )
                 logger.warning("Failed to close upstream HTTP client", exc_info=True)
+            else:
+                observe_client_pool_shutdown_completed(
+                    shutdown_trackers,
+                    succeeded=True,
+                )
 
         async with self._lifecycle_lock:
             self.clients.clear()

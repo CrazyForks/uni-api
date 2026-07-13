@@ -133,6 +133,11 @@ from uni_api.observability.request_context import (
 )
 from uni_api.observability.spans import merge_timing_spans
 from uni_api.observability.telemetry import emit_request_observability
+from uni_api.observability.responses_stream import (
+    ObservedResponseByteIterator,
+    ResponsesStreamDiagnostics,
+    observe_pool_sweeper_connection_close,
+)
 from uni_api.observability.middleware import (
     StatsMiddleware,
     StatsMiddlewareDependencies,
@@ -175,6 +180,7 @@ from uni_api.streaming.chat_completion_collector import (
 )
 from uni_api.streaming.bounded_queue import (
     ByteBoundedQueue,
+    ObservedStreamChunk,
     ReservedChunkBuffer,
     ReservedStreamChunk,
     RetainedByteBudget,
@@ -1141,23 +1147,30 @@ def _socket_inode_for_fd(fd: int) -> Optional[str]:
 
 
 def _httpcore_connection_socket_inode(connection: Any) -> Optional[str]:
-    inner_connection = getattr(connection, "_connection", None) or connection
-    network_stream = getattr(inner_connection, "_network_stream", None)
-    get_extra_info = getattr(network_stream, "get_extra_info", None)
-    if not callable(get_extra_info):
-        return None
-    try:
-        sock = get_extra_info("socket")
-    except BaseException:
-        return None
-    fileno = getattr(sock, "fileno", None)
-    if not callable(fileno):
-        return None
-    try:
-        fd = fileno()
-    except BaseException:
-        return None
-    return _socket_inode_for_fd(fd)
+    current = connection
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        network_stream = getattr(current, "_network_stream", None)
+        get_extra_info = getattr(network_stream, "get_extra_info", None)
+        if callable(get_extra_info):
+            try:
+                sock = get_extra_info("socket")
+            except BaseException:
+                sock = None
+            fileno = getattr(sock, "fileno", None)
+            if callable(fileno):
+                try:
+                    inode = _socket_inode_for_fd(fileno())
+                except BaseException:
+                    inode = None
+                if inode is not None:
+                    return inode
+        next_connection = getattr(current, "_connection", None)
+        if next_connection is None or next_connection is current:
+            break
+        current = next_connection
+    return None
 
 
 async def _await_cleanup_safely(awaitable: Any, *, label: str) -> bool:
@@ -1179,6 +1192,17 @@ async def _force_close_httpcore_stream_chain_safely(upstream_response: Any) -> b
     return await force_close_response_httpcore_stream_chain_safely(
         upstream_response,
         label="Upstream HTTP response stream",
+    )
+
+
+async def _force_close_httpcore_stream_chain_observed_safely(
+    upstream_response: Any,
+    outcome_sink: Callable[[dict[str, Any]], None],
+) -> bool:
+    return await force_close_response_httpcore_stream_chain_safely(
+        upstream_response,
+        label="Upstream HTTP response stream",
+        outcome_sink=outcome_sink,
     )
 
 
@@ -1213,6 +1237,41 @@ async def _close_upstream_response_stream_safely(
     return cleanup_ok
 
 
+async def _close_observed_responses_upstream_stream_safely(
+    stream_cm: Any | None,
+    upstream_response: Any | None,
+    diagnostics: ResponsesStreamDiagnostics,
+    *,
+    owner: str,
+    trigger: str,
+) -> bool:
+    claimed = diagnostics.begin_cleanup(owner=owner, trigger=trigger)
+    cleanup_outcome: dict[str, Any] = {}
+    transport_safe = await _force_close_httpcore_stream_chain_observed_safely(
+        upstream_response,
+        cleanup_outcome.update,
+    ) if upstream_response is not None else True
+    context_exit_succeeded = await _close_stream_cm_safely(stream_cm)
+    cleanup_outcome["won_cleanup_claim"] = claimed
+    diagnostics.record_cleanup_action(
+        actor=owner,
+        trigger=trigger,
+        outcome=cleanup_outcome,
+        transport_safe=transport_safe,
+        context_exit_succeeded=context_exit_succeeded,
+    )
+    diagnostics.observe_cleanup_transport_outcome(
+        cleanup_outcome,
+        actor=owner,
+    )
+    diagnostics.finish_cleanup(
+        transport_safe=transport_safe,
+        context_exit_succeeded=context_exit_succeeded,
+        actor=owner,
+    )
+    return bool(transport_safe and context_exit_succeeded)
+
+
 async def _sweep_httpx_client_idle_connections(client: httpx.AsyncClient) -> int:
     transport = getattr(client, "_transport", None)
     pool = getattr(transport, "_pool", None)
@@ -1226,40 +1285,78 @@ async def _sweep_httpx_client_idle_connections(client: httpx.AsyncClient) -> int
 
     lock = getattr(pool, "_optional_thread_lock", None)
     closing: list[Any] = []
+    sweeper_trackers: list[ResponsesStreamDiagnostics] = []
     close_wait_inodes = _tcp_close_wait_socket_inodes()
 
     def collect_connection(connection: Any) -> None:
         if all(candidate is not connection for candidate in closing):
             closing.append(connection)
 
-    def should_close_connection(connection: Any) -> bool:
+    def close_reason(connection: Any) -> tuple[str | None, Optional[str]]:
         inode = _httpcore_connection_socket_inode(connection)
         if inode is not None and inode in close_wait_inodes:
-            return True
+            return "kernel_close_wait", inode
         is_closed = getattr(connection, "is_closed", None)
         has_expired = getattr(connection, "has_expired", None)
-        return (callable(is_closed) and is_closed()) or (callable(has_expired) and has_expired())
+        if callable(is_closed) and is_closed():
+            return "httpcore_is_closed", inode
+        if callable(has_expired) and has_expired():
+            return "httpcore_has_expired", inode
+        return None, inode
+
+    def record_sweeper_close(connection: Any, trigger: str, inode: Optional[str]) -> None:
+        if inode is None:
+            inode = _httpcore_connection_socket_inode(connection)
+        observed_trackers = observe_pool_sweeper_connection_close(
+            connection,
+            trigger=trigger,
+            socket_inode=inode,
+        )
+        for tracker in observed_trackers:
+            if all(existing is not tracker for existing in sweeper_trackers):
+                sweeper_trackers.append(tracker)
 
     if lock is not None:
         with lock:
             for connection in list(pool_connections):
-                if should_close_connection(connection):
+                trigger, inode = close_reason(connection)
+                if trigger is not None:
+                    record_sweeper_close(connection, trigger, inode)
                     if connection in pool_connections:
                         pool_connections.remove(connection)
                     collect_connection(connection)
             for connection in assign_requests():
+                record_sweeper_close(
+                    connection,
+                    "httpcore_assign_cleanup",
+                    _httpcore_connection_socket_inode(connection),
+                )
                 collect_connection(connection)
     else:
         for connection in list(pool_connections):
-            if should_close_connection(connection):
+            trigger, inode = close_reason(connection)
+            if trigger is not None:
+                record_sweeper_close(connection, trigger, inode)
                 if connection in pool_connections:
                     pool_connections.remove(connection)
                 collect_connection(connection)
         for connection in assign_requests():
+            record_sweeper_close(
+                connection,
+                "httpcore_assign_cleanup",
+                _httpcore_connection_socket_inode(connection),
+            )
             collect_connection(connection)
     if not closing:
         return 0
-    await close_connections(closing)
+    try:
+        await close_connections(closing)
+    except BaseException:
+        for tracker in sweeper_trackers:
+            tracker.observe_pool_sweeper_close_completed(succeeded=False)
+        raise
+    for tracker in sweeper_trackers:
+        tracker.observe_pool_sweeper_close_completed(succeeded=True)
     return len(closing)
 
 
@@ -3823,6 +3920,19 @@ def _optional_positive_timeout(value: Any) -> Optional[float]:
     return timeout
 
 
+def _upstream_logical_authority(value: Any) -> str:
+    try:
+        parsed = urlparse(str(value or ""))
+        host = parsed.hostname or ""
+        port = parsed.port
+    except (TypeError, ValueError):
+        return ""
+    if not host:
+        return ""
+    rendered_host = f"[{host}]" if ":" in host else host
+    return f"{rendered_host}:{port}" if port is not None else rendered_host
+
+
 def _httpx_timeout_from_policy(
     timeout_resolution: dict[str, Any],
     *,
@@ -4340,6 +4450,27 @@ def _encode_responses_sse_event(event_type: str, payload: Any) -> bytes:
 def _raw_responses_sse_event_bytes(raw_event: str) -> bytes:
     return raw_event.encode("utf-8") + b"\n\n"
 
+
+def _observed_responses_stream_chunk(
+    data: bytes,
+    reservation: Any | None,
+    *,
+    event_type: str,
+    semantic_outcome: str,
+) -> ObservedStreamChunk | ReservedStreamChunk:
+    if reservation is not None:
+        return ReservedStreamChunk(
+            data,
+            reservation,
+            event_type=event_type,
+            semantic_outcome=semantic_outcome,
+        )
+    return ObservedStreamChunk(
+        data,
+        event_type=event_type,
+        semantic_outcome=semantic_outcome,
+    )
+
 def _build_responses_stream_keepalive_event() -> bytes:
     return _encode_responses_sse_event(
         "keepalive",
@@ -4375,13 +4506,24 @@ def _build_responses_stream_error_event(status_code: int, error_message: Any) ->
         },
     )
 
-def _stream_error_event_from_response(response: Any) -> bytes:
+
+def _observed_responses_stream_error_event(
+    status_code: int,
+    error_message: Any,
+) -> ObservedStreamChunk:
+    return ObservedStreamChunk(
+        _build_responses_stream_error_event(status_code, error_message),
+        event_type="error",
+        semantic_outcome="error",
+    )
+
+def _stream_error_event_from_response(response: Any) -> ObservedStreamChunk:
     status_code = int(getattr(response, "status_code", 500) or 500)
     body = getattr(response, "body", b"")
     message = bounded_stream_error_text(
         body or f"Upstream request failed with status {status_code}"
     )
-    return _build_responses_stream_error_event(status_code, message)
+    return _observed_responses_stream_error_event(status_code, message)
 
 def _responses_usage_from_payload(payload: Any) -> Optional[dict]:
     if not isinstance(payload, dict):
@@ -4543,6 +4685,7 @@ async def _prime_responses_upstream_stream(
     commit_policy: str = "real_output",
     precommit_keepalive_callback: Optional[Callable[[Optional[bytes]], Awaitable[bool]]] = None,
     retained_byte_budget: RetainedByteBudget | None = None,
+    diagnostics: ResponsesStreamDiagnostics | None = None,
 ) -> tuple[ReservedChunkBuffer, bool]:
     """
     Buffer structural Responses events until we see substantive output or a
@@ -4571,9 +4714,19 @@ async def _prime_responses_upstream_stream(
     chunk = None
     raw_event = None
     raw_events = []
+
+    def observe_pending_diagnostics() -> None:
+        if diagnostics is None:
+            return
+        pending = sse_parser.failure_pending_diagnostics
+        diagnostics.observe_partial_diagnostics(
+            pending if pending is not None else sse_parser.pending_diagnostics()
+        )
+
     try:
         while True:
             if disconnect_event is not None and disconnect_event.is_set():
+                observe_pending_diagnostics()
                 return buffered_chunks, False
 
             reached_eof = False
@@ -4584,9 +4737,19 @@ async def _prime_responses_upstream_stream(
                 )
             except StopAsyncIteration:
                 reached_eof = True
+                observe_pending_diagnostics()
                 try:
                     raw_events = sse_parser.finish()
                 except SSEProtocolError as exc:
+                    if diagnostics is not None:
+                        if sse_parser.failure_pending_diagnostics is not None:
+                            diagnostics.observe_partial_diagnostics(
+                                sse_parser.failure_pending_diagnostics
+                            )
+                        diagnostics.observe_exception(
+                            exc,
+                            origin="precommit_sse_finish",
+                        )
                     raise HTTPException(
                         status_code=502,
                         detail=f"Invalid upstream SSE stream: {exc}",
@@ -4595,12 +4758,26 @@ async def _prime_responses_upstream_stream(
                 try:
                     raw_events = sse_parser.feed(chunk)
                 except SSEProtocolError as exc:
+                    if diagnostics is not None:
+                        if sse_parser.failure_pending_diagnostics is not None:
+                            diagnostics.observe_partial_diagnostics(
+                                sse_parser.failure_pending_diagnostics
+                            )
+                        diagnostics.observe_exception(
+                            exc,
+                            origin="precommit_sse_feed",
+                        )
                     raise HTTPException(
                         status_code=502,
                         detail=f"Invalid upstream SSE stream: {exc}",
                     ) from exc
                 finally:
                     chunk = None
+
+            if diagnostics is not None:
+                for observed_event in raw_events:
+                    if observed_event.strip():
+                        diagnostics.observe_complete_event(observed_event)
 
             for event_index, raw_event in enumerate(raw_events):
                 if not raw_event.strip():
@@ -4630,6 +4807,21 @@ async def _prime_responses_upstream_stream(
                             detail=f"Invalid upstream SSE stream: {exc}",
                         ) from exc
                     semantic_failure = _responses_failure_http_exception(event_payload)
+                    if semantic_failure is not None:
+                        semantic_outcome = "failed"
+                    elif event_type == "response.completed":
+                        semantic_outcome = "completed"
+                    elif event_type == "response.incomplete":
+                        semantic_outcome = "incomplete"
+                    else:
+                        semantic_outcome = "nonterminal"
+                    if diagnostics is not None:
+                        diagnostics.observe_parsed_event(
+                            raw_event,
+                            event_type,
+                            event_payload,
+                            semantic_outcome=semantic_outcome,
+                        )
                     if semantic_failure is not None:
                         raise semantic_failure
 
@@ -4680,6 +4872,7 @@ async def _prime_responses_upstream_stream(
                     detail="Responses upstream closed before substantive output",
                 )
     except BaseException:
+        observe_pending_diagnostics()
         sse_parser.discard()
         chunk = None
         raw_event = None
@@ -5077,6 +5270,27 @@ class ResponsesRequestExecution:
         # or another local failure.  Only the receive monitor is allowed to
         # assert a real peer disconnect on the shared sticky event.
         if not worker_task.done():
+            diagnostics = self.current_info.get(
+                "_responses_stream_diagnostics_tracker"
+            )
+            if isinstance(diagnostics, ResponsesStreamDiagnostics):
+                if (
+                    self.disconnect_event is not None
+                    and self.disconnect_event.is_set()
+                ):
+                    diagnostics.mark_downstream_disconnect(
+                        stage="downstream-body-iterator-close"
+                    )
+                    close_trigger = "downstream_disconnect"
+                else:
+                    diagnostics.mark_local_end(
+                        origin="downstream_body_iterator_closed_or_shutdown"
+                    )
+                    close_trigger = "downstream_body_iterator_closed_or_shutdown"
+                diagnostics.mark_cleanup_intent(
+                    owner="responses_queue_body",
+                    trigger=close_trigger,
+                )
             worker_task.cancel()
         await self.stream_output_queue.close(discard=True)
         with suppress(asyncio.CancelledError):
@@ -5110,15 +5324,25 @@ class ResponsesRequestExecution:
         self.current_info["error_type"] = type(exc).__name__
         self.current_info["stream_outcome"] = "stream_worker_error"
         self.current_info["success"] = False
-        await self._emit_stream_chunk(_build_responses_stream_error_event(500, error_message))
+        await self._emit_stream_chunk(
+            _observed_responses_stream_error_event(500, error_message)
+        )
         await self._emit_stream_chunk(b"data: [DONE]\n\n")
 
     async def _emit_stream_chunk(self, chunk: Any) -> None:
         if self.stream_output_queue is None:
             return
         reservation = None
+        event_type = None
+        semantic_outcome = None
         if isinstance(chunk, ReservedStreamChunk):
             reservation = chunk.reservation
+            event_type = chunk.event_type
+            semantic_outcome = chunk.semantic_outcome
+            chunk = chunk.data
+        elif isinstance(chunk, ObservedStreamChunk):
+            event_type = chunk.event_type
+            semantic_outcome = chunk.semantic_outcome
             chunk = chunk.data
         if isinstance(chunk, str):
             chunk = chunk.encode("utf-8")
@@ -5133,6 +5357,16 @@ class ResponsesRequestExecution:
         try:
             for offset in range(0, len(chunk_bytes), segment_bytes):
                 segment = chunk_bytes[offset : offset + segment_bytes]
+                queue_item: Any = segment
+                if event_type is not None or semantic_outcome is not None:
+                    queue_item = ObservedStreamChunk(
+                        segment,
+                        event_type=event_type,
+                        semantic_outcome=semantic_outcome,
+                        final_event_segment=(
+                            offset + len(segment) >= len(chunk_bytes)
+                        ),
+                    )
                 transferred = (
                     reservation.split(len(segment))
                     if reservation is not None
@@ -5140,7 +5374,8 @@ class ResponsesRequestExecution:
                 )
                 try:
                     await self.stream_output_queue.put(
-                        segment,
+                        queue_item,
+                        size=len(segment),
                         retained_byte_lease=transferred,
                     )
                 except BaseException:
@@ -5176,6 +5411,15 @@ class ResponsesRequestExecution:
 
     async def _abort_stream_for_backpressure(self, exc: Exception) -> None:
         assert self.stream_output_queue is not None
+        diagnostics = self.current_info.get(
+            "_responses_stream_diagnostics_tracker"
+        )
+        if isinstance(diagnostics, ResponsesStreamDiagnostics):
+            diagnostics.mark_local_end(origin="local_backpressure_abort")
+            diagnostics.mark_cleanup_intent(
+                owner="responses_stream_queue",
+                trigger="local_backpressure_abort",
+            )
         _record_local_admission_rejection(self.current_info, exc)
         self.current_info["stream_error_status_code"] = 503
         self.current_info["error_type"] = type(exc).__name__
@@ -5513,6 +5757,15 @@ class ResponsesRequestExecution:
     async def _execute_stream_attempt(self, client: Any, attempt: Any, headers: dict[str, str], json_payload: str):
         _mark_current_info_stage(self.current_info, "upstream_send_start")
         runtime_gauges.begin_waiting_first_byte(self.current_info)
+        diagnostics = ResponsesStreamDiagnostics(
+            current_info=self.current_info,
+            attempt_index=attempt.state.get("observability_attempt_index"),
+            logical_authority=_upstream_logical_authority(
+                attempt.state.get("upstream_url")
+            ),
+            proxy_configured=bool(attempt.state.get("proxy")),
+        )
+        attempt.state["responses_stream_diagnostics_tracker"] = diagnostics
         first_byte_timeout = _optional_positive_timeout(attempt.state.get("first_byte_timeout"))
         first_byte_deadline = (
             asyncio.get_running_loop().time() + first_byte_timeout
@@ -5530,13 +5783,22 @@ class ResponsesRequestExecution:
             "url": attempt.state["upstream_url"],
             "headers": headers,
             "content": json_payload,
+            "extensions": {"trace": diagnostics.httpcore_trace},
         }
         if attempt.state.get("upstream_timeout") is not None:
             stream_kwargs["timeout"] = attempt.state["upstream_timeout"]
         stream_cm = client.stream(**stream_kwargs)
 
         async def cleanup_cancelled_stream_enter(response: Any) -> None:
-            await _close_upstream_response_stream_safely(stream_cm, response)
+            diagnostics.capture_response(response)
+            diagnostics.mark_local_end(origin="cancelled_upstream_header_wait")
+            await _close_observed_responses_upstream_stream_safely(
+                stream_cm,
+                response,
+                diagnostics,
+                owner="responses_stream_enter_cleanup",
+                trigger="cancelled_upstream_header_wait",
+            )
 
         try:
             upstream_resp = await _await_first_byte_deadline(
@@ -5550,6 +5812,8 @@ class ResponsesRequestExecution:
             )
         except DownstreamDisconnectedDuringWait:
             runtime_gauges.end_waiting_first_byte(self.current_info)
+            diagnostics.mark_downstream_disconnect(stage="upstream-response-headers")
+            diagnostics.mark_local_end(origin="downstream_disconnect")
             _log_responses_downstream_disconnect(
                 self.endpoint,
                 self.current_info,
@@ -5558,16 +5822,33 @@ class ResponsesRequestExecution:
                 stage="upstream-response-headers",
             )
             return Response(content="", status_code=499)
+        except BaseException as exc:
+            runtime_gauges.end_waiting_first_byte(self.current_info)
+            diagnostics.observe_exception(exc, origin="upstream_response_headers")
+            diagnostics.mark_local_end(origin="upstream_response_headers_error")
+            raise
         _mark_current_info_stage(self.current_info, "upstream_headers_received")
+        diagnostics.capture_response(upstream_resp)
         if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
             runtime_gauges.end_waiting_first_byte(self.current_info)
             raw = await read_limited_response_body(upstream_resp)
-            await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
+            diagnostics.mark_local_end(origin="upstream_non_success_status")
+            await _close_observed_responses_upstream_stream_safely(
+                stream_cm,
+                upstream_resp,
+                diagnostics,
+                owner="responses_precommit_cleanup",
+                trigger="upstream_non_success_status",
+            )
             raise HTTPException(status_code=upstream_resp.status_code, detail=raw.text())
 
+        diagnostics.set_phase("precommit")
         if self.stream_output_queue is not None:
             self.stream_response_headers = _copy_upstream_response_headers(upstream_resp.headers)
-        upstream_iter = upstream_resp.aiter_bytes()
+        upstream_iter = ObservedResponseByteIterator(
+            upstream_resp.aiter_bytes(),
+            diagnostics,
+        )
         try:
             precommit_keepalive_callback = None
             if self.stream_output_queue is not None:
@@ -5586,6 +5867,7 @@ class ResponsesRequestExecution:
                     commit_policy=attempt.state.get("responses_stream_commit_policy", "real_output"),
                     precommit_keepalive_callback=precommit_keepalive_callback,
                     retained_byte_budget=responses_stream_byte_budget,
+                    diagnostics=diagnostics,
                 ),
                 timeout_seconds=first_byte_timeout,
                 deadline=first_byte_deadline,
@@ -5596,9 +5878,18 @@ class ResponsesRequestExecution:
                 disconnect_event=self.disconnect_event,
             )
             _mark_first_byte_observed(self.current_info)
+            diagnostics.set_phase("postcommit")
         except DownstreamDisconnectedDuringWait:
             runtime_gauges.end_waiting_first_byte(self.current_info)
-            await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
+            diagnostics.mark_downstream_disconnect(stage="before-stream-commit")
+            diagnostics.mark_local_end(origin="downstream_disconnect")
+            await _close_observed_responses_upstream_stream_safely(
+                stream_cm,
+                upstream_resp,
+                diagnostics,
+                owner="responses_precommit_cleanup",
+                trigger="downstream_disconnect",
+            )
             _log_responses_downstream_disconnect(
                 self.endpoint,
                 self.current_info,
@@ -5607,22 +5898,75 @@ class ResponsesRequestExecution:
                 stage="before-stream-commit",
             )
             return Response(content="", status_code=499)
-        except HTTPException:
+        except HTTPException as exc:
             runtime_gauges.end_waiting_first_byte(self.current_info)
-            await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
+            semantic_failure_terminal = (
+                diagnostics.facts.get("semantic_terminal_outcome") == "failed"
+            )
+            if semantic_failure_terminal:
+                # This HTTPException is the deliberate status mapping of a
+                # parsed provider failure terminal, not a second transport or
+                # protocol exception.  Preserve the terminal diagnosis and its
+                # independent consistency facts.
+                diagnostics.mark_local_end(
+                    origin="precommit_semantic_failure_terminal"
+                )
+            else:
+                diagnostics.observe_exception(
+                    exc.__cause__
+                    if isinstance(exc.__cause__, BaseException)
+                    else exc,
+                    origin="precommit_http_error",
+                )
+                diagnostics.mark_local_end(origin="precommit_http_error")
+            await _close_observed_responses_upstream_stream_safely(
+                stream_cm,
+                upstream_resp,
+                diagnostics,
+                owner="responses_precommit_cleanup",
+                trigger=(
+                    "precommit_semantic_failure_terminal"
+                    if semantic_failure_terminal
+                    else "precommit_http_error"
+                ),
+            )
             raise
-        except RESPONSES_STREAM_NETWORK_ERRORS:
+        except RESPONSES_STREAM_NETWORK_ERRORS as exc:
             runtime_gauges.end_waiting_first_byte(self.current_info)
-            await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
+            diagnostics.observe_exception(exc, origin="precommit_network_or_deadline")
+            diagnostics.mark_local_end(origin="precommit_network_error")
+            await _close_observed_responses_upstream_stream_safely(
+                stream_cm,
+                upstream_resp,
+                diagnostics,
+                owner="responses_precommit_cleanup",
+                trigger="after_upstream_read_failure",
+            )
             raise
-        except BaseException:
+        except BaseException as exc:
             runtime_gauges.end_waiting_first_byte(self.current_info)
-            await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
+            diagnostics.observe_exception(exc, origin="precommit_local_error")
+            diagnostics.mark_local_end(origin="precommit_local_error")
+            await _close_observed_responses_upstream_stream_safely(
+                stream_cm,
+                upstream_resp,
+                diagnostics,
+                owner="responses_precommit_cleanup",
+                trigger="precommit_local_error",
+            )
             raise
 
         if self.disconnect_event is not None and self.disconnect_event.is_set():
             await buffered_chunks.clear()
-            await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
+            diagnostics.mark_downstream_disconnect(stage="before-stream-commit")
+            diagnostics.mark_local_end(origin="downstream_disconnect")
+            await _close_observed_responses_upstream_stream_safely(
+                stream_cm,
+                upstream_resp,
+                diagnostics,
+                owner="responses_precommit_cleanup",
+                trigger="downstream_disconnect",
+            )
             _log_responses_downstream_disconnect(
                 self.endpoint,
                 self.current_info,
@@ -5642,6 +5986,7 @@ class ResponsesRequestExecution:
                 stream_cm,
                 upstream_resp,
                 stream_committed,
+                diagnostics,
                 total_deadline=total_deadline,
                 total_timeout_seconds=total_timeout,
             ),
@@ -5657,14 +6002,17 @@ class ResponsesRequestExecution:
         stream_cm: Any,
         upstream_resp: Any,
         stream_committed: bool,
+        diagnostics: ResponsesStreamDiagnostics,
         *,
         total_deadline: Optional[float] = None,
         total_timeout_seconds: Any = None,
     ):
+        diagnostics.set_phase("postcommit")
         completed_seen = False
         incomplete_seen = False
         usage_seen = False
         output_seen = False
+        terminal_queue_handoff_completed = False
         proxy_sse_parser = IncrementalSSEParser()
 
         async def source_events():
@@ -5727,6 +6075,9 @@ class ResponsesRequestExecution:
                     raise DownstreamDisconnectedDuringWait()
                 raw_events = proxy_sse_parser.feed(bytes(chunk))
                 chunk = None
+                for observed_event in raw_events:
+                    if observed_event.strip():
+                        diagnostics.observe_complete_event(observed_event)
                 try:
                     for event_index in range(len(raw_events)):
                         raw_event = raw_events[event_index]
@@ -5739,7 +6090,13 @@ class ResponsesRequestExecution:
                     raw_events.clear()
                     raw_events = None
 
+            diagnostics.observe_partial_diagnostics(
+                proxy_sse_parser.pending_diagnostics()
+            )
             raw_events = proxy_sse_parser.finish()
+            for observed_event in raw_events:
+                if observed_event.strip():
+                    diagnostics.observe_complete_event(observed_event)
             try:
                 for event_index in range(len(raw_events)):
                     raw_event = raw_events[event_index]
@@ -5797,6 +6154,20 @@ class ResponsesRequestExecution:
                             event_payload
                         )
                         if semantic_failure is not None:
+                            semantic_outcome = "failed"
+                        elif event_type == "response.completed":
+                            semantic_outcome = "completed"
+                        elif event_type == "response.incomplete":
+                            semantic_outcome = "incomplete"
+                        else:
+                            semantic_outcome = "nonterminal"
+                        diagnostics.observe_parsed_event(
+                            raw_event,
+                            event_type,
+                            event_payload,
+                            semantic_outcome=semantic_outcome,
+                        )
+                        if semantic_failure is not None:
                             failure = SSEProtocolError(
                                 "Responses upstream emitted a failure terminal: "
                                 f"{str(semantic_failure.detail)[:1000]}"
@@ -5811,12 +6182,20 @@ class ResponsesRequestExecution:
                             self.current_info["success"] = False
                             self._finalize_stream_attempt_failure(attempt, failure)
                             # Preserve the provider's structured terminal.
-                            if reservation is None:
-                                yield event_bytes
-                            else:
+                            if reservation is not None:
                                 transferred = reservation
                                 reservation = None
-                                yield ReservedStreamChunk(event_bytes, transferred)
+                            yield _observed_responses_stream_chunk(
+                                event_bytes,
+                                transferred,
+                                event_type=event_type,
+                                semantic_outcome="failed",
+                            )
+                            terminal_queue_handoff_completed = True
+                            diagnostics.mark_terminal_queue_handoff_completed()
+                            diagnostics.mark_local_end(
+                                origin="upstream_failure_terminal"
+                            )
                             return
 
                         terminal_success = event_type in {
@@ -5827,12 +6206,20 @@ class ResponsesRequestExecution:
                             completed_seen = True
                         elif event_type == "response.incomplete":
                             incomplete_seen = True
-                        if terminal_success and _responses_usage_from_payload(
-                            event_payload
-                        ) is not None:
-                            usage_seen = True
+                        if terminal_success:
+                            usage_seen = bool(diagnostics.facts.get("usage_seen"))
 
-                        if reservation is None:
+                        if terminal_success:
+                            if reservation is not None:
+                                transferred = reservation
+                                reservation = None
+                            yield _observed_responses_stream_chunk(
+                                event_bytes,
+                                transferred,
+                                event_type=event_type,
+                                semantic_outcome=semantic_outcome,
+                            )
+                        elif reservation is None:
                             yield event_bytes
                         else:
                             transferred = reservation
@@ -5843,6 +6230,11 @@ class ResponsesRequestExecution:
                             # The semantic terminal ends the response.  Do not
                             # wait for EOF/[DONE] on a keep-alive connection.
                             self._finalize_stream_attempt_success(attempt)
+                            terminal_queue_handoff_completed = True
+                            diagnostics.mark_terminal_queue_handoff_completed()
+                            diagnostics.mark_local_end(
+                                origin=f"semantic_{event_type}"
+                            )
                             return
                     finally:
                         terminal_success = False
@@ -5862,12 +6254,31 @@ class ResponsesRequestExecution:
                 "Responses upstream ended without a terminal response event"
             )
         except DownstreamDisconnectedDuringWait:
+            diagnostics.mark_downstream_disconnect(stage="after-stream-commit")
+            diagnostics.mark_local_end(origin="downstream_disconnect")
             self._finalize_stream_attempt_cancelled(
                 attempt,
                 downstream_disconnected=True,
             )
             return
-        except RESPONSES_STREAM_NETWORK_ERRORS + (SSEProtocolError,) as exc:
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Starlette BaseHTTPMiddleware transports inner response body
+            # messages over an anyio stream and may re-raise an inner iterator
+            # exception only after the outer response has observed a clean EOF.
+            # Convert every ordinary post-commit generator failure here, before
+            # that boundary, so it cannot become a false completed HTTP 200.
+            if proxy_sse_parser.failure_pending_diagnostics is not None:
+                diagnostics.observe_partial_diagnostics(
+                    proxy_sse_parser.failure_pending_diagnostics
+                )
+            else:
+                diagnostics.observe_partial_diagnostics(
+                    proxy_sse_parser.pending_diagnostics()
+                )
+            diagnostics.observe_exception(exc, origin="postcommit_stream")
+            diagnostics.mark_local_end(origin="postcommit_stream_error")
             self._finalize_stream_attempt_failure(attempt, exc)
             await self._handle_proxy_stream_abort(attempt, exc, stream_committed)
             if stream_committed:
@@ -5875,12 +6286,20 @@ class ResponsesRequestExecution:
                 self.current_info["error_type"] = type(exc).__name__
                 self.current_info["stream_outcome"] = "upstream_stream_abort"
                 self.current_info["success"] = False
-                yield _build_responses_stream_error_event(502, exc)
+                yield _observed_responses_stream_error_event(502, exc)
                 yield b"data: [DONE]\n\n"
         finally:
             try:
                 await source.aclose()
             finally:
+                pending_diagnostics = (
+                    proxy_sse_parser.failure_pending_diagnostics
+                )
+                diagnostics.observe_partial_diagnostics(
+                    pending_diagnostics
+                    if pending_diagnostics is not None
+                    else proxy_sse_parser.pending_diagnostics()
+                )
                 proxy_sse_parser.discard()
                 try:
                     await buffered_chunks.clear()
@@ -5915,9 +6334,23 @@ class ResponsesRequestExecution:
                                 attempt.state["upstream_url"],
                             )
                     finally:
-                        await _close_upstream_response_stream_safely(
+                        if terminal_queue_handoff_completed:
+                            cleanup_trigger = "semantic_terminal"
+                        elif diagnostics.facts.get("downstream_disconnected"):
+                            cleanup_trigger = "downstream_disconnect"
+                        elif diagnostics.facts.get("exception_type"):
+                            cleanup_trigger = "after_upstream_read_or_stream_failure"
+                        else:
+                            cleanup_trigger = "consumer_or_shutdown_unknown"
+                            diagnostics.mark_local_end(
+                                origin="consumer_or_shutdown_unknown"
+                            )
+                        await _close_observed_responses_upstream_stream_safely(
                             stream_cm,
                             upstream_resp,
+                            diagnostics,
+                            owner="responses_proxy_finally",
+                            trigger=cleanup_trigger,
                         )
 
     def _finalize_stream_attempt_success(self, attempt: Any) -> None:
@@ -5979,6 +6412,9 @@ class ResponsesRequestExecution:
     def _downstream_disconnected(self, attempt: Any, *, stage: str) -> bool:
         if self.disconnect_event is None or not self.disconnect_event.is_set():
             return False
+        diagnostics = attempt.state.get("responses_stream_diagnostics_tracker")
+        if isinstance(diagnostics, ResponsesStreamDiagnostics):
+            diagnostics.mark_downstream_disconnect(stage=stage)
         _log_responses_downstream_disconnect(
             self.endpoint,
             self.current_info,
@@ -5992,8 +6428,14 @@ class ResponsesRequestExecution:
         stream_stage = "post-commit" if stream_committed else "preflight"
         error_text = bounded_stream_error_text(exc)
         request_model, actual_model = _log_model_names(self.request_model_name, attempt.original_model)
+        diagnostics = attempt.state.get("responses_stream_diagnostics_tracker")
+        diagnostics_json = (
+            diagnostics.snapshot_json()
+            if isinstance(diagnostics, ResponsesStreamDiagnostics)
+            else "{}"
+        )
         trace_logger.warning(
-            "%s upstream stream aborted stage=%s error_type=%s request_id=%s request_model=%s actual_model=%s provider=%s key=%s upstream_url=%s: %s",
+            "%s upstream stream aborted stage=%s error_type=%s request_id=%s request_model=%s actual_model=%s provider=%s key=%s upstream_url=%s stream_diagnostics=%s: %s",
             self.endpoint,
             stream_stage,
             type(exc).__name__,
@@ -6003,6 +6445,7 @@ class ResponsesRequestExecution:
             attempt.provider_name,
             _mask_secret_for_log(attempt.provider_api_key_raw),
             attempt.state["upstream_url"],
+            diagnostics_json,
             error_text,
         )
 

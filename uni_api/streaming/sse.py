@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import hashlib
 import os
 import threading
 from collections.abc import AsyncIterable, AsyncIterator
@@ -455,6 +456,7 @@ class IncrementalSSEParser:
         self._finished = False
         self._failed = False
         self._at_stream_start = True
+        self._failure_pending_diagnostics: dict[str, Any] | None = None
 
     def __del__(self) -> None:
         try:
@@ -496,6 +498,35 @@ class IncrementalSSEParser:
             pending = pending[:-1] + b"\r"
         return pending + bytes(undecoded_bytes)
 
+    def pending_diagnostics(self) -> dict[str, Any]:
+        """Return only size/hash for the normalized incomplete event.
+
+        Decoded CR/CRLF line endings are represented as LF. Any trailing
+        incomplete UTF-8 bytes are appended unchanged and explicitly covered
+        by the ``normalized_prefix_plus_utf8_tail_v1`` scope.
+        """
+
+        undecoded_bytes, _ = self._decoder.getstate()
+        pending_bytes = len(self._event) + len(undecoded_bytes)
+        result: dict[str, Any] = {
+            "bytes": pending_bytes,
+            "scope": "normalized_prefix_plus_utf8_tail_v1",
+        }
+        if pending_bytes:
+            digest = hashlib.sha256()
+            # hashlib accepts the existing bytearray/buffer directly.  Avoid a
+            # full bytes copy and concatenation at the failure/EOF snapshot.
+            digest.update(self._event)
+            digest.update(undecoded_bytes)
+            result["sha256"] = digest.hexdigest()
+        return result
+
+    @property
+    def failure_pending_diagnostics(self) -> dict[str, Any] | None:
+        if self._failure_pending_diagnostics is None:
+            return None
+        return dict(self._failure_pending_diagnostics)
+
     def feed(self, chunk: str | bytes | bytearray) -> list[str]:
         if self._finished:
             raise SSEProtocolError("cannot feed an SSE parser after finish()")
@@ -521,6 +552,7 @@ class IncrementalSSEParser:
             return events
         except BaseException:
             self._failed = True
+            self._capture_failure_pending_diagnostics()
             self._clear_pending_event()
             raise
 
@@ -573,12 +605,14 @@ class IncrementalSSEParser:
             return events
         except UnicodeDecodeError as exc:
             self._failed = True
+            self._capture_failure_pending_diagnostics()
             self._clear_pending_event()
             raise SSEProtocolError(
                 "SSE stream ended with an incomplete UTF-8 sequence"
             ) from exc
         except BaseException:
             self._failed = True
+            self._capture_failure_pending_diagnostics()
             self._clear_pending_event()
             raise
 
@@ -756,6 +790,18 @@ class IncrementalSSEParser:
     def _clear_pending_event(self) -> None:
         self._event = bytearray()
         self._release_pending_budget()
+
+    def _capture_failure_pending_diagnostics(self) -> None:
+        if self._failure_pending_diagnostics is not None:
+            return
+        try:
+            self._failure_pending_diagnostics = self.pending_diagnostics()
+        except BaseException:
+            self._failure_pending_diagnostics = {
+                "bytes": self._pending_size_bytes(),
+                "scope": "normalized_prefix_plus_utf8_tail_v1",
+                "sha256_unavailable": True,
+            }
 
 
 class IncrementalLineParser:

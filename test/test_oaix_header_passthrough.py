@@ -44,6 +44,7 @@ async def _fetch_response_captures_oaix_headers():
             "X-OAIX-Request-ID": "req_123",
             "X-OAIX-Token-ID": "456",
             "X-OAIX-Token-Owner-User-ID": "789",
+            "X-OAIX-Connection-ID": "oaixc-nonstream",
         },
         json={"id": "chatcmpl-test", "choices": []},
     )
@@ -66,6 +67,7 @@ async def _fetch_response_captures_oaix_headers():
     assert header_value(captured, "X-OAIX-Request-ID") == "req_123"
     assert header_value(captured, "X-OAIX-Token-ID") == "456"
     assert header_value(captured, "X-OAIX-Token-Owner-User-ID") == "789"
+    assert header_value(captured, "X-OAIX-Connection-ID") == "oaixc-nonstream"
 
 
 def test_fetch_response_captures_oaix_headers():
@@ -79,6 +81,7 @@ async def _fetch_response_stream_captures_oaix_headers():
             "X-OAIX-Request-ID": "req_stream",
             "X-OAIX-Token-ID": "654",
             "X-OAIX-Token-Owner-User-ID": "987",
+            "X-OAIX-Connection-ID": "oaixc-stream",
         },
         content=b"data: [DONE]\n\n",
     )
@@ -101,6 +104,7 @@ async def _fetch_response_stream_captures_oaix_headers():
     assert header_value(captured, "X-OAIX-Request-ID") == "req_stream"
     assert header_value(captured, "X-OAIX-Token-ID") == "654"
     assert header_value(captured, "X-OAIX-Token-Owner-User-ID") == "987"
+    assert header_value(captured, "X-OAIX-Connection-ID") == "oaixc-stream"
 
 
 def test_fetch_response_stream_captures_oaix_headers():

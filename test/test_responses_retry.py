@@ -1,5 +1,7 @@
 import asyncio
+import errno
 import gzip
+import hashlib
 import json
 import os
 import sys
@@ -7,6 +9,7 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import httpx
+import httpcore
 import pytest
 from fastapi import BackgroundTasks
 
@@ -81,7 +84,15 @@ class DummyClient:
             return self.response[url]
         return self.response
 
-    def stream(self, method, url, headers=None, content=None, timeout=None):
+    def stream(
+        self,
+        method,
+        url,
+        headers=None,
+        content=None,
+        timeout=None,
+        extensions=None,
+    ):
         self.stream_calls.append(
             {
                 "method": method,
@@ -89,6 +100,7 @@ class DummyClient:
                 "headers": headers,
                 "content": content,
                 "timeout": timeout,
+                "extensions": extensions,
             }
         )
         return DummyStreamContext(self._pick_response(url), [])
@@ -144,9 +156,10 @@ class SequencedDummyClientManager:
 
 
 class DummyStreamingUpstreamResponse:
-    def __init__(self, *, chunks=None, stream_error=None, status_code=200, json_data=None, raw_body=None, headers=None):
+    def __init__(self, *, chunks=None, stream_error=None, status_code=200, json_data=None, raw_body=None, headers=None, extensions=None):
         self.status_code = status_code
         self.headers = headers or {}
+        self.extensions = extensions or {}
         self._chunks = list(chunks or [])
         self._stream_error = stream_error
         self._json_data = json_data if json_data is not None else {"ok": True}
@@ -230,10 +243,38 @@ class EncodedStreamingUpstreamResponse(DummyStreamingUpstreamResponse):
             yield chunk
 
 
+class FakeNetworkStream:
+    def get_extra_info(self, name):
+        return {
+            "client_addr": ("10.0.0.8", 42000),
+            "server_addr": ("192.0.2.10", 443),
+            "socket": None,
+        }.get(name)
+
+
 def _responses_sse(event_name, payload):
     if payload == "[DONE]":
         return b"data: [DONE]\n\n"
     return f"event: {event_name}\ndata: {json.dumps(payload)}\n\n".encode("utf-8")
+
+
+def _chained_responses_read_error():
+    try:
+        raise ConnectionResetError(errno.ECONNRESET, "Connection reset by peer")
+    except ConnectionResetError as os_exc:
+        try:
+            raise httpcore.ReadError("read failed") from os_exc
+        except httpcore.ReadError as core_exc:
+            try:
+                raise httpx.ReadError(
+                    "read failed",
+                    request=httpx.Request(
+                        "POST",
+                        "https://example.com/v1/responses",
+                    ),
+                ) from core_exc
+            except httpx.ReadError as exc:
+                return exc
 
 
 def _configure_responses_test(monkeypatch, *, engine, provider_preferences=None):
@@ -1352,6 +1393,20 @@ def test_responses_stream_records_channel_success_only_after_protocol_terminal(
         channel_results.append(success)
 
     monkeypatch.setattr(main, "_schedule_channel_stats_bounded", record)
+    completed_event = _responses_sse(
+        "response.completed",
+        {
+            "type": "response.completed",
+            "sequence_number": 7,
+            "response": {
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2,
+                }
+            },
+        },
+    )
     main.app.state.client_manager = DummyClientManager(
         DummyStreamingUpstreamResponse(
             chunks=[
@@ -1360,21 +1415,17 @@ def test_responses_stream_records_channel_success_only_after_protocol_terminal(
                     "response.output_text.delta",
                     {"type": "response.output_text.delta", "delta": "ok"},
                 ),
-                _responses_sse(
-                    "response.completed",
-                    {
-                        "type": "response.completed",
-                        "response": {
-                            "usage": {
-                                "input_tokens": 1,
-                                "output_tokens": 1,
-                                "total_tokens": 2,
-                            }
-                        },
-                    },
-                ),
-                _responses_sse(None, "[DONE]"),
-            ]
+                # OAIX may flush the terminal and [DONE] in one HTTP body
+                # chunk. The terminal hash must remain independently queryable
+                # even though [DONE] becomes the last fully framed event.
+                completed_event + _responses_sse(None, "[DONE]"),
+            ],
+            headers={"X-OAIX-Connection-ID": "oaixc-terminal-success"},
+            extensions={
+                "http_version": b"HTTP/2",
+                "stream_id": 13,
+                "network_stream": FakeNetworkStream(),
+            },
         )
     )
     current_info = {
@@ -1392,6 +1443,29 @@ def test_responses_stream_records_channel_success_only_after_protocol_terminal(
     assert channel_results == [True]
     assert current_info["success"] is True
     assert current_info["upstream_attempts"][-1]["success"] is True
+    diagnostics = current_info["responses_stream_diagnostics"]
+    assert diagnostics["oaix_connection_id"] == "oaixc-terminal-success"
+    assert diagnostics["http_version"] == "HTTP/2"
+    assert diagnostics["httpcore_stream_id"] == 13
+    assert diagnostics["terminal_frame_seen"] is True
+    assert diagnostics["upstream_terminal_seen"] is True
+    assert diagnostics["upstream_terminal_validated"] is True
+    assert diagnostics["usage_seen"] is True
+    assert diagnostics["diagnosis"] == "responses_completed_with_usage"
+    assert diagnostics["last_event_type"] == "[DONE]"
+    assert diagnostics["complete_event_count"] == 4
+    assert diagnostics["semantic_terminal_type"] == "response.completed"
+    assert diagnostics["semantic_terminal_outcome"] == "completed"
+    assert diagnostics["semantic_terminal_sequence_number"] == 7
+    assert diagnostics["semantic_terminal_sha256"] == hashlib.sha256(
+        completed_event
+    ).hexdigest()
+    assert diagnostics["downstream_terminal_seen"] is False
+    assert diagnostics["cleanup_owner"] == "responses_proxy_finally"
+    assert diagnostics["cleanup_result"] == "succeeded"
+    assert callable(
+        main.app.state.client_manager.stream_calls[0]["extensions"]["trace"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -1421,13 +1495,26 @@ def test_responses_semantic_terminal_closes_without_waiting_for_eof(
         )
     )
 
+    current_info = {
+        "request_id": f"terminal-without-usage-{terminal_type}",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
     response, body = _run_responses_request_with_stream_body(
-        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True)
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info=current_info,
     )
 
     assert response.status_code == 200
     assert terminal_type in body
     assert "proxy read upstream after semantic terminal" not in body
+    diagnostics = current_info["responses_stream_diagnostics"]
+    assert diagnostics["usage_seen"] is False
+    assert diagnostics["diagnosis"] == (
+        "responses_completed_without_usage"
+        if terminal_type == "response.completed"
+        else "responses_incomplete_terminal"
+    )
 
 
 @pytest.mark.parametrize("coalesced", [False, True])
@@ -1492,11 +1579,108 @@ def test_responses_malformed_terminal_payload_is_protocol_failure(monkeypatch):
         )
     )
 
+    current_info = {
+        "request_id": "malformed-terminal",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
     response, _body = _run_responses_request_with_stream_body(
-        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True)
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info=current_info,
     )
 
     assert response.status_code == 502
+    diagnostics = current_info["responses_stream_diagnostics"]
+    assert diagnostics["terminal_frame_seen"] is True
+    assert diagnostics["upstream_terminal_seen"] is False
+    assert diagnostics["upstream_terminal_validated"] is False
+    assert diagnostics["semantic_status"] == "error"
+    assert diagnostics["diagnosis"] == "responses_sse_protocol_error"
+
+
+def test_responses_completed_label_with_failed_payload_is_diagnosed_as_failure(
+    monkeypatch,
+):
+    _configure_responses_test(monkeypatch, engine="codex")
+    main.app.state.client_manager = DummyClientManager(
+        DummyStreamingUpstreamResponse(
+            chunks=[
+                _responses_sse(
+                    "response.completed",
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "status": "failed",
+                            "error": {
+                                "status_code": 503,
+                                "message": "provider failed",
+                            },
+                        },
+                    },
+                )
+            ]
+        )
+    )
+    current_info = {
+        "request_id": "completed-label-failed-payload",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+
+    response, _body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info=current_info,
+    )
+
+    assert response.status_code == 503
+    diagnostics = current_info["responses_stream_diagnostics"]
+    assert diagnostics["declared_terminal_type"] == "response.completed"
+    assert diagnostics["semantic_terminal_type"] == "response.completed"
+    assert diagnostics["semantic_terminal_outcome"] == "failed"
+    assert diagnostics["diagnosis"] == "responses_terminal_semantics_inconsistent"
+    assert diagnostics["semantic_status"] == "failed"
+    assert diagnostics["terminal_consistency_status"] == "inconsistent"
+    assert diagnostics["terminal_semantics_inconsistency"] == [
+        "declared_outcome_mismatch"
+    ]
+    assert "exception_type" not in diagnostics
+    assert diagnostics["semantic_status"] == "failed"
+
+
+def test_responses_failed_label_without_failure_semantics_is_not_a_terminal(
+    monkeypatch,
+):
+    _configure_responses_test(monkeypatch, engine="codex")
+    main.app.state.client_manager = DummyClientManager(
+        DummyStreamingUpstreamResponse(
+            chunks=[
+                _responses_sse(
+                    "response.failed",
+                    {
+                        "type": "response.created",
+                        "response": {"status": "in_progress"},
+                    },
+                )
+            ]
+        )
+    )
+    current_info = {
+        "request_id": "failed-label-nonfailure-payload",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+
+    response, _body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info=current_info,
+    )
+
+    assert response.status_code == 502
+    diagnostics = current_info["responses_stream_diagnostics"]
+    assert diagnostics["declared_terminal_type"] == "response.failed"
+    assert diagnostics["terminal_frame_semantic_outcome"] == "nonterminal"
+    assert diagnostics["upstream_terminal_seen"] is False
+    assert diagnostics["semantic_status"] == "error"
 
 
 @pytest.mark.parametrize(
@@ -1507,6 +1691,7 @@ def test_responses_malformed_terminal_payload_is_protocol_failure(monkeypatch):
             "upstream aborted",
             request=httpx.Request("POST", "https://example.com/v1/responses"),
         ),
+        RuntimeError("unexpected upstream iterator failure"),
     ],
 )
 def test_responses_postcommit_abort_records_only_channel_failure(
@@ -1549,6 +1734,74 @@ def test_responses_postcommit_abort_records_only_channel_failure(
     assert current_info["success"] is False
     assert current_info["stream_outcome"] == "upstream_stream_abort"
     assert current_info["upstream_attempts"][-1]["success"] is False
+    diagnostics = current_info["responses_stream_diagnostics"]
+    assert diagnostics["diagnosis"] != "responses_stream_in_progress"
+    assert diagnostics["exception_type"] in {
+        "ReadError",
+        "RuntimeError",
+        "SSEProtocolError",
+    }
+
+
+def test_responses_postcommit_partial_terminal_read_error_is_fully_diagnostic(
+    monkeypatch,
+):
+    _configure_responses_test(monkeypatch, engine="codex")
+    partial_terminal = (
+        b"event: response.completed\n"
+        b'data: {"type":"response.completed","response":{"usage":'
+        b'{"input_tokens":1,"output_tokens":1}'
+    )
+    main.app.state.client_manager = DummyClientManager(
+        DummyStreamingUpstreamResponse(
+            chunks=[
+                _responses_sse("response.created", {"type": "response.created"}),
+                _responses_sse(
+                    "response.output_text.delta",
+                    {"type": "response.output_text.delta", "delta": "partial"},
+                ),
+                partial_terminal,
+            ],
+            stream_error=_chained_responses_read_error(),
+            headers={"X-OAIX-Connection-ID": "oaixc-partial-reset"},
+        )
+    )
+    current_info = {
+        "request_id": "partial-terminal-reset",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info=current_info,
+    )
+
+    assert response.status_code == 200
+    assert "partial" in body
+    assert "event: error" in body
+    diagnostics = current_info["responses_stream_diagnostics"]
+    assert diagnostics["oaix_connection_id"] == "oaixc-partial-reset"
+    assert diagnostics["upstream_terminal_seen"] is False
+    assert diagnostics["usage_seen"] is False
+    assert diagnostics["last_event_type"] == "response.output_text.delta"
+    assert diagnostics["partial_event_bytes"] == len(partial_terminal)
+    assert diagnostics["partial_event_sha256"] == hashlib.sha256(
+        partial_terminal
+    ).hexdigest()
+    assert diagnostics["exception_type"] == "ReadError"
+    assert diagnostics["exception_errno"] == errno.ECONNRESET
+    assert diagnostics["exception_errno_name"] == "ECONNRESET"
+    assert [row["type"] for row in diagnostics["exception_chain"]] == [
+        "ReadError",
+        "ReadError",
+        "ConnectionResetError",
+    ]
+    assert diagnostics["diagnosis"] == "responses_partial_event_abort"
+    assert diagnostics["cleanup_owner"] == "responses_proxy_finally"
+    assert diagnostics["cleanup_trigger"] == (
+        "after_upstream_read_or_stream_failure"
+    )
 
 
 def test_responses_stream_closes_entered_upstream_response_before_context(monkeypatch):
@@ -1722,13 +1975,28 @@ def test_responses_stream_retry_closes_failed_upstream_response(monkeypatch):
             "upstream stalled",
             request=httpx.Request("POST", "https://provider-a.example/v1/responses"),
         ),
+        headers={"X-OAIX-Connection-ID": "oaixc-retry-a"},
     )
     upstream_b = DummyStreamingUpstreamResponse(
         chunks=[
             _responses_sse("response.created", {"type": "response.created", "provider": "b"}),
             _responses_sse("response.output_text.delta", {"type": "response.output_text.delta", "delta": "hello-b"}),
+            _responses_sse(
+                "response.completed",
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 1,
+                            "total_tokens": 2,
+                        }
+                    },
+                },
+            ),
             _responses_sse(None, "[DONE]"),
-        ]
+        ],
+        headers={"X-OAIX-Connection-ID": "oaixc-retry-b"},
     )
     main.app.state.config = {
         "api_keys": [
@@ -1747,12 +2015,18 @@ def test_responses_stream_retry_closes_failed_upstream_response(monkeypatch):
         }
     )
 
+    current_info = {
+        "request_id": "precommit-retry-isolation",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
     response, body = _run_responses_request_with_stream_body(
         ResponsesRequest(
             model="gpt-5.4",
             input=[{"role": "user", "content": "hello"}],
             stream=True,
-        )
+        ),
+        current_info=current_info,
     )
 
     assert response.status_code == 200
@@ -1763,6 +2037,20 @@ def test_responses_stream_retry_closes_failed_upstream_response(monkeypatch):
     assert upstream_a.context_exit_calls == 1
     assert upstream_b.close_calls == 1
     assert upstream_b.context_exit_calls == 1
+    attempts = current_info["upstream_attempts"]
+    assert len(attempts) == 2
+    assert attempts[0]["stream_diagnostics"]["oaix_connection_id"] == (
+        "oaixc-retry-a"
+    )
+    assert attempts[0]["stream_diagnostics"]["exception_type"] == "ReadTimeout"
+    assert attempts[1]["stream_diagnostics"]["oaix_connection_id"] == (
+        "oaixc-retry-b"
+    )
+    assert attempts[1]["stream_diagnostics"]["upstream_terminal_seen"] is True
+    assert current_info["responses_stream_diagnostics"] is attempts[1][
+        "stream_diagnostics"
+    ]
+    assert "exception_type" not in current_info["responses_stream_diagnostics"]
 
 
 def test_responses_stream_keepalive_does_not_commit_and_retries(monkeypatch):
@@ -2524,6 +2812,11 @@ def test_responses_live_disconnect_does_not_rewrite_client_close_as_sse_502(
     assert channel_results == []
     assert current_info["upstream_attempts"][-1]["status_code"] == 499
     assert upstream_response.close_calls >= 1
+    diagnostics = current_info["responses_stream_diagnostics"]
+    assert diagnostics["downstream_disconnected"] is True
+    assert diagnostics["downstream_disconnect_stage"] == "after-stream-commit"
+    assert diagnostics["diagnosis"] == "responses_downstream_disconnect"
+    assert diagnostics["cleanup_trigger"] == "downstream_disconnect"
 
 
 def test_responses_stream_emits_oaix_keepalive_before_real_output(monkeypatch):
@@ -2546,6 +2839,7 @@ def test_responses_stream_emits_oaix_keepalive_before_real_output(monkeypatch):
         headers={
             "X-OAIX-Request-ID": "req_keepalive",
             "X-OAIX-Token-ID": "8686",
+            "X-OAIX-Connection-ID": "oaixc-keepalive",
         },
     )
     client_manager = DummyClientManager(upstream_response)
@@ -2565,6 +2859,10 @@ def test_responses_stream_emits_oaix_keepalive_before_real_output(monkeypatch):
     assert response.status_code == 200
     assert response.headers["x-oaix-request-id"] == "req_keepalive"
     assert response.headers["x-oaix-token-id"] == "8686"
+    assert response.headers["x-oaix-connection-id"] == "oaixc-keepalive"
+    assert current_info["responses_stream_diagnostics"][
+        "oaix_connection_id"
+    ] == "oaixc-keepalive"
     assert body.startswith("event: keepalive\ndata: ")
     assert '"type": "keepalive"' in body.split("\n\n", 1)[0]
     assert '"sequence_number": 0' in body.split("\n\n", 1)[0]

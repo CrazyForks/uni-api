@@ -1,0 +1,1360 @@
+from __future__ import annotations
+
+import asyncio
+import errno as errno_module
+import hashlib
+import hmac
+import json
+import math
+import os
+import re
+import secrets
+import weakref
+from datetime import datetime, timezone
+from typing import Any
+
+
+_SCHEMA_VERSION = 1
+_MAX_CAUSE_DEPTH = 16
+_MAX_TRACE_EVENTS = 32
+_MAX_CLEANUP_ACTIONS = 8
+_MAX_EVENT_FACT_CACHE = 64
+_MAX_EVENT_TYPE_BYTES = 128
+_MAX_USAGE_COUNTER = (1 << 63) - 1
+_ENDPOINT_HMAC_KEY = secrets.token_bytes(32)
+_TrackerRef = weakref.ReferenceType[Any]
+_SOCKET_TRACKERS: dict[str, set[_TrackerRef]] = {}
+_NETWORK_STREAM_TRACKERS: dict[int, set[_TrackerRef]] = {}
+
+_EVENT_LINE_RE = re.compile(r"(?m)^event:[ \t]?(?P<event>[^\r\n]*)$")
+_SAFE_RESPONSES_EVENT_TYPES = frozenset(
+    {
+        "error",
+        "keepalive",
+        "ping",
+        "response.created",
+        "response.queued",
+        "response.in_progress",
+        "response.completed",
+        "response.incomplete",
+        "response.failed",
+        "response.output_item.added",
+        "response.output_item.done",
+        "response.content_part.added",
+        "response.content_part.done",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.refusal.delta",
+        "response.refusal.done",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.file_search_call.in_progress",
+        "response.file_search_call.searching",
+        "response.file_search_call.completed",
+        "response.web_search_call.in_progress",
+        "response.web_search_call.searching",
+        "response.web_search_call.completed",
+        "response.reasoning_summary_part.added",
+        "response.reasoning_summary_part.done",
+        "response.reasoning_summary_text.delta",
+        "response.reasoning_summary_text.done",
+        "response.reasoning_text.delta",
+        "response.reasoning_text.done",
+        "response.image_generation_call.in_progress",
+        "response.image_generation_call.generating",
+        "response.image_generation_call.partial_image",
+        "response.image_generation_call.completed",
+        "response.code_interpreter_call.in_progress",
+        "response.code_interpreter_call.interpreting",
+        "response.code_interpreter_call.completed",
+        "response.mcp_list_tools.in_progress",
+        "response.mcp_list_tools.completed",
+        "response.mcp_list_tools.failed",
+        "response.mcp_call_arguments.delta",
+        "response.mcp_call_arguments.done",
+        "response.mcp_call.in_progress",
+        "response.mcp_call.completed",
+        "response.mcp_call.failed",
+        "response.audio.delta",
+        "response.audio.done",
+        "response.audio_transcript.delta",
+        "response.audio_transcript.done",
+    }
+)
+_AUTH_RE = re.compile(r"(?i)\b(?:bearer|basic)\s+[^\s,;]+")
+_API_KEY_RE = re.compile(r"(?i)\bsk-[a-z0-9_-]{8,}")
+_URL_USERINFO_RE = re.compile(r"(?i)(https?://)[^/@\s]+@")
+_URL_QUERY_RE = re.compile(r"(?i)(https?://[^?\s]+)\?[^\s]*")
+_USAGE_COUNTER_FIELDS = frozenset(
+    {
+        "prompt_tokens",
+        "input_tokens",
+        "completion_tokens",
+        "output_tokens",
+        "total_tokens",
+    }
+)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_text(value: Any, *, max_bytes: int = 512) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        text = value[:max_bytes].decode("utf-8", errors="replace")
+    elif isinstance(value, (str, int, float, bool)):
+        text = str(value)
+    else:
+        text = type(value).__name__
+    text = text.strip()
+    if not text:
+        return None
+    candidate = text[:max_bytes]
+    encoded = candidate.encode("utf-8", errors="replace")
+    if len(encoded) > max_bytes:
+        candidate = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    return candidate
+
+
+def _redacted_error_text(exc: BaseException) -> str | None:
+    detail: Any = exc.args[0] if exc.args else None
+    text = _safe_text(detail, max_bytes=512)
+    if not text:
+        return None
+    text = _AUTH_RE.sub("[redacted-auth]", text)
+    text = _API_KEY_RE.sub("[redacted-api-key]", text)
+    text = _URL_USERINFO_RE.sub(r"\1[redacted]@", text)
+    return _URL_QUERY_RE.sub(r"\1?[redacted]", text)
+
+
+def _errno_value(exc: BaseException) -> int | None:
+    value = getattr(exc, "errno", None)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    return None
+
+
+def _exception_chain(exc: BaseException) -> tuple[list[dict[str, Any]], bool]:
+    rows: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    relation = "raised"
+    while current is not None and id(current) not in seen and len(rows) < _MAX_CAUSE_DEPTH:
+        seen.add(id(current))
+        error_number = _errno_value(current)
+        row: dict[str, Any] = {
+            "relation": relation,
+            "type": type(current).__name__,
+            "module": type(current).__module__,
+        }
+        if error_number is not None:
+            row["errno"] = error_number
+            row["errno_name"] = errno_module.errorcode.get(error_number)
+        message = _redacted_error_text(current)
+        if message:
+            row["message_sha256"] = hashlib.sha256(
+                message.encode("utf-8")
+            ).hexdigest()
+        rows.append(row)
+        if current.__cause__ is not None:
+            current = current.__cause__
+            relation = "cause"
+        elif current.__context__ is not None and not current.__suppress_context__:
+            current = current.__context__
+            relation = "context"
+        else:
+            current = None
+    return rows, current is not None
+
+
+def _socket_inode(sock: Any) -> str | None:
+    fileno = getattr(sock, "fileno", None)
+    if not callable(fileno):
+        return None
+    try:
+        fd = int(fileno())
+        target = os.readlink(f"/proc/self/fd/{fd}")
+    except (OSError, TypeError, ValueError):
+        return None
+    match = re.fullmatch(r"socket:\[(\d+)]", target)
+    return match.group(1) if match else None
+
+
+def _endpoint_parts(value: Any) -> tuple[str | None, int | None, str | None]:
+    if isinstance(value, (tuple, list)) and len(value) >= 2:
+        address = _safe_text(value[0], max_bytes=256)
+        raw_port = value[1]
+        port = raw_port if isinstance(raw_port, int) and not isinstance(raw_port, bool) else None
+        family = "ipv6" if address and ":" in address else "ipv4"
+        return address, port, family
+    address = _safe_text(value, max_bytes=256)
+    return address, None, "other" if address else None
+
+
+def _endpoint_hmac(address: str | None, port: int | None) -> str | None:
+    if not address:
+        return None
+    canonical = f"{address}\x00{port if port is not None else ''}".encode("utf-8")
+    return hmac.new(_ENDPOINT_HMAC_KEY, canonical, hashlib.sha256).hexdigest()
+
+
+def safe_responses_event_type(value: Any) -> str:
+    event_name = str(value or "").strip().lower()
+    if event_name == "[done]":
+        return "[DONE]"
+    if event_name in _SAFE_RESPONSES_EVENT_TYPES:
+        return event_name
+    return "other" if event_name else "message"
+
+
+def _event_type(raw_event: str) -> str:
+    # SSE uses the last event field in a frame.  Mirror the parser semantics,
+    # but never export an arbitrary upstream-controlled field as a cardinality
+    # dimension or payload side channel.
+    event_name = ""
+    for match in _EVENT_LINE_RE.finditer(raw_event):
+        event_name = (match.group("event") or "").strip().lower()
+    if event_name:
+        return safe_responses_event_type(event_name)
+    if raw_event.strip() == "data: [DONE]":
+        return "[DONE]"
+    return "message"
+
+
+def _register_tracker(
+    registry: dict[Any, set[_TrackerRef]],
+    key: Any,
+    tracker: ResponsesStreamDiagnostics,
+) -> None:
+    references = registry.setdefault(key, set())
+    for reference in tuple(references):
+        candidate = reference()
+        if candidate is tracker:
+            return
+        if candidate is None:
+            references.discard(reference)
+
+    tracker_reference: _TrackerRef
+
+    def remove_dead(reference: _TrackerRef) -> None:
+        current = registry.get(key)
+        if current is None:
+            return
+        current.discard(reference)
+        if not current:
+            registry.pop(key, None)
+
+    tracker_reference = weakref.ref(tracker, remove_dead)
+    references.add(tracker_reference)
+
+
+def _registered_trackers(
+    registry: dict[Any, set[_TrackerRef]],
+    key: Any,
+) -> list[ResponsesStreamDiagnostics]:
+    references = registry.get(key)
+    if references is None:
+        return []
+    live: list[ResponsesStreamDiagnostics] = []
+    for reference in tuple(references):
+        tracker = reference()
+        if tracker is None:
+            references.discard(reference)
+        else:
+            live.append(tracker)
+    if not live:
+        registry.pop(key, None)
+    return live
+
+
+def _sequence_number(payload: Any) -> int | None:
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("sequence_number")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _usage_counter_value_valid(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return 0 <= value <= _MAX_USAGE_COUNTER
+    if isinstance(value, float):
+        return (
+            math.isfinite(value)
+            and 0 <= value <= _MAX_USAGE_COUNTER
+            and value.is_integer()
+        )
+    if isinstance(value, str):
+        rendered = value.strip()
+        if not rendered or len(rendered) > 20 or not rendered.isdigit():
+            return False
+        try:
+            return int(rendered) <= _MAX_USAGE_COUNTER
+        except (ValueError, OverflowError):
+            return False
+    return False
+
+
+def _normalized_usage_counter(value: Any) -> int | None:
+    if not _usage_counter_value_valid(value):
+        return None
+    try:
+        return int(str(value).strip()) if isinstance(value, str) else int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _usage_observation(
+    payload: Any,
+) -> tuple[bool, bool, bool, bool, bool, bool | None, bool | None]:
+    if not isinstance(payload, dict):
+        return False, False, False, False, False, None, None
+    usage = payload.get("usage")
+    response = payload.get("response")
+    if not isinstance(usage, dict) and isinstance(response, dict):
+        usage = response.get("usage")
+    if not isinstance(usage, dict):
+        return False, False, False, False, False, None, None
+    observed_fields = [field for field in _USAGE_COUNTER_FIELDS if field in usage]
+    if not observed_fields:
+        return True, False, False, False, False, None, None
+    values_valid = all(
+        _usage_counter_value_valid(usage[field]) for field in observed_fields
+    )
+    input_known = "prompt_tokens" in usage or "input_tokens" in usage
+    output_known = "completion_tokens" in usage or "output_tokens" in usage
+    # Total is deterministically derivable only when both components exist.
+    total_known = "total_tokens" in usage or (input_known and output_known)
+    alias_consistent = True
+    for first, second in (
+        ("prompt_tokens", "input_tokens"),
+        ("completion_tokens", "output_tokens"),
+    ):
+        if first in usage and second in usage:
+            first_value = _normalized_usage_counter(usage[first])
+            second_value = _normalized_usage_counter(usage[second])
+            alias_consistent = alias_consistent and (
+                first_value is not None
+                and second_value is not None
+                and first_value == second_value
+            )
+    return (
+        True,
+        True,
+        input_known,
+        output_known,
+        total_known,
+        values_valid,
+        alias_consistent,
+    )
+
+
+def _transport_error_code(exc: BaseException) -> tuple[str, str]:
+    """Return a bounded deterministic transport code without retaining text."""
+
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    fallback_type = type(exc).__name__
+    while current is not None and id(current) not in seen and len(seen) < _MAX_CAUSE_DEPTH:
+        seen.add(id(current))
+        number = _errno_value(current)
+        if number is not None:
+            name = errno_module.errorcode.get(number, f"ERRNO_{number}")
+            return f"errno_{name.lower()}", "errno"
+
+        error_type = type(current).__name__
+        rendered = str(current).lower()
+        if error_type == "RemoteProtocolError":
+            if "incomplete chunked read" in rendered:
+                return "peer_closed_incomplete_chunked_body", "known_message_pattern"
+            if "incomplete message body" in rendered:
+                if "expected" in rendered and "received" in rendered:
+                    return "peer_closed_incomplete_fixed_body", "known_message_pattern"
+                return "peer_closed_incomplete_message_body", "known_message_pattern"
+            if "without sending a response" in rendered:
+                return "peer_closed_before_response_headers", "known_message_pattern"
+            return "remote_protocol_error_unspecified", "exception_type"
+
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif current.__context__ is not None and not current.__suppress_context__:
+            current = current.__context__
+        else:
+            current = None
+
+    normalized = re.sub(r"(?<!^)(?=[A-Z])", "_", fallback_type).lower()
+    return f"{normalized}_unspecified", "exception_type"
+
+
+def _terminal_semantics_consistency(
+    event_type: str,
+    payload: Any,
+    semantic_outcome: str,
+) -> tuple[bool, list[str]]:
+    reasons: list[str] = []
+    payload_type = ""
+    response_status = ""
+    if isinstance(payload, dict):
+        payload_type = str(payload.get("type") or "").strip()
+        response = payload.get("response")
+        if isinstance(response, dict):
+            response_status = str(response.get("status") or "").strip().lower()
+    if payload_type and payload_type != event_type:
+        reasons.append("payload_type_mismatch")
+    declared_outcome = {
+        "response.completed": "completed",
+        "response.incomplete": "incomplete",
+        "response.failed": "failed",
+        "error": "failed",
+    }.get(event_type)
+    if declared_outcome and semantic_outcome != declared_outcome:
+        reasons.append("declared_outcome_mismatch")
+    if (
+        semantic_outcome in {"completed", "incomplete", "failed"}
+        and response_status in {"completed", "incomplete", "failed"}
+        and response_status != semantic_outcome
+    ):
+        reasons.append("response_status_mismatch")
+    return not reasons, reasons
+
+
+class ResponsesStreamDiagnostics:
+    """Bounded, payload-free facts for one Responses upstream attempt."""
+
+    def __init__(
+        self,
+        *,
+        current_info: dict[str, Any],
+        attempt_index: int | None,
+        logical_authority: str | None,
+        proxy_configured: bool,
+    ) -> None:
+        self._socket_inode: str | None = None
+        self._network_stream_id: int | None = None
+        self._cleanup_claimed = False
+        self._cleanup_owner_claimed = False
+        self._observed_event_facts: dict[int, tuple[int, int, str]] = {}
+        self._facts: dict[str, Any] = {
+            "schema_version": _SCHEMA_VERSION,
+            "hash_scope": "ember_normalized_sse_event_lf_v1",
+            "partial_hash_scope": "normalized_prefix_plus_utf8_tail_v1",
+            "transport_peer_semantics": "physical_peer_may_be_proxy",
+            "logical_authority": _safe_text(logical_authority, max_bytes=256),
+            "explicit_proxy_configured": bool(proxy_configured),
+            "upstream_body_bytes": 0,
+            "upstream_chunk_count": 0,
+            "complete_event_count": 0,
+            "upstream_eof_seen": False,
+            "terminal_frame_seen": False,
+            "upstream_terminal_seen": False,
+            "upstream_terminal_validated": False,
+            "usage_object_seen": False,
+            "usage_counters_seen": False,
+            "usage_input_known": False,
+            "usage_output_known": False,
+            "usage_total_known": False,
+            "usage_seen": False,
+            "downstream_terminal_seen": False,
+            "downstream_terminal_asgi_write_completed": False,
+            "error_event_seen": False,
+            "diagnosis": "responses_stream_in_progress",
+            "phase": "upstream_headers",
+        }
+        attempts = current_info.get("upstream_attempts")
+        if (
+            isinstance(attempts, list)
+            and isinstance(attempt_index, int)
+            and 0 <= attempt_index < len(attempts)
+            and isinstance(attempts[attempt_index], dict)
+        ):
+            attempts[attempt_index]["stream_diagnostics"] = self._facts
+        # This is deliberately the most recent attempt. A precommit failure
+        # followed by a successful retry must not contaminate request_summary.
+        current_info["responses_stream_diagnostics"] = self._facts
+        current_info["_responses_stream_diagnostics_tracker"] = self
+
+    @property
+    def facts(self) -> dict[str, Any]:
+        return self._facts
+
+    def capture_response(self, response: Any) -> None:
+        try:
+            extensions = getattr(response, "extensions", None)
+            if not isinstance(extensions, dict):
+                extensions = {}
+            raw_version = extensions.get("http_version")
+            if isinstance(raw_version, bytes):
+                version = raw_version.decode("ascii", errors="replace")
+            else:
+                version = _safe_text(raw_version, max_bytes=32)
+            if version:
+                self._facts["http_version"] = version
+            stream_id = extensions.get("stream_id")
+            if isinstance(stream_id, int) and not isinstance(stream_id, bool):
+                self._facts["httpcore_stream_id"] = stream_id
+
+            headers = getattr(response, "headers", None)
+            connection_id = None
+            if headers is not None:
+                try:
+                    connection_id = headers.get("x-oaix-connection-id")
+                except Exception:
+                    connection_id = None
+                if connection_id is None:
+                    try:
+                        connection_id = next(
+                            value
+                            for name, value in headers.items()
+                            if str(name).lower() == "x-oaix-connection-id"
+                        )
+                    except (AttributeError, StopIteration, TypeError):
+                        connection_id = None
+            connection_id = _safe_text(connection_id, max_bytes=256)
+            if connection_id:
+                self._facts["oaix_connection_id"] = connection_id
+
+            network_stream = extensions.get("network_stream")
+            get_extra_info = getattr(network_stream, "get_extra_info", None)
+            if not callable(get_extra_info):
+                self._facts["transport_metadata_available"] = False
+                return
+            self._facts["transport_metadata_available"] = True
+            self._network_stream_id = id(network_stream)
+            _register_tracker(
+                _NETWORK_STREAM_TRACKERS,
+                self._network_stream_id,
+                self,
+            )
+            try:
+                local = get_extra_info("client_addr")
+            except Exception:
+                local = None
+            try:
+                peer = get_extra_info("server_addr")
+            except Exception:
+                peer = None
+            local_address, local_port, local_family = _endpoint_parts(local)
+            peer_address, peer_port, peer_family = _endpoint_parts(peer)
+            local_hmac = _endpoint_hmac(local_address, local_port)
+            peer_hmac = _endpoint_hmac(peer_address, peer_port)
+            if local_hmac:
+                self._facts["transport_local_endpoint_hmac"] = local_hmac
+                self._facts["transport_local_family"] = local_family
+            if peer_hmac:
+                self._facts["transport_peer_endpoint_hmac"] = peer_hmac
+                self._facts["transport_peer_family"] = peer_family
+            if local_hmac and peer_hmac:
+                four_tuple = f"{local_hmac}\x00{peer_hmac}".encode("ascii")
+                self._facts["transport_four_tuple_hmac"] = hmac.new(
+                    _ENDPOINT_HMAC_KEY, four_tuple, hashlib.sha256
+                ).hexdigest()
+            try:
+                sock = get_extra_info("socket")
+            except Exception:
+                sock = None
+            inode = _socket_inode(sock)
+            if inode:
+                self._socket_inode = inode
+                self._facts["transport_socket_hmac"] = hmac.new(
+                    _ENDPOINT_HMAC_KEY,
+                    inode.encode("ascii"),
+                    hashlib.sha256,
+                ).hexdigest()
+                _register_tracker(_SOCKET_TRACKERS, inode, self)
+        except Exception as exc:
+            self._facts["transport_metadata_error"] = type(exc).__name__
+
+    def set_phase(self, phase: str) -> None:
+        normalized = _safe_text(phase, max_bytes=40)
+        if normalized:
+            if normalized != self._facts.get("phase"):
+                self._observed_event_facts.clear()
+            self._facts["phase"] = normalized
+
+    def observe_upstream_chunk(self, chunk: Any) -> None:
+        try:
+            size = len(chunk)
+        except Exception:
+            return
+        self._facts["upstream_body_bytes"] = int(
+            self._facts.get("upstream_body_bytes") or 0
+        ) + max(0, int(size))
+        self._facts["upstream_chunk_count"] = int(
+            self._facts.get("upstream_chunk_count") or 0
+        ) + 1
+        self._facts.setdefault("first_upstream_body_at", _utc_now())
+
+    def observe_complete_event(self, raw_event: str) -> None:
+        try:
+            encoded = raw_event.encode("utf-8")
+            digest = hashlib.sha256()
+            digest.update(encoded)
+            digest.update(b"\n\n")
+            ordinal = int(self._facts.get("complete_event_count") or 0) + 1
+            event_type = _event_type(raw_event)
+            if len(self._observed_event_facts) >= _MAX_EVENT_FACT_CACHE:
+                self._observed_event_facts.pop(
+                    next(iter(self._observed_event_facts)),
+                    None,
+                )
+            self._observed_event_facts[id(raw_event)] = (
+                ordinal,
+                len(encoded) + 2,
+                digest.hexdigest(),
+            )
+            self._facts.update(
+                {
+                    "complete_event_count": ordinal,
+                    "last_event_ordinal": ordinal,
+                    "last_event_type": event_type,
+                    "last_event_bytes": len(encoded) + 2,
+                    "last_event_sha256": digest.hexdigest(),
+                    "last_event_received_at": _utc_now(),
+                }
+            )
+            if event_type in {
+                "response.completed",
+                "response.incomplete",
+                "response.failed",
+                "error",
+            }:
+                self._facts["terminal_frame_seen"] = True
+                self._facts["declared_terminal_type"] = event_type
+                self._facts["declared_terminal_ordinal"] = ordinal
+                self._facts["declared_terminal_bytes"] = len(encoded) + 2
+                self._facts["declared_terminal_sha256"] = digest.hexdigest()
+                self._facts["declared_terminal_received_at"] = _utc_now()
+            self._refresh_diagnosis()
+        except Exception as exc:
+            self._facts["event_observer_error"] = type(exc).__name__
+
+    def observe_parsed_event(
+        self,
+        raw_event: str,
+        event_type: str,
+        payload: Any,
+        *,
+        semantic_outcome: str,
+    ) -> None:
+        safe_event_type = safe_responses_event_type(event_type)
+        declared_terminal = event_type in {
+            "response.completed",
+            "response.incomplete",
+            "response.failed",
+            "error",
+        }
+        cached_event = self._observed_event_facts.pop(id(raw_event), None)
+        if cached_event is None:
+            encoded = raw_event.encode("utf-8")
+            digest = hashlib.sha256()
+            digest.update(encoded)
+            digest.update(b"\n\n")
+            event_ordinal = int(self._facts.get("complete_event_count") or 0)
+            event_bytes = len(encoded) + 2
+            event_sha256 = digest.hexdigest()
+        else:
+            event_ordinal, event_bytes, event_sha256 = cached_event
+        if declared_terminal:
+            self._facts.update(
+                {
+                    "terminal_frame_seen": True,
+                    "declared_terminal_type": safe_event_type,
+                    "declared_terminal_ordinal": event_ordinal,
+                    "declared_terminal_bytes": event_bytes,
+                    "declared_terminal_sha256": event_sha256,
+                    "terminal_frame_structured": True,
+                    "terminal_frame_structured_at": _utc_now(),
+                }
+            )
+            self._facts["terminal_frame_semantic_outcome"] = semantic_outcome
+            consistent, reasons = _terminal_semantics_consistency(
+                event_type,
+                payload,
+                semantic_outcome,
+            )
+            self._facts["terminal_semantics_consistent"] = consistent
+            self._facts["terminal_consistency_status"] = (
+                "consistent" if consistent else "inconsistent"
+            )
+            if reasons:
+                self._facts["terminal_semantics_inconsistency"] = reasons
+            else:
+                self._facts.pop("terminal_semantics_inconsistency", None)
+
+        if semantic_outcome in {"completed", "incomplete", "failed"}:
+            now = _utc_now()
+            self._facts.update(
+                {
+                    "upstream_terminal_seen": True,
+                    "upstream_terminal_validated": bool(
+                        self._facts.get("terminal_semantics_consistent")
+                    ),
+                    "semantic_terminal_type": safe_event_type,
+                    "semantic_terminal_outcome": semantic_outcome,
+                    "semantic_terminal_bytes": event_bytes,
+                    "semantic_terminal_sha256": event_sha256,
+                    "semantic_terminal_classified_at": now,
+                }
+            )
+            self._facts.setdefault(
+                "transport_end_trigger",
+                f"semantic_{semantic_outcome}",
+            )
+            if semantic_outcome == "completed":
+                self._facts["response_completed_validated"] = bool(
+                    self._facts.get("terminal_semantics_consistent")
+                )
+            elif semantic_outcome == "incomplete":
+                self._facts["response_incomplete_validated"] = bool(
+                    self._facts.get("terminal_semantics_consistent")
+                )
+            else:
+                self._facts["failure_terminal_validated"] = bool(
+                    self._facts.get("terminal_semantics_consistent")
+                )
+            sequence = _sequence_number(payload)
+            if sequence is not None:
+                self._facts["semantic_terminal_sequence_number"] = sequence
+            (
+                usage_object_seen,
+                usage_counters_seen,
+                usage_input_known,
+                usage_output_known,
+                usage_total_known,
+                usage_values_valid,
+                usage_alias_consistent,
+            ) = _usage_observation(payload)
+            if usage_object_seen:
+                self._facts["usage_object_seen"] = True
+            if usage_counters_seen:
+                self._facts["usage_counters_seen"] = True
+                self._facts["usage_input_known"] = usage_input_known
+                self._facts["usage_output_known"] = usage_output_known
+                self._facts["usage_total_known"] = usage_total_known
+                self._facts["usage_values_valid"] = bool(usage_values_valid)
+                self._facts["usage_alias_consistent"] = bool(
+                    usage_alias_consistent
+                )
+            if (
+                usage_counters_seen
+                and usage_input_known
+                and usage_output_known
+                and usage_total_known
+                and usage_values_valid
+                and usage_alias_consistent
+            ):
+                self._facts["usage_seen"] = True
+            if semantic_outcome == "failed":
+                self._facts["failure_stage"] = (
+                    self._facts.get("phase") or "unknown"
+                )
+        self._refresh_diagnosis()
+
+    def mark_terminal_queue_handoff_completed(self) -> None:
+        self._facts["ember_queue_terminal_handoff_completed"] = True
+        self._facts["ember_queue_terminal_handoff_completed_at"] = _utc_now()
+        self._refresh_diagnosis()
+
+    def observe_partial_event(self, pending_data: bytes) -> None:
+        try:
+            self.observe_partial_diagnostics(
+                {
+                    "bytes": len(pending_data),
+                    "sha256": hashlib.sha256(pending_data).hexdigest()
+                    if pending_data
+                    else None,
+                    "scope": "caller_supplied_pending_bytes_v1",
+                }
+            )
+        except Exception as exc:
+            self._facts["partial_observer_error"] = type(exc).__name__
+
+    def observe_partial_diagnostics(self, diagnostics: dict[str, Any]) -> None:
+        try:
+            size = max(0, int(diagnostics.get("bytes") or 0))
+            self._facts["partial_event_bytes"] = size
+            digest = _safe_text(diagnostics.get("sha256"), max_bytes=128)
+            if size and digest:
+                self._facts["partial_event_sha256"] = digest
+            elif not size:
+                self._facts.pop("partial_event_sha256", None)
+            scope = _safe_text(diagnostics.get("scope"), max_bytes=128)
+            if scope:
+                self._facts["partial_hash_scope"] = scope
+        except Exception as exc:
+            self._facts["partial_observer_error"] = type(exc).__name__
+
+    def observe_upstream_eof(self) -> None:
+        self._facts["upstream_eof_seen"] = True
+        self._facts["upstream_eof_at"] = _utc_now()
+        self._facts.setdefault("transport_end_trigger", "upstream_http_body_eof")
+        self._refresh_diagnosis()
+
+    def observe_exception(self, exc: BaseException, *, origin: str) -> None:
+        if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
+            return
+        if self._facts.get("exception_type"):
+            return
+        chain, truncated = _exception_chain(exc)
+        self._facts.update(
+            {
+                "exception_origin": _safe_text(origin, max_bytes=80),
+                "exception_type": type(exc).__name__,
+                "exception_at": _utc_now(),
+                "exception_chain": chain,
+                "exception_chain_depth": len(chain),
+                "exception_chain_truncated": truncated,
+                "failure_stage": self._facts.get("phase") or "unknown",
+            }
+        )
+        transport_error_code, transport_error_code_source = _transport_error_code(
+            exc
+        )
+        self._facts["transport_error_code"] = transport_error_code
+        self._facts["transport_error_code_source"] = transport_error_code_source
+        if chain:
+            deepest_errno = next(
+                (row for row in reversed(chain) if row.get("errno") is not None),
+                None,
+            )
+            if deepest_errno is not None:
+                self._facts["exception_errno"] = deepest_errno["errno"]
+                if deepest_errno.get("errno_name"):
+                    self._facts["exception_errno_name"] = deepest_errno[
+                        "errno_name"
+                    ]
+        self._refresh_diagnosis()
+
+    async def httpcore_trace(self, name: str, info: dict[str, Any]) -> None:
+        """HTTPcore trace callback; it must never affect the request."""
+
+        try:
+            # Successful body reads are high-volume and do not help attribute a
+            # close.  Keeping them would also consume the bounded ledger before
+            # a late read failure.  Preserve only the failure and close-order
+            # transitions needed for a deterministic transport diagnosis.
+            interesting = (
+                name.endswith("receive_response_body.failed")
+                or "response_closed" in name
+            )
+            if not interesting:
+                return
+            row: dict[str, Any] = {"name": _safe_text(name, max_bytes=128), "at": _utc_now()}
+            exc = info.get("exception") if isinstance(info, dict) else None
+            if isinstance(exc, BaseException):
+                chain, truncated = _exception_chain(exc)
+                row["exception_chain"] = chain
+                row["exception_chain_truncated"] = truncated
+            events = self._facts.setdefault("httpcore_events", [])
+            if isinstance(events, list) and len(events) < _MAX_TRACE_EVENTS:
+                events.append(row)
+            else:
+                self._facts["httpcore_events_truncated"] = True
+            if name.endswith("receive_response_body.failed"):
+                if isinstance(exc, asyncio.CancelledError):
+                    self._facts["httpcore_body_read_cancelled_at"] = row["at"]
+                    self._facts["httpcore_body_read_cancellation_had_local_claim"] = (
+                        self._cleanup_claimed
+                    )
+                    self._facts.setdefault(
+                        "transport_end_trigger",
+                        "ember_local_cleanup"
+                        if self._cleanup_claimed
+                        else "httpcore_body_read_cancellation_origin_unknown",
+                    )
+                else:
+                    self._facts["httpcore_body_read_failed_at"] = row["at"]
+                    self._facts.setdefault(
+                        "transport_end_trigger",
+                        "httpcore_body_read_failure",
+                    )
+                    self._facts[
+                        "local_cleanup_claimed_before_body_read_failure"
+                    ] = self._cleanup_claimed
+                    if isinstance(exc, BaseException):
+                        self._facts["httpcore_body_read_failure_type"] = type(
+                            exc
+                        ).__name__
+            elif name.endswith("response_closed.started"):
+                self._facts["httpcore_response_close_started_at"] = row["at"]
+                if self._cleanup_claimed:
+                    trigger = "ember_explicit_cleanup"
+                elif self._facts.get("httpcore_body_read_failed_at"):
+                    trigger = "httpcore_reactive_close_after_body_read_failure"
+                elif self._facts.get("httpcore_body_read_cancelled_at"):
+                    trigger = "httpcore_reactive_close_after_body_read_cancellation"
+                elif self._facts.get("pool_sweeper_close_started_at"):
+                    trigger = "pool_sweeper"
+                else:
+                    trigger = "httpcore_close_trigger_unknown"
+                self._facts["httpcore_response_close_trigger"] = trigger
+            elif name.endswith("response_closed.complete"):
+                self._facts["httpcore_response_close_completed_at"] = row["at"]
+            elif name.endswith("response_closed.failed"):
+                self._facts["httpcore_response_close_failed_at"] = row["at"]
+        except Exception:
+            # HTTPcore treats trace callback failures as transport failures.
+            # Observability is therefore deliberately fail-open here.
+            return
+
+    def mark_downstream_disconnect(self, *, stage: str) -> None:
+        self._facts["downstream_disconnected"] = True
+        self._facts["downstream_disconnect_stage"] = _safe_text(stage, max_bytes=80)
+        self._facts["downstream_disconnect_at"] = _utc_now()
+        self._facts["failure_stage"] = "downstream"
+        self._facts.setdefault("transport_end_trigger", "downstream_disconnect")
+        self._refresh_diagnosis()
+
+    def mark_local_end(self, *, origin: str) -> None:
+        self._facts.setdefault("local_end_origin", _safe_text(origin, max_bytes=80))
+        self._facts.setdefault("local_end_at", _utc_now())
+        self._refresh_diagnosis()
+
+    def mark_cleanup_intent(self, *, owner: str, trigger: str) -> None:
+        """Record a local cancellation intent before it reaches HTTPcore.
+
+        This is deliberately separate from ownership of the actual transport
+        close. Queue/body cancellation must be visible to the HTTPcore trace,
+        but the later proxy finalizer is the component that executes cleanup.
+        """
+
+        self._cleanup_claimed = True
+        self._facts.setdefault("cleanup_intent_owner", _safe_text(owner, max_bytes=80))
+        self._facts.setdefault(
+            "cleanup_intent_trigger",
+            _safe_text(trigger, max_bytes=80),
+        )
+        self._facts.setdefault("cleanup_intent_at", _utc_now())
+        self._facts.setdefault("transport_end_trigger", "ember_local_cleanup")
+
+    def begin_cleanup(self, *, owner: str, trigger: str) -> bool:
+        attempts = int(self._facts.get("cleanup_attempt_count") or 0) + 1
+        self._facts["cleanup_attempt_count"] = attempts
+        if self._cleanup_owner_claimed:
+            return False
+        self._cleanup_claimed = True
+        self._cleanup_owner_claimed = True
+        self._facts.setdefault("transport_end_trigger", "ember_local_cleanup")
+        self._facts.update(
+            {
+                "cleanup_owner": _safe_text(owner, max_bytes=80),
+                "cleanup_trigger": _safe_text(trigger, max_bytes=80),
+                "cleanup_started_at": _utc_now(),
+                "cleanup_started_after_body_read_failure": bool(
+                    self._facts.get("httpcore_body_read_failed_at")
+                ),
+            }
+        )
+        return True
+
+    def record_cleanup_action(
+        self,
+        *,
+        actor: str,
+        trigger: str,
+        outcome: dict[str, Any],
+        transport_safe: bool,
+        context_exit_succeeded: bool | None,
+    ) -> None:
+        actions = self._facts.setdefault("cleanup_actions", [])
+        if not isinstance(actions, list) or len(actions) >= _MAX_CLEANUP_ACTIONS:
+            self._facts["cleanup_actions_truncated"] = True
+            return
+        row: dict[str, Any] = {
+            "actor": _safe_text(actor, max_bytes=80),
+            "trigger": _safe_text(trigger, max_bytes=80),
+            "transport_safe": bool(transport_safe),
+            "completed_at": _utc_now(),
+        }
+        if context_exit_succeeded is not None:
+            row["context_exit_succeeded"] = bool(context_exit_succeeded)
+        for key in (
+            "method",
+            "cooperative_close_started",
+            "cooperative_close_completed",
+            "transport_evicted",
+            "transport_isolated",
+            "detached_cleanup",
+            "won_cleanup_claim",
+        ):
+            if key in outcome:
+                value = outcome[key]
+                row[key] = (
+                    _safe_text(value, max_bytes=80)
+                    if key == "method"
+                    else bool(value)
+                )
+        actions.append(row)
+
+    def observe_cleanup_transport_outcome(
+        self,
+        outcome: dict[str, Any],
+        *,
+        actor: str | None = None,
+    ) -> None:
+        normalized_actor = _safe_text(actor, max_bytes=80) if actor else None
+        existing_actor = self._facts.get("cleanup_transport_action_actor")
+        if normalized_actor and existing_actor and existing_actor != normalized_actor:
+            return
+        if normalized_actor and not existing_actor:
+            self._facts["cleanup_transport_action_actor"] = normalized_actor
+        for key in (
+            "method",
+            "cooperative_close_started",
+            "cooperative_close_completed",
+            "transport_evicted",
+            "transport_isolated",
+            "detached_cleanup",
+        ):
+            if key in outcome:
+                fact_key = f"cleanup_{key}"
+                if key in {
+                    "transport_evicted",
+                    "transport_isolated",
+                    "detached_cleanup",
+                }:
+                    self._facts[fact_key] = bool(
+                        self._facts.get(fact_key)
+                    ) or bool(outcome[key])
+                else:
+                    self._facts.setdefault(fact_key, outcome[key])
+
+    def finish_cleanup(
+        self,
+        *,
+        transport_safe: bool,
+        context_exit_succeeded: bool | None,
+        actor: str | None = None,
+    ) -> None:
+        if "cleanup_transport_safe" not in self._facts:
+            self._facts["cleanup_transport_safe"] = bool(transport_safe)
+            if actor:
+                self._facts["cleanup_transport_result_actor"] = _safe_text(
+                    actor,
+                    max_bytes=80,
+                )
+        if (
+            context_exit_succeeded is not None
+            and "cleanup_context_exit_succeeded" not in self._facts
+        ):
+            self._facts["cleanup_context_exit_succeeded"] = bool(
+                context_exit_succeeded
+            )
+            if actor:
+                self._facts["cleanup_context_exit_actor"] = _safe_text(
+                    actor,
+                    max_bytes=80,
+                )
+        transport_result = self._facts.get("cleanup_transport_safe")
+        context_result = self._facts.get("cleanup_context_exit_succeeded")
+        if transport_result is False or context_result is False:
+            self._facts.setdefault("cleanup_completed_at", _utc_now())
+            self._facts["cleanup_result"] = "incomplete"
+            self._facts["cleanup_failure"] = True
+            self._facts["cleanup_failure_stage"] = "cleanup"
+            # Preserve the stage of an earlier transport/protocol failure.
+            # Cleanup is a second failure dimension, not a rewrite of cause.
+            self._facts.setdefault("failure_stage", "cleanup")
+            self._unregister_socket()
+        elif transport_result is True and context_result is True:
+            self._facts.setdefault("cleanup_completed_at", _utc_now())
+            self._facts["cleanup_result"] = "succeeded"
+            self._unregister_socket()
+        elif transport_result is True:
+            self._facts["cleanup_result"] = "transport_safe_context_pending"
+
+    def mark_downstream_sse_events_sent(self, event_types: set[str]) -> None:
+        if not event_types:
+            return
+        now = _utc_now()
+        if "response.completed" in event_types:
+            self._facts["downstream_terminal_seen"] = True
+            self._facts["downstream_semantic_status"] = "completed"
+        elif "response.incomplete" in event_types:
+            self._facts["downstream_terminal_seen"] = True
+            self._facts["downstream_semantic_status"] = "incomplete"
+        elif "response.failed" in event_types:
+            self._facts["downstream_terminal_seen"] = True
+            self._facts["downstream_semantic_status"] = "failed"
+        if "error" in event_types:
+            self._facts["error_event_seen"] = True
+        if self._facts.get("downstream_terminal_seen") or "error" in event_types:
+            self._facts["downstream_terminal_asgi_write_completed"] = True
+            self._facts["downstream_terminal_asgi_write_completed_at"] = now
+
+    def snapshot_json(self) -> str:
+        return json.dumps(
+            self._facts,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def observe_pool_sweeper_close(self, *, trigger: str) -> None:
+        self._facts.setdefault("pool_sweeper_close_started_at", _utc_now())
+        self._facts.setdefault("pool_sweeper_trigger", _safe_text(trigger, max_bytes=80))
+        self._facts["pool_sweeper_close_observed"] = True
+        if trigger == "kernel_close_wait":
+            self._facts.setdefault(
+                "transport_end_trigger",
+                "kernel_close_wait_observed",
+            )
+        else:
+            self._facts.setdefault(
+                "transport_end_trigger",
+                f"pool_sweeper_{trigger}",
+            )
+        self.mark_local_end(origin="pool_sweeper_close")
+        claimed = self.begin_cleanup(owner="pool_sweeper", trigger=trigger)
+        self._facts.setdefault("pool_sweeper_won_cleanup_claim", claimed)
+
+    def observe_pool_sweeper_close_completed(self, *, succeeded: bool) -> None:
+        self._facts["pool_sweeper_close_completed_at"] = _utc_now()
+        self._facts["pool_sweeper_close_succeeded"] = bool(succeeded)
+        outcome = {
+            "method": "pool_sweeper_connection_close",
+            "cooperative_close_started": False,
+            "cooperative_close_completed": False,
+            "transport_evicted": bool(succeeded),
+            "transport_isolated": bool(succeeded),
+            "detached_cleanup": False,
+        }
+        self.record_cleanup_action(
+            actor="pool_sweeper",
+            trigger=str(self._facts.get("pool_sweeper_trigger") or "unknown"),
+            outcome=outcome,
+            transport_safe=bool(succeeded),
+            context_exit_succeeded=None,
+        )
+        self.observe_cleanup_transport_outcome(outcome, actor="pool_sweeper")
+        self.finish_cleanup(
+            transport_safe=bool(succeeded),
+            context_exit_succeeded=None,
+            actor="pool_sweeper",
+        )
+
+    def _refresh_diagnosis(self) -> None:
+        facts = self._facts
+        semantic_outcome = str(facts.get("semantic_terminal_outcome") or "")
+        queue_handoff_completed = bool(
+            facts.get("ember_queue_terminal_handoff_completed")
+        )
+        local_end_origin = str(facts.get("local_end_origin") or "")
+        if facts.get("downstream_disconnected"):
+            diagnosis = "responses_downstream_disconnect"
+            semantic_status = "unknown"
+        elif local_end_origin == "local_backpressure_abort":
+            diagnosis = "responses_local_backpressure_abort"
+            semantic_status = "unknown"
+        elif facts.get("exception_type"):
+            error_type = str(facts.get("exception_type") or "")
+            if error_type in {"ReadError", "RemoteProtocolError"}:
+                diagnosis = "responses_read_error"
+            elif error_type == "ReadTimeout":
+                diagnosis = "responses_read_timeout"
+            elif error_type == "SSEProtocolError" or error_type.startswith("SSE"):
+                diagnosis = "responses_sse_protocol_error"
+            else:
+                diagnosis = "responses_stream_error"
+            if int(facts.get("partial_event_bytes") or 0) > 0:
+                diagnosis = "responses_partial_event_abort"
+            semantic_status = "error"
+        elif facts.get("terminal_semantics_consistent") is False:
+            # Consistency remains an independent fact.  A later confirmed
+            # transport/protocol exception is the primary stream failure and
+            # therefore takes precedence in the single diagnosis field.
+            diagnosis = "responses_terminal_semantics_inconsistent"
+            semantic_status = (
+                semantic_outcome
+                if queue_handoff_completed
+                or (semantic_outcome == "failed" and facts.get("phase") == "precommit")
+                else "unknown"
+            )
+        elif semantic_outcome == "failed" and facts.get("phase") == "precommit":
+            # A provider failure rejected before the HTTP 200 stream commit is
+            # already the final semantic result; there is no Ember queue handoff
+            # on this branch.
+            diagnosis = "responses_failure_terminal"
+            semantic_status = "failed"
+        elif semantic_outcome == "completed" and queue_handoff_completed:
+            diagnosis = (
+                "responses_completed_with_usage"
+                if facts.get("usage_seen")
+                else "responses_completed_without_usage"
+            )
+            semantic_status = "completed"
+        elif semantic_outcome == "incomplete" and queue_handoff_completed:
+            diagnosis = "responses_incomplete_terminal"
+            semantic_status = "incomplete"
+        elif semantic_outcome == "failed" and queue_handoff_completed:
+            diagnosis = "responses_failure_terminal"
+            semantic_status = "failed"
+        elif local_end_origin:
+            diagnosis = "responses_local_close_before_terminal"
+            semantic_status = "unknown"
+        elif semantic_outcome:
+            diagnosis = "responses_terminal_pending_queue_handoff"
+            semantic_status = "unknown"
+        elif facts.get("upstream_eof_seen"):
+            diagnosis = "responses_eof_before_terminal"
+            semantic_status = "unknown"
+        elif facts.get("terminal_frame_seen"):
+            diagnosis = "responses_terminal_event_unvalidated"
+            semantic_status = "unknown"
+        else:
+            diagnosis = "responses_stream_in_progress"
+            semantic_status = "unknown"
+        facts["diagnosis"] = diagnosis
+        facts["semantic_status"] = semantic_status
+
+    def _unregister_socket(self) -> None:
+        inode = self._socket_inode
+        if inode:
+            references = _SOCKET_TRACKERS.get(inode)
+            if references is not None:
+                for reference in tuple(references):
+                    if reference() is None or reference() is self:
+                        references.discard(reference)
+                if not references:
+                    _SOCKET_TRACKERS.pop(inode, None)
+        network_stream_id = self._network_stream_id
+        if network_stream_id is not None:
+            references = _NETWORK_STREAM_TRACKERS.get(network_stream_id)
+            if references is not None:
+                for reference in tuple(references):
+                    if reference() is None or reference() is self:
+                        references.discard(reference)
+                if not references:
+                    _NETWORK_STREAM_TRACKERS.pop(network_stream_id, None)
+
+
+class ObservedResponseByteIterator:
+    """Count bytes and capture transport EOF/errors without changing chunks."""
+
+    def __init__(self, inner: Any, diagnostics: ResponsesStreamDiagnostics) -> None:
+        self._inner = inner
+        self._diagnostics = diagnostics
+
+    def __aiter__(self) -> ObservedResponseByteIterator:
+        return self
+
+    async def __anext__(self) -> Any:
+        try:
+            chunk = await self._inner.__anext__()
+        except StopAsyncIteration:
+            self._diagnostics.observe_upstream_eof()
+            raise
+        except BaseException as exc:
+            self._diagnostics.observe_exception(exc, origin="upstream_body_iterator")
+            raise
+        self._diagnostics.observe_upstream_chunk(chunk)
+        return chunk
+
+
+def observe_pool_sweeper_socket_close(
+    socket_inode: str | None,
+    *,
+    trigger: str,
+) -> list[ResponsesStreamDiagnostics]:
+    if not socket_inode:
+        return []
+    trackers = _registered_trackers(_SOCKET_TRACKERS, socket_inode)
+    for tracker in trackers:
+        tracker.observe_pool_sweeper_close(trigger=trigger)
+    return trackers
+
+
+def observe_pool_sweeper_connection_close(
+    connection: Any,
+    *,
+    trigger: str,
+    socket_inode: str | None = None,
+) -> list[ResponsesStreamDiagnostics]:
+    current = connection
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        network_stream = getattr(current, "_network_stream", None)
+        trackers = _registered_trackers(
+            _NETWORK_STREAM_TRACKERS,
+            id(network_stream),
+        )
+        if trackers:
+            for tracker in trackers:
+                tracker.observe_pool_sweeper_close(trigger=trigger)
+            return trackers
+        next_connection = getattr(current, "_connection", None)
+        if next_connection is None or next_connection is current:
+            break
+        current = next_connection
+    return observe_pool_sweeper_socket_close(socket_inode, trigger=trigger)
+
+
+def observe_client_pool_shutdown_connection(
+    connection: Any,
+) -> list[ResponsesStreamDiagnostics]:
+    current = connection
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        network_stream = getattr(current, "_network_stream", None)
+        trackers = _registered_trackers(
+            _NETWORK_STREAM_TRACKERS,
+            id(network_stream),
+        )
+        if trackers:
+            for tracker in trackers:
+                tracker.mark_local_end(origin="client_pool_shutdown")
+                tracker.begin_cleanup(
+                    owner="client_pool_shutdown",
+                    trigger="client_pool_shutdown",
+                )
+                tracker.facts.setdefault("client_pool_shutdown_started_at", _utc_now())
+            return trackers
+        next_connection = getattr(current, "_connection", None)
+        if next_connection is None or next_connection is current:
+            break
+        current = next_connection
+    return []
+
+
+def observe_client_pool_shutdown_completed(
+    trackers: list[ResponsesStreamDiagnostics],
+    *,
+    succeeded: bool,
+) -> None:
+    outcome = {
+        "method": "client_pool_aclose",
+        "cooperative_close_started": True,
+        "cooperative_close_completed": bool(succeeded),
+        "transport_evicted": False,
+        "transport_isolated": bool(succeeded),
+        "detached_cleanup": False,
+    }
+    for tracker in trackers:
+        tracker.facts["client_pool_shutdown_completed_at"] = _utc_now()
+        tracker.facts["client_pool_shutdown_succeeded"] = bool(succeeded)
+        tracker.record_cleanup_action(
+            actor="client_pool_shutdown",
+            trigger="client_pool_shutdown",
+            outcome=outcome,
+            transport_safe=bool(succeeded),
+            context_exit_succeeded=None,
+        )
+        tracker.observe_cleanup_transport_outcome(
+            outcome,
+            actor="client_pool_shutdown",
+        )
+        tracker.finish_cleanup(
+            transport_safe=bool(succeeded),
+            context_exit_succeeded=None,
+            actor="client_pool_shutdown",
+        )

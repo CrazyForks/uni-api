@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import math
 import os
 from contextlib import suppress
+from datetime import datetime, timezone
 from time import time
 from typing import Any, Awaitable, Callable, Optional
 
@@ -15,9 +17,11 @@ from core.utils import safe_get
 from uni_api.admission import AdmissionRejected, get_request_admission_lease
 from uni_api.admission.json_parsing import parse_owned_json_value
 from uni_api.observability.spans import merge_timing_spans
+from uni_api.observability.responses_stream import safe_responses_event_type
 from uni_api.http_content import is_json_media_type
 from uni_api.serialization import json
 from uni_api.streaming.cleanup import call_cleanup_safely
+from uni_api.streaming.bounded_queue import ObservedStreamChunk
 from uni_api.streaming.error_text import bounded_stream_error_text
 from uni_api.streaming.sse import (
     DEFAULT_MAX_PENDING_BYTES,
@@ -31,6 +35,7 @@ AsyncCloseCallback = Callable[[dict[str, Any]], Awaitable[None]]
 _MAX_JSON_USAGE_TELEMETRY_BYTES = 64 * 1024
 _MAX_STATS_TEXT_BYTES = 64 * 1024
 _MAX_STATS_FIELD_BYTES = 4 * 1024
+_MAX_USAGE_COUNTER = (1 << 63) - 1
 _STATS_SNAPSHOT_FIELDS = frozenset(
     {
         "request_id",
@@ -96,6 +101,10 @@ class DownstreamWriteTimeout(TimeoutError):
 
 class DownstreamDisconnected(ConnectionError):
     """A socket-like error observed specifically while calling ASGI send."""
+
+
+class DownstreamSendError(RuntimeError):
+    """A non-disconnect exception raised at the downstream ASGI boundary."""
 
 
 def _positive_timeout_from_env(name: str, default: float) -> float:
@@ -299,6 +308,23 @@ class LoggingStreamingResponse(Response):
         self._finalized = False
         self._finalize_lock = asyncio.Lock()
         self._stream_task: Optional[asyncio.Task] = None
+        diagnostics = self.current_info.get("responses_stream_diagnostics")
+        if isinstance(diagnostics, dict):
+            diagnostics["downstream_usage_observer_status"] = "active"
+            diagnostics.setdefault("downstream_usage_object_seen", False)
+            diagnostics.setdefault("downstream_usage_counters_seen", False)
+            diagnostics.setdefault("downstream_usage_input_known", False)
+            diagnostics.setdefault("downstream_usage_output_known", False)
+            diagnostics.setdefault("downstream_usage_total_known", False)
+            diagnostics.setdefault("downstream_usage_seen", False)
+            diagnostics.setdefault("response_start_asgi_write_attempted", False)
+            diagnostics.setdefault("response_start_asgi_write_completed", False)
+            diagnostics.setdefault("downstream_final_body_attempted", False)
+            diagnostics.setdefault("downstream_final_body_completed", False)
+            diagnostics.setdefault(
+                "downstream_final_body_outcome",
+                "not_attempted",
+            )
 
         # Response(content=None) synthesizes Content-Length: 0. Remove only
         # that synthetic value for genuinely streaming bodies; preserve an
@@ -318,15 +344,36 @@ class LoggingStreamingResponse(Response):
         return self._trace_type is not None and isinstance(value, self._trace_type)
 
     @staticmethod
-    def _coerce_token_count(value: Any) -> int:
-        try:
-            return int(value or 0)
-        except Exception:
-            return 0
+    def _parse_usage_count(value: Any) -> tuple[int, bool]:
+        if isinstance(value, bool):
+            return 0, False
+        if isinstance(value, int):
+            return (value, 0 <= value <= _MAX_USAGE_COUNTER)
+        if isinstance(value, float):
+            if (
+                math.isfinite(value)
+                and 0 <= value <= _MAX_USAGE_COUNTER
+                and value.is_integer()
+            ):
+                return int(value), True
+            return 0, False
+        if isinstance(value, str):
+            rendered = value.strip()
+            if rendered and len(rendered) <= 20 and rendered.isdigit():
+                try:
+                    parsed = int(rendered)
+                except (ValueError, OverflowError):
+                    return 0, False
+                if parsed <= _MAX_USAGE_COUNTER:
+                    return parsed, True
+        return 0, False
 
     def _record_usage(self, usage_obj: Any) -> bool:
         if not isinstance(usage_obj, dict):
             return False
+        diagnostics = self.current_info.get("responses_stream_diagnostics")
+        if isinstance(diagnostics, dict):
+            diagnostics["downstream_usage_object_seen"] = True
         if not any(
             key in usage_obj
             for key in (
@@ -338,35 +385,112 @@ class LoggingStreamingResponse(Response):
             )
         ):
             return False
+        if isinstance(diagnostics, dict):
+            diagnostics["downstream_usage_counters_seen"] = True
 
-        prompt_tokens = usage_obj.get("prompt_tokens")
-        completion_tokens = usage_obj.get("completion_tokens")
-        if prompt_tokens is None:
-            prompt_tokens = usage_obj.get("input_tokens")
-        if completion_tokens is None:
-            completion_tokens = usage_obj.get("output_tokens")
+        input_known = "prompt_tokens" in usage_obj or "input_tokens" in usage_obj
+        output_known = (
+            "completion_tokens" in usage_obj or "output_tokens" in usage_obj
+        )
+        explicit_total_known = "total_tokens" in usage_obj
+        total_known = explicit_total_known or (input_known and output_known)
 
-        prompt_tokens = self._coerce_token_count(prompt_tokens)
-        completion_tokens = self._coerce_token_count(completion_tokens)
-        total_tokens = usage_obj.get("total_tokens")
-        if total_tokens is None:
+        prompt_raw = (
+            usage_obj.get("prompt_tokens")
+            if "prompt_tokens" in usage_obj
+            else usage_obj.get("input_tokens")
+        )
+        completion_raw = (
+            usage_obj.get("completion_tokens")
+            if "completion_tokens" in usage_obj
+            else usage_obj.get("output_tokens")
+        )
+        prompt_tokens, prompt_valid = self._parse_usage_count(prompt_raw)
+        completion_tokens, completion_valid = self._parse_usage_count(
+            completion_raw
+        )
+        if explicit_total_known:
+            total_tokens, total_valid = self._parse_usage_count(
+                usage_obj.get("total_tokens")
+            )
+        elif input_known and output_known and prompt_valid and completion_valid:
             total_tokens = prompt_tokens + completion_tokens
+            total_valid = True
         else:
-            total_tokens = self._coerce_token_count(total_tokens)
+            total_tokens = 0
+            total_valid = False
 
-        self.current_info["prompt_tokens"] = prompt_tokens
-        self.current_info["completion_tokens"] = completion_tokens
-        self.current_info["total_tokens"] = total_tokens
+        observed_values_valid = all(
+            self._parse_usage_count(usage_obj[field])[1]
+            for field in (
+                "prompt_tokens",
+                "input_tokens",
+                "completion_tokens",
+                "output_tokens",
+                "total_tokens",
+            )
+            if field in usage_obj
+        )
+        values_valid = (
+            observed_values_valid
+            and (not input_known or prompt_valid)
+            and (not output_known or completion_valid)
+            and (not total_known or total_valid)
+        )
+        alias_consistent = True
+        for first, second in (
+            ("prompt_tokens", "input_tokens"),
+            ("completion_tokens", "output_tokens"),
+        ):
+            if first in usage_obj and second in usage_obj:
+                first_value, first_valid = self._parse_usage_count(
+                    usage_obj[first]
+                )
+                second_value, second_valid = self._parse_usage_count(
+                    usage_obj[second]
+                )
+                alias_consistent = alias_consistent and (
+                    first_valid
+                    and second_valid
+                    and first_value == second_value
+                )
+        if isinstance(diagnostics, dict):
+            diagnostics["downstream_usage_input_known"] = input_known
+            diagnostics["downstream_usage_output_known"] = output_known
+            diagnostics["downstream_usage_total_known"] = total_known
+            diagnostics["downstream_usage_values_valid"] = values_valid
+            diagnostics["downstream_usage_alias_consistent"] = alias_consistent
+        if not values_valid:
+            self.current_info["usage_parse_error"] = "invalid_usage_counter"
+            return False
+        if not alias_consistent:
+            self.current_info["usage_parse_error"] = "conflicting_usage_aliases"
+            return False
+
+        if input_known:
+            self.current_info["prompt_tokens"] = prompt_tokens
+        if output_known:
+            self.current_info["completion_tokens"] = completion_tokens
+        if total_known:
+            self.current_info["total_tokens"] = total_tokens
+        if not (input_known and output_known and total_known):
+            if isinstance(diagnostics, dict):
+                diagnostics["downstream_usage_completeness"] = "incomplete"
+            return False
+        self.current_info["usage_seen"] = True
+        if isinstance(diagnostics, dict):
+            diagnostics["downstream_usage_seen"] = True
+            diagnostics["downstream_usage_completeness"] = "complete"
         return True
 
     def _record_usage_from_payload(self, payload: Any) -> bool:
         if not isinstance(payload, dict):
             return False
-        usage_obj = (
-            payload.get("usage")
-            or safe_get(payload, "response", "usage", default=None)
-            or safe_get(payload, "message", "usage", default=None)
-        )
+        usage_obj = payload.get("usage")
+        if not isinstance(usage_obj, dict):
+            usage_obj = safe_get(payload, "response", "usage", default=None)
+        if not isinstance(usage_obj, dict):
+            usage_obj = safe_get(payload, "message", "usage", default=None)
         return self._record_usage(usage_obj)
 
     async def _record_usage_from_data(self, data: str) -> bool:
@@ -421,11 +545,46 @@ class LoggingStreamingResponse(Response):
         self._usage_json_buffer.clear()
         await self._release_usage_json_reservation()
         self.current_info["usage_parse_error"] = type(exc).__name__
+        diagnostics = self.current_info.get("responses_stream_diagnostics")
+        if isinstance(diagnostics, dict):
+            diagnostics["downstream_usage_observer_status"] = "disabled"
+            diagnostics["downstream_usage_observer_error_type"] = type(exc).__name__
         logger.warning(
             "Disabled bounded streaming usage parser: %s: %s",
             type(exc).__name__,
             exc,
         )
+
+    def _record_downstream_sse_event_sent(
+        self,
+        event_type: str | None,
+        *,
+        semantic_outcome: str | None,
+    ) -> None:
+        if not event_type and not semantic_outcome:
+            return
+        diagnostics = self.current_info.get("responses_stream_diagnostics")
+        if not isinstance(diagnostics, dict):
+            return
+        if event_type:
+            event_type = safe_responses_event_type(event_type)
+            diagnostics["downstream_declared_terminal_type"] = event_type
+        if semantic_outcome == "completed":
+            diagnostics["downstream_terminal_seen"] = True
+            diagnostics["downstream_semantic_status"] = "completed"
+        elif semantic_outcome == "incomplete":
+            diagnostics["downstream_terminal_seen"] = True
+            diagnostics["downstream_semantic_status"] = "incomplete"
+        elif semantic_outcome == "failed":
+            diagnostics["downstream_terminal_seen"] = True
+            diagnostics["downstream_semantic_status"] = "failed"
+        if event_type == "error" or semantic_outcome == "error":
+            diagnostics["error_event_seen"] = True
+        if diagnostics.get("downstream_terminal_seen") or semantic_outcome == "error":
+            diagnostics["downstream_terminal_asgi_write_completed"] = True
+            diagnostics["downstream_terminal_asgi_write_completed_at"] = (
+                datetime.now(timezone.utc).isoformat()
+            )
 
     async def _observe_usage_chunk(self, chunk: bytes) -> None:
         if self._usage_parser_disabled:
@@ -476,6 +635,7 @@ class LoggingStreamingResponse(Response):
             # started.  Treat that lifecycle race exactly like a telemetry
             # budget rejection instead of truncating a committed response.
             await self._disable_usage_parser(exc)
+        return
 
     async def _finish_usage_observation(self) -> None:
         if self._usage_parser_disabled:
@@ -491,6 +651,12 @@ class LoggingStreamingResponse(Response):
                 RuntimeError,
             ) as exc:
                 await self._disable_usage_parser(exc)
+            else:
+                diagnostics = self.current_info.get(
+                    "responses_stream_diagnostics"
+                )
+                if isinstance(diagnostics, dict):
+                    diagnostics["downstream_usage_observer_status"] = "completed"
             return
         if self._usage_json_buffer:
             data = None
@@ -504,6 +670,9 @@ class LoggingStreamingResponse(Response):
                 data = None
                 self._usage_json_buffer.clear()
                 await self._release_usage_json_reservation()
+        diagnostics = self.current_info.get("responses_stream_diagnostics")
+        if isinstance(diagnostics, dict) and not self._usage_parser_disabled:
+            diagnostics["downstream_usage_observer_status"] = "completed"
 
     async def _listen_for_disconnect(self, receive: Receive) -> None:
         if self._disconnect_event is not None:
@@ -565,6 +734,36 @@ class LoggingStreamingResponse(Response):
         self.current_info["stream_error_after_response_start"] = bool(
             self.current_info.get("response_committed")
         )
+        diagnostics = self.current_info.get("responses_stream_diagnostics")
+        if isinstance(diagnostics, dict):
+            if diagnostics.get("downstream_usage_observer_status") == "aborted":
+                diagnostics["downstream_usage_observer_abort_reason"] = outcome
+            diagnosis_by_outcome = {
+                "downstream_disconnected": "responses_downstream_disconnect",
+                "downstream_write_timeout": "responses_downstream_write_timeout",
+                "downstream_send_error": "responses_downstream_send_error",
+            }
+            diagnosis = diagnosis_by_outcome.get(outcome)
+            if diagnosis:
+                diagnostics["diagnosis"] = diagnosis
+                diagnostics["failure_stage"] = "downstream"
+                diagnostics["downstream_failure_outcome"] = outcome
+                diagnostics["downstream_failure_at"] = datetime.now(
+                    timezone.utc
+                ).isoformat()
+            if not self.current_info.get("response_committed"):
+                diagnostics["response_start_asgi_write_completed"] = False
+                diagnostics["response_start_asgi_write_outcome"] = outcome
+                diagnostics["response_start_asgi_write_error_type"] = (
+                    type(error).__name__
+                    if error is not None
+                    else "DownstreamDisconnected"
+                    if downstream_disconnected
+                    else "unknown"
+                )
+                diagnostics["response_start_asgi_write_error_at"] = (
+                    datetime.now(timezone.utc).isoformat()
+                )
 
     async def _send_sse_error(
         self,
@@ -608,6 +807,10 @@ class LoggingStreamingResponse(Response):
                 "more_body": True,
             },
         )
+        self._record_downstream_sse_event_sent(
+            "error",
+            semantic_outcome="error",
+        )
         self._wire_sse_boundary_known = True
         self._wire_sse_at_event_boundary = True
 
@@ -629,7 +832,7 @@ class LoggingStreamingResponse(Response):
             # proves that the downstream peer disappeared.
             if self._is_disconnect_error(exc):
                 raise DownstreamDisconnected(str(exc)) from exc
-            raise
+            raise DownstreamSendError(type(exc).__name__) from exc
 
     async def _stream_response_body(self, send: Send) -> None:
         try:
@@ -644,13 +847,37 @@ class LoggingStreamingResponse(Response):
                 parser.discard()
             self._usage_json_buffer.clear()
             await self._release_usage_json_reservation()
+            diagnostics = self.current_info.get(
+                "responses_stream_diagnostics"
+            )
+            if (
+                isinstance(diagnostics, dict)
+                and diagnostics.get("downstream_usage_observer_status")
+                == "active"
+            ):
+                diagnostics["downstream_usage_observer_status"] = "aborted"
+                diagnostics["downstream_usage_observer_abort_reason"] = str(
+                    self.current_info.get("stream_outcome")
+                    or "body_stream_terminated_before_observer_finish"
+                )
+                diagnostics["downstream_usage_observer_aborted_at"] = (
+                    datetime.now(timezone.utc).isoformat()
+                )
 
     async def _stream_response_body_inner(self, send: Send) -> None:
         async for chunk in self.body_iterator:
             segment = None
             text = None
+            observed_event_type = None
+            observed_semantic_outcome = None
+            observed_final_event_segment = False
             try:
                 self._mark_first_byte_observed(self.current_info)
+                if isinstance(chunk, ObservedStreamChunk):
+                    observed_event_type = chunk.event_type
+                    observed_semantic_outcome = chunk.semantic_outcome
+                    observed_final_event_segment = chunk.final_event_segment
+                    chunk = chunk.data
                 if isinstance(chunk, str):
                     chunk = chunk.encode("utf-8")
                 elif isinstance(chunk, memoryview):
@@ -698,6 +925,14 @@ class LoggingStreamingResponse(Response):
                             "more_body": True,
                         },
                     )
+                    if (
+                        observed_final_event_segment
+                        and offset + len(segment) >= len(chunk)
+                    ):
+                        self._record_downstream_sse_event_sent(
+                            observed_event_type,
+                            semantic_outcome=observed_semantic_outcome,
+                        )
                     if self._is_sse_response:
                         if candidate_sse_boundary is None:
                             self._wire_sse_boundary_known = False
@@ -715,6 +950,9 @@ class LoggingStreamingResponse(Response):
                 segment = None
                 text = None
                 chunk = None
+                observed_event_type = None
+                observed_semantic_outcome = None
+                observed_final_event_segment = False
         await self._finish_usage_observation()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -733,6 +971,12 @@ class LoggingStreamingResponse(Response):
         pending_cancel: asyncio.CancelledError | None = None
         disconnect_listener: Optional[asyncio.Task] = None
         try:
+            diagnostics = self.current_info.get("responses_stream_diagnostics")
+            if isinstance(diagnostics, dict):
+                diagnostics["response_start_asgi_write_attempted"] = True
+                diagnostics["response_start_asgi_write_attempted_at"] = (
+                    datetime.now(timezone.utc).isoformat()
+                )
             await self._send_with_deadline(
                 send,
                 {
@@ -743,6 +987,11 @@ class LoggingStreamingResponse(Response):
             )
             started = True
             self.current_info["response_committed"] = True
+            if isinstance(diagnostics, dict):
+                diagnostics["response_start_asgi_write_completed"] = True
+                diagnostics["response_start_asgi_write_completed_at"] = (
+                    datetime.now(timezone.utc).isoformat()
+                )
             self._stream_task = asyncio.create_task(self._stream_response_body(send))
 
             # BaseHTTPMiddleware supplies a receive wrapper that may itself
@@ -799,6 +1048,19 @@ class LoggingStreamingResponse(Response):
             self._record_stream_failure(
                 outcome="downstream_disconnected",
                 downstream_disconnected=True,
+            )
+        except DownstreamSendError as exc:
+            should_send_final_body = False
+            self.current_info["sse_error_event_suppressed"] = (
+                "downstream_send_failed_boundary_unknown"
+            )
+            self._record_stream_failure(
+                outcome="downstream_send_error",
+                error=exc,
+            )
+            logger.warning(
+                "Streaming response downstream send failed: %s",
+                bounded_stream_error_text(exc),
             )
         except Exception as exc:
             disconnected = bool(
@@ -859,6 +1121,15 @@ class LoggingStreamingResponse(Response):
             pending_cancel = pending_cancel or cleanup_cancel
 
             if started and should_send_final_body:
+                diagnostics = self.current_info.get(
+                    "responses_stream_diagnostics"
+                )
+                if isinstance(diagnostics, dict):
+                    diagnostics["downstream_final_body_attempted"] = True
+                    diagnostics["downstream_final_body_outcome"] = "attempting"
+                    diagnostics["downstream_final_body_attempted_at"] = (
+                        datetime.now(timezone.utc).isoformat()
+                    )
                 try:
                     await self._send_with_deadline(
                         send,
@@ -868,29 +1139,86 @@ class LoggingStreamingResponse(Response):
                             "more_body": False,
                         },
                     )
+                    if isinstance(diagnostics, dict):
+                        diagnostics["downstream_final_body_completed"] = True
+                        diagnostics["downstream_final_body_outcome"] = "completed"
+                        diagnostics["downstream_final_body_completed_at"] = (
+                            datetime.now(timezone.utc).isoformat()
+                        )
                 except asyncio.CancelledError as exc:
                     pending_cancel = pending_cancel or exc
                     self._record_stream_failure(outcome="cancelled", error=exc)
+                    if isinstance(diagnostics, dict):
+                        diagnostics["downstream_final_body_error_type"] = type(
+                            exc
+                        ).__name__
+                        diagnostics["downstream_final_body_outcome"] = "cancelled"
+                        diagnostics["downstream_final_body_error_at"] = (
+                            datetime.now(timezone.utc).isoformat()
+                        )
                 except DownstreamWriteTimeout as exc:
                     self._record_stream_failure(
                         outcome="downstream_write_timeout",
                         error=exc,
                     )
+                    if isinstance(diagnostics, dict):
+                        diagnostics["downstream_final_body_error_type"] = type(
+                            exc
+                        ).__name__
+                        diagnostics["downstream_final_body_outcome"] = (
+                            "downstream_write_timeout"
+                        )
+                        diagnostics["downstream_final_body_error_at"] = (
+                            datetime.now(timezone.utc).isoformat()
+                        )
                     logger.warning("Final downstream streaming write timed out")
                 except DownstreamDisconnected:
                     self._record_stream_failure(
                         outcome="downstream_disconnected",
                         downstream_disconnected=True,
                     )
+                    if isinstance(diagnostics, dict):
+                        diagnostics["downstream_final_body_error_type"] = (
+                            "DownstreamDisconnected"
+                        )
+                        diagnostics["downstream_final_body_outcome"] = (
+                            "downstream_disconnected"
+                        )
+                        diagnostics["downstream_final_body_error_at"] = (
+                            datetime.now(timezone.utc).isoformat()
+                        )
                     logger.warning("Final downstream streaming peer disconnected")
-                except Exception as exc:
+                except DownstreamSendError as exc:
                     self._record_stream_failure(
                         outcome="downstream_send_error",
                         error=exc,
                     )
+                    if isinstance(diagnostics, dict):
+                        diagnostics["downstream_final_body_error_type"] = type(
+                            exc
+                        ).__name__
+                        diagnostics["downstream_final_body_outcome"] = (
+                            "downstream_send_error"
+                        )
+                        diagnostics["downstream_final_body_error_at"] = (
+                            datetime.now(timezone.utc).isoformat()
+                        )
                     logger.warning(
                         "Error sending final streaming response body: %s",
                         bounded_stream_error_text(exc),
+                    )
+            else:
+                diagnostics = self.current_info.get(
+                    "responses_stream_diagnostics"
+                )
+                if isinstance(diagnostics, dict):
+                    diagnostics["downstream_final_body_skip_reason"] = (
+                        "response_start_not_completed"
+                        if not started
+                        else str(
+                            self.current_info.get("stream_outcome")
+                            or "prior_stream_failure"
+                        )
                     )
 
             finalize_cancel = await self._finalize_once()

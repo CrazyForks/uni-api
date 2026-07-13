@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 from core.log_config import logger
 from uni_api.admission import get_request_admission_lease
@@ -553,8 +553,30 @@ async def _abort_bound_response_lease_safely(
     return True
 
 
-async def force_close_response_httpcore_stream_chain_safely(response: Any | None, *, label: str) -> bool:
+async def force_close_response_httpcore_stream_chain_safely(
+    response: Any | None,
+    *,
+    label: str,
+    outcome_sink: Callable[[dict[str, Any]], None] | None = None,
+) -> bool:
+    def emit_outcome(**values: Any) -> None:
+        if outcome_sink is None:
+            return
+        try:
+            outcome_sink(values)
+        except Exception:
+            # Cleanup observability must never change transport safety.
+            logger.warning("%s cleanup outcome observer failed", label, exc_info=True)
+
     if response is None:
+        emit_outcome(
+            method="no_response",
+            cooperative_close_started=False,
+            cooperative_close_completed=False,
+            transport_evicted=False,
+            transport_isolated=False,
+            detached_cleanup=False,
+        )
         return True
 
     response_aclose = getattr(response, "aclose", None)
@@ -572,6 +594,8 @@ async def force_close_response_httpcore_stream_chain_safely(response: Any | None
         current = getattr(current, "_stream", None)
 
     close_task: asyncio.Task[Any] | None = None
+    cooperative_close_started = False
+    cooperative_close_completed = False
     if callable(response_aclose):
         try:
             close_result = response_aclose()
@@ -584,6 +608,7 @@ async def force_close_response_httpcore_stream_chain_safely(response: Any | None
         else:
             if hasattr(close_result, "__await__"):
                 close_task = asyncio.ensure_future(close_result)
+                cooperative_close_started = True
 
     cooperative_failed = False
     if close_task is not None and await _wait_cleanup_task_bounded(
@@ -592,6 +617,15 @@ async def force_close_response_httpcore_stream_chain_safely(response: Any | None
         label=label,
     ):
         if _cleanup_task_result(close_task, label=label):
+            cooperative_close_completed = True
+            emit_outcome(
+                method="cooperative_response_aclose",
+                cooperative_close_started=cooperative_close_started,
+                cooperative_close_completed=True,
+                transport_evicted=False,
+                transport_isolated=False,
+                detached_cleanup=False,
+            )
             return True
         cooperative_failed = True
         close_task = None
@@ -653,8 +687,21 @@ async def force_close_response_httpcore_stream_chain_safely(response: Any | None
                 label=label,
                 transport_isolated=evicted_any,
             )
+            emit_outcome(
+                method="pool_eviction_after_cooperative_timeout"
+                if evicted_any
+                else "cooperative_timeout_unisolated",
+                cooperative_close_started=cooperative_close_started,
+                cooperative_close_completed=False,
+                transport_evicted=evicted_any,
+                transport_isolated=evicted_any,
+                detached_cleanup=detached,
+            )
             return bool(evicted_any and detached)
-        cleanup_ok = _cleanup_task_result(close_task, label=label) and cleanup_ok
+        cooperative_close_completed = _cleanup_task_result(
+            close_task, label=label
+        )
+        cleanup_ok = cooperative_close_completed and cleanup_ok
     elif not evicted_any:
         # There was neither a cooperative close nor an identifiable pool
         # request.  Report failure rather than claiming the lease is safe.
@@ -662,7 +709,22 @@ async def force_close_response_httpcore_stream_chain_safely(response: Any | None
     # The return value describes transport safety, not whether every best-
     # effort close coroutine exited cleanly.  An evicted pool request cannot
     # be reused even while its bounded cleanup supervisor is still running.
-    return bool(evicted_any or cleanup_ok)
+    transport_safe = bool(evicted_any or cleanup_ok)
+    emit_outcome(
+        method="pool_eviction"
+        if evicted_any
+        else (
+            "cooperative_response_aclose"
+            if cooperative_close_started
+            else "no_identifiable_close"
+        ),
+        cooperative_close_started=cooperative_close_started,
+        cooperative_close_completed=cooperative_close_completed,
+        transport_evicted=evicted_any,
+        transport_isolated=evicted_any,
+        detached_cleanup=False,
+    )
+    return transport_safe
 
 
 async def yield_from_stream(stream: AsyncIterator[Any], *, label: str) -> AsyncIterator[Any]:

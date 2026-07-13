@@ -359,6 +359,44 @@ class StreamQueueItemLease:
 class ReservedStreamChunk:
     data: bytes
     reservation: RetainedByteLease
+    event_type: str | None = None
+    semantic_outcome: str | None = None
+
+
+class ObservedStreamChunk(bytes):
+    """Bytes plus bounded protocol metadata carried through ASGI unchanged.
+
+    Starlette's ``StreamingResponse`` encodes every yielded object that is not
+    already ``bytes``/``memoryview``.  Keeping the metadata on a real bytes
+    subclass therefore preserves both the normal wire contract and the
+    terminal-event acknowledgement while the chunk crosses
+    ``BaseHTTPMiddleware``'s in-memory ASGI channel.
+    """
+
+    event_type: str | None
+    semantic_outcome: str | None
+    final_event_segment: bool
+
+    def __new__(
+        cls,
+        data: bytes | bytearray | memoryview,
+        event_type: str | None = None,
+        semantic_outcome: str | None = None,
+        final_event_segment: bool = True,
+    ) -> "ObservedStreamChunk":
+        value = super().__new__(cls, data)
+        value.event_type = event_type
+        value.semantic_outcome = semantic_outcome
+        value.final_event_segment = bool(final_event_segment)
+        return value
+
+    @property
+    def data(self) -> bytes:
+        return self
+
+    @property
+    def body(self) -> bytes:
+        return self
 
 
 class ReservedChunkBuffer:

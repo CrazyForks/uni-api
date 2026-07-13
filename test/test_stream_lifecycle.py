@@ -1198,8 +1198,10 @@ def test_failed_body_send_marks_sse_boundary_unknown_before_error_recovery():
         assert nonempty_attempts == 1
         assert b"event: error" not in wire
         assert current_info["sse_error_event_suppressed"] == (
-            "partial_or_unknown_frame_boundary"
+            "downstream_send_failed_boundary_unknown"
         )
+        assert current_info["stream_outcome"] == "downstream_send_error"
+        assert current_info["error_type"] == "DownstreamSendError"
         assert current_info.get("downstream_disconnected") is not True
 
     asyncio.run(scenario())
@@ -1936,5 +1938,136 @@ def test_stats_stream_context_lives_through_body_then_restores_outer_context():
                 # Preserve isolation if an assertion exposes a lifecycle bug.
                 set_request_info(sentinel)
             reset_request_info(outer_token)
+
+    asyncio.run(scenario())
+
+
+def test_responses_generic_postcommit_error_is_observed_before_base_http_eof(
+    monkeypatch,
+):
+    """A local iterator bug must not become a clean, terminal-free HTTP 200."""
+
+    from fastapi import BackgroundTasks
+
+    import main
+    from core.models import ResponsesRequest
+    from test.test_responses_retry import (
+        DummyClientManager,
+        DummyStreamingUpstreamResponse,
+        _configure_responses_test,
+        _responses_sse,
+    )
+
+    async def scenario():
+        _configure_responses_test(monkeypatch, engine="codex")
+        main.app.state.client_manager = DummyClientManager(
+            DummyStreamingUpstreamResponse(
+                chunks=[
+                    _responses_sse(
+                        "response.created",
+                        {"type": "response.created"},
+                    ),
+                    _responses_sse(
+                        "response.output_text.delta",
+                        {
+                            "type": "response.output_text.delta",
+                            "delta": "partial",
+                        },
+                    ),
+                ],
+                stream_error=RuntimeError("unexpected postcommit iterator failure"),
+            )
+        )
+
+        emitted = []
+        updated = []
+        gauges = _Gauges()
+
+        async def parse_request_body(request):
+            await request.body()
+            return {}
+
+        async def monitor_disconnect(_request, disconnect_event):
+            await disconnect_event.wait()
+
+        async def inner_app(scope, receive, send):
+            current_info = get_request_info()
+            response = await main.ResponsesRequestHandler().request_responses(
+                http_request=SimpleNamespace(
+                    headers={},
+                    state=SimpleNamespace(uni_api_request_info=current_info),
+                ),
+                request_data=ResponsesRequest(
+                    model="gpt-5.4",
+                    input=[{"role": "user", "content": "hello"}],
+                    stream=True,
+                ),
+                api_index=0,
+                background_tasks=BackgroundTasks(),
+                endpoint="/v1/responses",
+            )
+            await response(scope, receive, send)
+
+        app = StatsMiddleware(
+            inner_app,
+            dependencies=_stats_dependencies(
+                gauges,
+                parse_request_body=parse_request_body,
+                monitor_disconnect=monitor_disconnect,
+                emitted=emitted,
+                updated=updated,
+            ),
+        )
+        scope = _scope(method="POST", path="/v1/responses")
+        scope["headers"] = [
+            (b"authorization", b"Bearer token"),
+            (b"content-type", b"application/json"),
+        ]
+        receive_queue = asyncio.Queue()
+        await receive_queue.put(
+            {"type": "http.request", "body": b"{}", "more_body": False}
+        )
+        sent = []
+
+        async def receive():
+            return await receive_queue.get()
+
+        async def send(message):
+            sent.append(dict(message))
+
+        await asyncio.wait_for(app(scope, receive, send), timeout=3)
+
+        body = b"".join(
+            message.get("body", b"")
+            for message in sent
+            if message["type"] == "http.response.body"
+        )
+        assert b"response.output_text.delta" in body
+        assert b"event: error" in body
+        assert b"unexpected postcommit iterator failure" in body
+        assert b"data: [DONE]" in body
+
+        assert gauges.active == 0
+        assert gauges.begin_calls == 1
+        assert gauges.end_calls == 1
+        assert len(emitted) == 1
+        assert len(updated) == 1
+
+        current_info = emitted[0]
+        assert current_info["wire_status_code"] == 200
+        assert current_info["response_committed"] is True
+        assert current_info["stream_outcome"] == "upstream_stream_abort"
+        assert current_info["error_type"] == "RuntimeError"
+        assert current_info["success"] is False
+
+        diagnostics = current_info["responses_stream_diagnostics"]
+        assert diagnostics["diagnosis"] == "responses_stream_error"
+        assert diagnostics["semantic_status"] == "error"
+        assert diagnostics["failure_stage"] == "postcommit"
+        assert diagnostics["exception_type"] == "RuntimeError"
+        assert diagnostics["error_event_seen"] is True
+        assert diagnostics["downstream_terminal_seen"] is False
+        assert diagnostics["downstream_terminal_asgi_write_completed"] is True
+        assert diagnostics["downstream_final_body_outcome"] == "completed"
 
     asyncio.run(scenario())

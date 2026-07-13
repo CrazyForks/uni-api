@@ -1,8 +1,11 @@
 import json
 import re
+import asyncio
 
 import main
 from fugue_observability import (
+    FugueObservabilityClient,
+    FugueObservabilityConfig,
     build_uni_api_ember_request_telemetry,
     fugue_observability_config_from_env,
 )
@@ -32,6 +35,8 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
             "role": "sk-test",
             "stream": True,
             "status_code": 200,
+            "wire_status_code": 200,
+            "response_committed": True,
             "process_time": 1.25,
             "api_key": "sk-secret-api-key",
             "text": "this is request body content",
@@ -94,8 +99,84 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
                     "success": False,
                     "error_type": "ReadTimeout",
                     "error_message": "Bearer ember-secret-token",
+                    "stream_diagnostics": {
+                        "semantic_status": "error",
+                        "diagnosis": "responses_partial_event_abort",
+                        "failure_stage": "postcommit",
+                        "oaix_connection_id": "oaixc-observe-1",
+                        "http_version": "HTTP/2",
+                        "httpcore_stream_id": 17,
+                        "explicit_proxy_configured": False,
+                        "transport_local_endpoint_hmac": "a" * 64,
+                        "transport_peer_endpoint_hmac": "b" * 64,
+                        "transport_four_tuple_hmac": "c" * 64,
+                        "transport_socket_hmac": "d" * 64,
+                        "upstream_body_bytes": 4096,
+                        "upstream_chunk_count": 8,
+                        "complete_event_count": 5,
+                        "last_event_type": "response.output_text.delta",
+                        "last_event_ordinal": 5,
+                        "last_event_bytes": 128,
+                        "last_event_sha256": "e" * 64,
+                        "partial_event_bytes": 77,
+                        "partial_event_sha256": "f" * 64,
+                        "hash_scope": "ember_normalized_sse_event_lf_v1",
+                        "partial_hash_scope": "normalized_prefix_plus_utf8_tail_v1",
+                        "upstream_eof_seen": False,
+                        "upstream_terminal_seen": False,
+                        "upstream_terminal_validated": False,
+                        "downstream_terminal_seen": False,
+                        "downstream_terminal_asgi_write_completed": False,
+                        "error_event_seen": True,
+                        "usage_seen": False,
+                        "exception_type": "ReadError",
+                        "exception_origin": "postcommit_stream",
+                        "exception_errno": 104,
+                        "exception_errno_name": "ECONNRESET",
+                        "exception_chain_depth": 3,
+                        "exception_chain_truncated": False,
+                        "exception_chain": [
+                            {"type": "ReadError", "relation": "raised"},
+                            {"type": "ReadError", "relation": "cause"},
+                            {
+                                "type": "ConnectionResetError",
+                                "relation": "cause",
+                                "errno": 104,
+                            },
+                        ],
+                        "cleanup_owner": "responses_proxy_finally",
+                        "cleanup_trigger": "after_upstream_read_or_stream_failure",
+                        "cleanup_method": "cooperative_response_aclose",
+                        "cleanup_result": "succeeded",
+                        "cleanup_transport_evicted": False,
+                        "cleanup_transport_safe": True,
+                    },
                 }
             ],
+            "responses_stream_diagnostics": {
+                "semantic_status": "error",
+                "diagnosis": "responses_partial_event_abort",
+                "failure_stage": "postcommit",
+                "oaix_connection_id": "oaixc-observe-1",
+                "upstream_body_bytes": 4096,
+                "upstream_chunk_count": 8,
+                "last_event_type": "response.output_text.delta",
+                "last_event_ordinal": 5,
+                "last_event_bytes": 128,
+                "last_event_sha256": "e" * 64,
+                "partial_event_bytes": 77,
+                "partial_event_sha256": "f" * 64,
+                "hash_scope": "ember_normalized_sse_event_lf_v1",
+                "upstream_terminal_seen": False,
+                "upstream_terminal_validated": False,
+                "downstream_terminal_seen": False,
+                "downstream_terminal_asgi_write_completed": False,
+                "error_event_seen": True,
+                "usage_seen": False,
+                "exception_type": "ReadError",
+                "exception_origin": "postcommit_stream",
+                "cleanup_result": "succeeded",
+            },
         },
         runtime_metrics={
             "inflight_requests": 12,
@@ -139,6 +220,16 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
     assert log_event["app_id"] == "app_123"
     assert log_event["path"] == "/v1/responses"
     assert log_event["status_code"] == 200
+    summary = log_event["summary"]
+    assert summary["wire_status_code"] == "200"
+    assert summary["semantic_status"] == "error"
+    assert summary["upstream_terminal_seen"] == "false"
+    assert summary["upstream_terminal_validated"] == "false"
+    assert summary["downstream_terminal_seen"] == "false"
+    assert summary["usage_seen"] == "false"
+    assert summary["diagnosis"] == "responses_partial_event_abort"
+    assert summary["failure_stage"] == "postcommit"
+    assert summary["oaix_connection_id"] == "oaixc-observe-1"
     attempt_event = next(event for event in telemetry["logs"] if event["event"] == "upstream_attempt")
     attempt_attrs = attempt_event["attributes"]
     assert attempt_attrs["provider"] == "fugue-codex"
@@ -147,6 +238,15 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
     assert attempt_attrs["payload_bytes"] == "29658219"
     assert attempt_attrs["timeout_seconds"] == "120"
     assert attempt_attrs["timeout_adjusted_from_seconds"] == "20"
+    assert attempt_attrs["diagnosis"] == "responses_partial_event_abort"
+    assert attempt_attrs["failure_stage"] == "postcommit"
+    assert attempt_attrs["upstream_terminal_validated"] == "false"
+    assert attempt_attrs["oaix_connection_id"] == "oaixc-observe-1"
+    assert attempt_attrs["upstream_http_version"] == "HTTP/2"
+    assert attempt_attrs["exception_errno_name"] == "ECONNRESET"
+    assert attempt_attrs["exception_chain_depth"] == "3"
+    assert "ConnectionResetError" in attempt_attrs["exception_chain_json"]
+    assert attempt_attrs["cleanup_owner"] == "responses_proxy_finally"
 
     stages = {
         event["attributes"]["stage"]
@@ -256,6 +356,219 @@ def test_post_commit_stream_failure_keeps_wire_200_and_has_failure_metric():
     metrics = {event["metric"]: event["value"] for event in telemetry["metrics"]}
     assert metrics["uniapi_ember_exposed_5xx_total"] == 0
     assert metrics["uniapi_ember_stream_failures_total"] == 1
+
+
+def test_responses_diagnostics_are_exported_with_valid_bounded_json():
+    diagnostic = {
+        "schema_version": 1,
+        "semantic_status": "error",
+        "diagnosis": "responses_read_error",
+        "failure_stage": "upstream_headers",
+        "terminal_consistency_status": "inconsistent",
+        "terminal_semantics_consistent": False,
+        "terminal_semantics_inconsistency": ["declared_outcome_mismatch"],
+        "usage_object_seen": True,
+        "usage_counters_seen": True,
+        "usage_input_known": True,
+        "usage_output_known": False,
+        "usage_total_known": True,
+        "usage_values_valid": True,
+        "usage_seen": False,
+        "downstream_usage_object_seen": True,
+        "downstream_usage_counters_seen": True,
+        "downstream_usage_input_known": True,
+        "downstream_usage_output_known": False,
+        "downstream_usage_total_known": True,
+        "downstream_usage_values_valid": True,
+        "downstream_usage_seen": False,
+        "downstream_usage_observer_status": "completed",
+        "transport_error_code": "peer_closed_incomplete_chunked_body",
+        "transport_error_code_source": "known_message_pattern",
+        "transport_end_trigger": "httpcore_body_read_failure",
+        "response_start_asgi_write_attempted": True,
+        "response_start_asgi_write_completed": True,
+        "downstream_final_body_attempted": False,
+        "downstream_final_body_completed": False,
+        "cleanup_result": "incomplete",
+        "cleanup_failure": True,
+        "cleanup_failure_stage": "cleanup",
+        "cleanup_actions": [
+            {
+                "actor": "responses_proxy_finally",
+                "method": "cooperative_response_aclose",
+                "transport_safe": False,
+                "padding": "x" * 300,
+            }
+            for _ in range(32)
+        ],
+        "cleanup_actions_truncated": True,
+        "exception_chain": [
+            {
+                "relation": "cause",
+                "type": "RemoteProtocolError",
+                "message_sha256": "a" * 64,
+                "padding": "y" * 300,
+            }
+            for _ in range(32)
+        ],
+        "exception_chain_truncated": True,
+    }
+    telemetry = build_uni_api_ember_request_telemetry(
+        service_name="uni-api-ember",
+        service_version="test",
+        identity_attrs={"app_id": "app_123"},
+        current_info={
+            "endpoint": "POST /v1/responses",
+            "status_code": 200,
+            "wire_status_code": 200,
+            "response_committed": True,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "usage_parse_error": "missing_usage_components",
+            "responses_stream_diagnostics": diagnostic,
+            "upstream_attempts": [
+                {
+                    "index": 1,
+                    "status_code": 200,
+                    "stream_diagnostics": diagnostic,
+                }
+            ],
+        },
+    )
+
+    summary = telemetry["logs"][0]["summary"]
+    attempt = telemetry["logs"][1]["attributes"]
+    for attrs in (summary, attempt):
+        assert attrs["failure_stage"] == "precommit"
+        assert attrs["transport_error_code"] == (
+            "peer_closed_incomplete_chunked_body"
+        )
+        assert attrs["terminal_semantics_consistent"] == "false"
+        assert attrs["usage_input_known"] == "true"
+        assert attrs["usage_output_known"] == "false"
+        assert attrs["downstream_usage_output_known"] == "false"
+        assert attrs["cleanup_failure_stage"] == "cleanup"
+        for field in (
+            "terminal_semantics_inconsistency_json",
+            "exception_chain_json",
+            "cleanup_actions_json",
+        ):
+            json.loads(attrs[field])
+            assert len(attrs[field].encode("utf-8")) <= 4096
+        assert attrs["exception_chain_json_truncated"] == "true"
+        assert attrs["cleanup_actions_json_truncated"] == "true"
+        assert len(attrs["exception_chain_json_sha256"]) == 64
+
+    assert summary["response_committed"] == "true"
+    assert summary["prompt_tokens"] == "0"
+    assert "completion_tokens" not in summary
+    assert summary["total_tokens"] == "0"
+    assert summary["usage_parse_error"] == "missing_usage_components"
+
+
+def test_responses_summary_exports_real_known_zero_usage():
+    no_diagnostics = build_uni_api_ember_request_telemetry(
+        service_name="uni-api-ember",
+        service_version="test",
+        identity_attrs={"app_id": "app_123"},
+        current_info={
+            "endpoint": "POST /v1/responses",
+            "status_code": 200,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        },
+    )
+    no_diagnostics_summary = no_diagnostics["logs"][0]["summary"]
+    assert "prompt_tokens" not in no_diagnostics_summary
+    assert "completion_tokens" not in no_diagnostics_summary
+    assert "total_tokens" not in no_diagnostics_summary
+
+    unknown = build_uni_api_ember_request_telemetry(
+        service_name="uni-api-ember",
+        service_version="test",
+        identity_attrs={"app_id": "app_123"},
+        current_info={
+            "endpoint": "POST /v1/responses",
+            "status_code": 200,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "responses_stream_diagnostics": {
+                "downstream_usage_input_known": False,
+                "downstream_usage_output_known": False,
+                "downstream_usage_total_known": False,
+                "downstream_usage_seen": False,
+            },
+        },
+    )
+    unknown_summary = unknown["logs"][0]["summary"]
+    assert "prompt_tokens" not in unknown_summary
+    assert "completion_tokens" not in unknown_summary
+    assert "total_tokens" not in unknown_summary
+
+    telemetry = build_uni_api_ember_request_telemetry(
+        service_name="uni-api-ember",
+        service_version="test",
+        identity_attrs={"app_id": "app_123"},
+        current_info={
+            "endpoint": "POST /v1/responses",
+            "status_code": 200,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "responses_stream_diagnostics": {
+                "downstream_usage_input_known": True,
+                "downstream_usage_output_known": True,
+                "downstream_usage_total_known": True,
+                "downstream_usage_values_valid": True,
+                "downstream_usage_alias_consistent": True,
+                "downstream_usage_seen": True,
+            },
+        },
+    )
+
+    summary = telemetry["logs"][0]["summary"]
+    assert summary["prompt_tokens"] == "0"
+    assert summary["completion_tokens"] == "0"
+    assert summary["total_tokens"] == "0"
+
+
+def test_responses_request_summary_is_never_sampled_away():
+    client = FugueObservabilityClient(
+        FugueObservabilityConfig(
+            endpoint="https://observability.invalid",
+            sample_rate=0.0,
+        )
+    )
+    client._queue = asyncio.Queue(maxsize=10)
+
+    client.emit_request(
+        current_info={
+            "endpoint": "POST /v1/responses",
+            "status_code": 200,
+            "wire_status_code": 200,
+            "stream_outcome": "completed",
+            "responses_stream_diagnostics": {
+                "diagnosis": "responses_completed_with_usage",
+                "semantic_status": "completed",
+                "usage_seen": True,
+            },
+        }
+    )
+    assert client._queue.qsize() == 1
+
+    client._queue.get_nowait()
+    client._queue.task_done()
+    client.emit_request(
+        current_info={
+            "endpoint": "GET /healthz",
+            "status_code": 200,
+            "stream_outcome": "completed",
+        }
+    )
+    assert client._queue.qsize() == 0
 
 
 def test_traceparent_is_inherited_and_forwarded():

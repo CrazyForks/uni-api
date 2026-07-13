@@ -4,6 +4,7 @@ import json
 import pytest
 
 from uni_api.admission import RequestAdmissionController
+from uni_api.disconnect import DOWNSTREAM_DISCONNECT_EVENT_SCOPE_KEY
 from uni_api.middleware.admission import (
     ADMISSION_WAIT_MS_STATE_KEY,
     RESERVE_BODY_BYTES_STATE_KEY,
@@ -312,12 +313,81 @@ def test_same_turn_admission_and_disconnect_race_is_owned_by_disconnect():
     asyncio.run(run())
 
 
-def test_queued_prebuffer_limit_returns_structured_503_and_cleans_ownership():
+def test_queued_prebuffer_high_watermark_backpressures_then_replays_all_frames():
     async def run():
         controller = _controller(
             max_body_bytes=64,
             body_budget_bytes=64,
             wait_timeout_seconds=1,
+        )
+        holder = await controller.acquire()
+        sent = []
+        delivered = 0
+        app_started = asyncio.Event()
+        received_body = bytearray()
+
+        async def receive():
+            nonlocal delivered
+            delivered += 1
+            assert app_started.is_set() or delivered <= 16
+            return {
+                "type": "http.request",
+                "body": b"x",
+                "more_body": delivered < 32,
+            }
+
+        async def app(scope, replay_receive, send):
+            app_started.set()
+            reserve_body_bytes = scope["state"][RESERVE_BODY_BYTES_STATE_KEY]
+            while True:
+                message = await replay_receive()
+                body = message.get("body", b"") or b""
+                await reserve_body_bytes(len(body))
+                received_body.extend(body)
+                if not message.get("more_body", False):
+                    break
+            await send({"type": "http.response.start", "status": 204, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        async def send(message):
+            sent.append(message)
+
+        middleware = RequestAdmissionMiddleware(
+            app,
+            controller=controller,
+        )
+        request = asyncio.create_task(middleware(_scope(), receive, send))
+        await _wait_until(
+            lambda: controller.snapshot()["pending_body_reserved_bytes"] == 16
+        )
+
+        assert delivered == 16
+        assert request.done() is False
+        assert sent == []
+        assert controller.snapshot()["rejected"] == {}
+
+        await holder.release()
+        await request
+
+        snapshot = controller.snapshot()
+        assert delivered == 32
+        assert received_body == b"x" * 32
+        assert sent[0]["status"] == 204
+        assert snapshot["active"] == 0
+        assert snapshot["waiters"] == 0
+        assert snapshot["reserved_body_bytes"] == 0
+        assert snapshot["pending_body_reserved_bytes"] == 0
+        assert snapshot["rejected"] == {}
+
+    asyncio.run(run())
+
+
+def test_wait_timeout_while_prebuffer_backpressured_releases_pending_bytes():
+    async def run():
+        controller = _controller(
+            max_body_bytes=64,
+            body_budget_bytes=64,
+            wait_timeout_seconds=0.05,
         )
         holder = await controller.acquire()
         sent = []
@@ -345,13 +415,220 @@ def test_queued_prebuffer_limit_returns_structured_503_and_cleans_ownership():
         snapshot = controller.snapshot()
         assert delivered == 16
         assert status == 503
-        assert payload["error"]["code"] == "admission_prebuffer_full"
-        assert headers[b"x-uni-api-admission-reason"] == b"admission_prebuffer_full"
+        assert payload["error"]["code"] == "wait_timeout"
+        assert headers[b"x-uni-api-admission-reason"] == b"wait_timeout"
         assert snapshot["active"] == 1
         assert snapshot["waiters"] == 0
         assert snapshot["reserved_body_bytes"] == 0
         assert snapshot["pending_body_reserved_bytes"] == 0
+        assert snapshot["rejected"] == {"wait_timeout": 1}
         await holder.release()
+
+    asyncio.run(run())
+
+
+def test_queued_body_byte_budget_remains_the_rejection_boundary():
+    async def run():
+        controller = _controller(
+            max_body_bytes=64,
+            body_budget_bytes=8,
+            wait_timeout_seconds=1,
+        )
+        holder = await controller.acquire()
+        sent = []
+        messages = iter(
+            [
+                {
+                    "type": "http.request",
+                    "body": b"12345",
+                    "more_body": True,
+                },
+                {
+                    "type": "http.request",
+                    "body": b"6789",
+                    "more_body": True,
+                },
+            ]
+        )
+
+        async def receive():
+            return next(messages)
+
+        async def send(message):
+            sent.append(message)
+
+        middleware = RequestAdmissionMiddleware(
+            lambda scope, receive, send: None,
+            controller=controller,
+        )
+        await middleware(_scope(), receive, send)
+
+        status, payload, headers = _response(sent)
+        snapshot = controller.snapshot()
+        assert status == 503
+        assert payload["error"]["code"] == "body_budget_exhausted"
+        assert (
+            headers[b"x-uni-api-admission-reason"]
+            == b"body_budget_exhausted"
+        )
+        assert snapshot["active"] == 1
+        assert snapshot["waiters"] == 0
+        assert snapshot["reserved_body_bytes"] == 0
+        assert snapshot["pending_body_reserved_bytes"] == 0
+        assert snapshot["rejected"] == {"body_budget_exhausted": 1}
+        await holder.release()
+
+    asyncio.run(run())
+
+
+def test_cancellation_while_prebuffer_backpressured_releases_queued_ownership():
+    async def run():
+        controller = _controller(
+            max_body_bytes=64,
+            body_budget_bytes=64,
+            wait_timeout_seconds=1,
+        )
+        holder = await controller.acquire()
+        delivered = 0
+
+        async def receive():
+            nonlocal delivered
+            delivered += 1
+            return {
+                "type": "http.request",
+                "body": b"x",
+                "more_body": True,
+            }
+
+        middleware = RequestAdmissionMiddleware(
+            lambda scope, receive, send: None,
+            controller=controller,
+        )
+        request = asyncio.create_task(
+            middleware(_scope(), receive, lambda message: None)
+        )
+        await _wait_until(
+            lambda: controller.snapshot()["pending_body_reserved_bytes"] == 16
+        )
+
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+
+        snapshot = controller.snapshot()
+        assert delivered == 16
+        assert snapshot["active"] == 1
+        assert snapshot["waiters"] == 0
+        assert snapshot["reserved_body_bytes"] == 0
+        assert snapshot["pending_body_reserved_bytes"] == 0
+        assert snapshot["rejected"] == {}
+        await holder.release()
+
+    asyncio.run(run())
+
+
+def test_transport_disconnect_while_prebuffer_backpressured_releases_waiter():
+    async def run():
+        controller = _controller(
+            max_body_bytes=64,
+            body_budget_bytes=64,
+            wait_timeout_seconds=1,
+        )
+        holder = await controller.acquire()
+        delivered = 0
+        app_called = False
+        observed = []
+        disconnect_event = asyncio.Event()
+        scope = _scope()
+        scope["state"][DOWNSTREAM_DISCONNECT_EVENT_SCOPE_KEY] = disconnect_event
+
+        async def receive():
+            nonlocal delivered
+            delivered += 1
+            return {
+                "type": "http.request",
+                "body": b"x",
+                "more_body": True,
+            }
+
+        async def app(scope, receive, send):
+            nonlocal app_called
+            app_called = True
+
+        async def on_early(scope, status_code, reason):
+            observed.append((status_code, reason))
+
+        middleware = RequestAdmissionMiddleware(
+            app,
+            controller=controller,
+            on_early_response=on_early,
+        )
+        request = asyncio.create_task(
+            middleware(scope, receive, lambda message: None)
+        )
+        await _wait_until(
+            lambda: controller.snapshot()["pending_body_reserved_bytes"] == 16
+        )
+
+        disconnect_event.set()
+        await request
+
+        snapshot = controller.snapshot()
+        assert delivered == 16
+        assert app_called is False
+        assert observed == [(499, "disconnected_while_queued")]
+        assert snapshot["active"] == 1
+        assert snapshot["waiters"] == 0
+        assert snapshot["reserved_body_bytes"] == 0
+        assert snapshot["pending_body_reserved_bytes"] == 0
+        assert snapshot["rejected"] == {}
+        await holder.release()
+
+    asyncio.run(run())
+
+
+def test_same_turn_transport_disconnect_owns_a_queued_admission_grant():
+    async def run():
+        controller = _controller(
+            max_body_bytes=64,
+            body_budget_bytes=64,
+            wait_timeout_seconds=1,
+        )
+        holder = await controller.acquire()
+        disconnect_event = asyncio.Event()
+        scope = _scope()
+        scope["state"][DOWNSTREAM_DISCONNECT_EVENT_SCOPE_KEY] = disconnect_event
+        app_called = False
+
+        async def receive():
+            return {
+                "type": "http.request",
+                "body": b"x",
+                "more_body": True,
+            }
+
+        async def app(scope, receive, send):
+            nonlocal app_called
+            app_called = True
+
+        middleware = RequestAdmissionMiddleware(app, controller=controller)
+        request = asyncio.create_task(
+            middleware(scope, receive, lambda message: None)
+        )
+        await _wait_until(
+            lambda: controller.snapshot()["pending_body_reserved_bytes"] == 16
+        )
+
+        disconnect_event.set()
+        await holder.release()
+        await request
+
+        snapshot = controller.snapshot()
+        assert app_called is False
+        assert snapshot["active"] == 0
+        assert snapshot["waiters"] == 0
+        assert snapshot["reserved_body_bytes"] == 0
+        assert snapshot["pending_body_reserved_bytes"] == 0
 
     asyncio.run(run())
 
@@ -682,7 +959,7 @@ def test_repeated_cancel_cannot_interrupt_queued_ownership_transaction(
             controller=controller,
         )
         queued = asyncio.create_task(
-            middleware._acquire_queued_request(receive)
+            middleware._acquire_queued_request(_scope(), receive)
         )
         await _wait_until(
             lambda: controller.snapshot()["pending_body_reserved_bytes"] == 8

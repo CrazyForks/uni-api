@@ -17,6 +17,7 @@ from uni_api.admission import (
     reset_request_admission_lease,
 )
 from core.log_config import logger
+from uni_api.disconnect import DOWNSTREAM_DISCONNECT_EVENT_SCOPE_KEY
 from uni_api.middleware.request_decompression import (
     BODY_BYTES_RESERVATION_SCOPE_KEY,
     BODY_EARLY_RESPONSE_OBSERVER_SCOPE_KEY,
@@ -27,7 +28,7 @@ from uni_api.middleware.request_decompression import (
 RESERVE_BODY_BYTES_STATE_KEY = BODY_BYTES_RESERVATION_SCOPE_KEY
 ADMISSION_LEASE_STATE_KEY = "uni_api_admission_lease"
 ADMISSION_WAIT_MS_STATE_KEY = "uni_api_admission_wait_ms"
-ADMISSION_PREBUFFER_MAX_MESSAGES = 16
+ADMISSION_PREBUFFER_MESSAGE_HIGH_WATERMARK = 16
 
 
 async def _finish_ownership_cleanup(
@@ -111,7 +112,7 @@ class RequestAdmissionMiddleware:
                     replayed_messages,
                     handed_off_receive_task,
                     disconnected_while_queued,
-                ) = await self._acquire_queued_request(receive)
+                ) = await self._acquire_queued_request(scope, receive)
                 if disconnected_while_queued:
                     state = scope.setdefault("state", {})
                     state[ADMISSION_WAIT_MS_STATE_KEY] = (
@@ -227,6 +228,7 @@ class RequestAdmissionMiddleware:
 
     async def _acquire_queued_request(
         self,
+        scope: Scope,
         receive: Receive,
     ) -> tuple[
         Any,
@@ -242,6 +244,18 @@ class RequestAdmissionMiddleware:
         acquire_task = await self.controller.begin_acquire()
         receive_task: asyncio.Task[Message] | None = (
             None if acquire_task.done() else asyncio.create_task(receive())
+        )
+        state = scope.get("state")
+        disconnect_event = (
+            state.get(DOWNSTREAM_DISCONNECT_EVENT_SCOPE_KEY)
+            if isinstance(state, dict)
+            else None
+        )
+        disconnect_task: asyncio.Task[bool] | None = (
+            asyncio.create_task(disconnect_event.wait())
+            if isinstance(disconnect_event, asyncio.Event)
+            and not acquire_task.done()
+            else None
         )
         buffered: deque[tuple[Message, int]] = deque()
         pending = self.controller.pending_body_reservation()
@@ -260,8 +274,23 @@ class RequestAdmissionMiddleware:
                 return
             await granted_lease.release()
 
+        async def cancel_disconnect_observer(
+            task: asyncio.Task[bool],
+        ) -> None:
+            async def cancel_and_consume() -> None:
+                if not task.done():
+                    task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            cleanup_task = asyncio.create_task(cancel_and_consume())
+            await _finish_ownership_cleanup(cleanup_task)
+
         async def cleanup_queued_ownership(
             receive_to_cleanup: asyncio.Task[Message] | None,
+            disconnect_to_cleanup: asyncio.Task[bool] | None,
             known_lease: Any,
         ) -> None:
             """Release every queued owner even if an earlier step fails."""
@@ -277,21 +306,35 @@ class RequestAdmissionMiddleware:
                         pass
             finally:
                 try:
-                    await cancel_acquire_and_release_result()
+                    if disconnect_to_cleanup is not None:
+                        if not disconnect_to_cleanup.done():
+                            disconnect_to_cleanup.cancel()
+                        try:
+                            await disconnect_to_cleanup
+                        except (asyncio.CancelledError, Exception):
+                            pass
                 finally:
                     try:
-                        if known_lease is not None:
-                            await known_lease.release()
+                        await cancel_acquire_and_release_result()
                     finally:
-                        buffered.clear()
-                        await pending.release()
+                        try:
+                            if known_lease is not None:
+                                await known_lease.release()
+                        finally:
+                            buffered.clear()
+                            await pending.release()
 
         async def finish_queued_ownership_cleanup(
             receive_to_cleanup: asyncio.Task[Message] | None,
+            disconnect_to_cleanup: asyncio.Task[bool] | None,
             known_lease: Any,
         ) -> None:
             cleanup_task = asyncio.create_task(
-                cleanup_queued_ownership(receive_to_cleanup, known_lease)
+                cleanup_queued_ownership(
+                    receive_to_cleanup,
+                    disconnect_to_cleanup,
+                    known_lease,
+                )
             )
             await _finish_ownership_cleanup(cleanup_task)
 
@@ -300,10 +343,27 @@ class RequestAdmissionMiddleware:
                 wait_tasks: set[asyncio.Task[Any]] = {acquire_task}
                 if receive_task is not None:
                     wait_tasks.add(receive_task)
+                if disconnect_task is not None:
+                    wait_tasks.add(disconnect_task)
                 done, _ = await asyncio.wait(
                     wait_tasks,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
+
+                # A transport close owns a same-turn race with admission.  If
+                # the gate already granted, cleanup consumes and releases that
+                # lease before returning the disconnected outcome.
+                if disconnect_task is not None and disconnect_task in done:
+                    disconnected_wait = disconnect_task
+                    disconnect_task = None
+                    abandoned_receive = receive_task
+                    receive_task = None
+                    await finish_queued_ownership_cleanup(
+                        abandoned_receive,
+                        disconnected_wait,
+                        lease,
+                    )
+                    return None, buffered, None, True
 
                 if acquire_task in done:
                     lease = acquire_task.result()
@@ -315,8 +375,10 @@ class RequestAdmissionMiddleware:
                                 message = None
                                 await finish_queued_ownership_cleanup(
                                     None,
+                                    disconnect_task,
                                     lease,
                                 )
+                                disconnect_task = None
                                 lease = None
                                 return None, buffered, None, True
                             if not queued_body_complete:
@@ -327,6 +389,39 @@ class RequestAdmissionMiddleware:
                                 )
                             receive_task = None
                     await pending.transfer_to(lease)
+                    if (
+                        isinstance(disconnect_event, asyncio.Event)
+                        and disconnect_event.is_set()
+                    ):
+                        abandoned_receive = receive_task
+                        receive_task = None
+                        await finish_queued_ownership_cleanup(
+                            abandoned_receive,
+                            disconnect_task,
+                            lease,
+                        )
+                        disconnect_task = None
+                        lease = None
+                        return None, buffered, None, True
+                    if disconnect_task is not None:
+                        await cancel_disconnect_observer(disconnect_task)
+                        disconnect_task = None
+                    # Cancellation of event.wait() yields once.  Recheck the
+                    # transport-owned event so a close in that turn still owns
+                    # the admission race.
+                    if (
+                        isinstance(disconnect_event, asyncio.Event)
+                        and disconnect_event.is_set()
+                    ):
+                        abandoned_receive = receive_task
+                        receive_task = None
+                        await finish_queued_ownership_cleanup(
+                            abandoned_receive,
+                            None,
+                            lease,
+                        )
+                        lease = None
+                        return None, buffered, None, True
                     return lease, buffered, receive_task, False
 
                 assert receive_task is not None and receive_task in done
@@ -334,7 +429,12 @@ class RequestAdmissionMiddleware:
                 receive_task = None
                 if message.get("type") == "http.disconnect":
                     message = None
-                    await finish_queued_ownership_cleanup(None, lease)
+                    await finish_queued_ownership_cleanup(
+                        None,
+                        disconnect_task,
+                        lease,
+                    )
+                    disconnect_task = None
                     return None, buffered, None, True
 
                 if not queued_body_complete:
@@ -347,13 +447,18 @@ class RequestAdmissionMiddleware:
                 ):
                     queued_body_complete = True
                 if (
-                    len(buffered) >= ADMISSION_PREBUFFER_MAX_MESSAGES
-                    and message.get("more_body", False)
+                    not queued_body_complete
+                    and len(buffered)
+                    >= ADMISSION_PREBUFFER_MESSAGE_HIGH_WATERMARK
                 ):
-                    self.controller.record_rejection(
-                        "admission_prebuffer_full"
-                    )
-                    raise AdmissionRejected("admission_prebuffer_full")
+                    # ASGI body frame boundaries are transport details, not a
+                    # measure of request size or memory pressure.  Pause the
+                    # receive side at a bounded message high-water mark instead
+                    # of rejecting an otherwise valid request.  The queued
+                    # acquisition task still enforces its normal wait timeout;
+                    # once admitted, replay_receive drains these frames and
+                    # resumes the remaining body under the active lease.
+                    continue
                 # Even after the final body frame, keep exactly one receive
                 # pending so a peer that disconnects while still queued is
                 # observed before the application is admitted.
@@ -361,7 +466,13 @@ class RequestAdmissionMiddleware:
         except BaseException:
             abandoned_receive = receive_task
             receive_task = None
-            await finish_queued_ownership_cleanup(abandoned_receive, lease)
+            abandoned_disconnect = disconnect_task
+            disconnect_task = None
+            await finish_queued_ownership_cleanup(
+                abandoned_receive,
+                abandoned_disconnect,
+                lease,
+            )
             lease = None
             raise
 

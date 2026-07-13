@@ -6,6 +6,8 @@ from typing import Any
 
 from uvicorn.protocols.http.h11_impl import H11Protocol
 
+from uni_api.disconnect import DOWNSTREAM_DISCONNECT_EVENT_SCOPE_KEY
+
 
 @dataclass(slots=True)
 class BoundedHTTPProtocolStats:
@@ -54,11 +56,13 @@ def build_bounded_h11_protocol(
     class BoundedH11Protocol(H11Protocol):
         _header_timeout_handle: asyncio.TimerHandle | None
         _rejected_before_registration: bool
+        _downstream_disconnect_event: asyncio.Event | None
 
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
             self._header_timeout_handle = None
             self._rejected_before_registration = False
+            self._downstream_disconnect_event = None
 
         def connection_made(self, transport: asyncio.Transport) -> None:
             if len(self.connections) >= stats.connection_limit:
@@ -72,9 +76,33 @@ def build_bounded_h11_protocol(
 
         def connection_lost(self, exc: Exception | None) -> None:
             self._unset_header_timeout()
+            if (
+                self._downstream_disconnect_event is not None
+                and self.cycle is not None
+                and not self.cycle.response_complete
+            ):
+                self._downstream_disconnect_event.set()
             if self._rejected_before_registration:
                 return
             super().connection_lost(exc)
+
+        def handle_events(self) -> None:
+            previous_cycle = self.cycle
+            super().handle_events()
+            if self.cycle is previous_cycle:
+                return
+            scope = getattr(self.cycle, "scope", None)
+            if not isinstance(scope, dict):
+                return
+            state = scope.get("state")
+            if not isinstance(state, dict):
+                return
+            # Install the transport-owned signal before the newly-created
+            # ASGI task can run.  Admission can then stop consuming request
+            # frames for backpressure without losing prompt disconnects.
+            event = asyncio.Event()
+            state[DOWNSTREAM_DISCONNECT_EVENT_SCOPE_KEY] = event
+            self._downstream_disconnect_event = event
 
         def data_received(self, data: bytes) -> None:
             previous_cycle = self.cycle

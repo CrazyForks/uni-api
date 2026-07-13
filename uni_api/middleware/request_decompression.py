@@ -16,6 +16,7 @@ from uni_api.admission.json_memory import (
     JSONMemoryComplexityError,
 )
 from uni_api.admission.resources import startup_cpu_worker_count
+from uni_api.disconnect import DOWNSTREAM_DISCONNECT_EVENT_SCOPE_KEY
 from uni_api.http_content import is_json_media_type
 
 
@@ -75,7 +76,6 @@ BodyBytesReservationCallback = Callable[[int], Awaitable[None]]
 BODY_BYTES_RESERVATION_SCOPE_KEY = "uni_api_reserve_body_bytes"
 BODY_REJECTION_RECORDER_SCOPE_KEY = "uni_api_record_body_rejection"
 BODY_EARLY_RESPONSE_OBSERVER_SCOPE_KEY = "uni_api_observe_body_early_response"
-DOWNSTREAM_DISCONNECT_EVENT_SCOPE_KEY = "uni_api_downstream_disconnect_event"
 
 
 class RequestBodyTooComplex(JSONMemoryComplexityError):

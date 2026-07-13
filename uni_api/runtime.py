@@ -197,7 +197,9 @@ from uni_api.streaming.sse import (
     is_sse_comment_frame,
     parse_owned_sse_event,
     parse_sse_event,
+    sse_event_has_data_field,
     stream_parser_retained_budget_snapshot,
+    validate_sse_event_type_consistency,
 )
 from uni_api.server import build_bounded_h11_protocol
 from uni_api.upstream.client_pool import ClientPool
@@ -284,6 +286,13 @@ def _log_stdout_request_summary(provider: str, model: str, engine: str, role: st
 
 
 DEFAULT_TIMEOUT = int(os.getenv("TIMEOUT", 100))
+# Responses data-only events gain this bounded header during normalization.
+# Define the resulting event limit before middleware construction so its
+# downstream usage observer accepts exactly the frames this proxy can emit.
+RESPONSES_CANONICAL_EVENT_HEADER_MAX_BYTES = len(b"event: ") + 256 + len(b"\n")
+RESPONSES_CANONICAL_EVENT_MAX_BYTES = (
+    DEFAULT_MAX_EVENT_BYTES + RESPONSES_CANONICAL_EVENT_HEADER_MAX_BYTES
+)
 is_debug = _env_flag(os.getenv("DEBUG"))
 logger.info("DISABLE_DATABASE: %s", DISABLE_DATABASE)
 
@@ -2301,6 +2310,7 @@ app.add_middleware(
         emit_request_observability=_emit_request_observability,
         mark_first_byte_observed=_mark_first_byte_observed,
         moderation_handler=_moderate_content_for_middleware,
+        responses_usage_buffer_limit_bytes=RESPONSES_CANONICAL_EVENT_MAX_BYTES,
         logging_response_class=LoggingStreamingResponse,
         debug=is_debug,
     ),
@@ -4249,9 +4259,20 @@ RESPONSES_STREAM_PRECOMMIT_MAX_ITEMS = max(
     1,
     _env_int("RESPONSES_STREAM_PRECOMMIT_MAX_ITEMS", 128),
 )
+# A raw event may be exactly DEFAULT_MAX_EVENT_BYTES.  Canonicalizing a
+# data-only event adds ``event: `` + at most 256 event-type bytes + one LF,
+# while the buffered wire frame adds the terminating blank line.
+RESPONSES_CANONICAL_EVENT_MAX_OVERHEAD_BYTES = (
+    RESPONSES_CANONICAL_EVENT_HEADER_MAX_BYTES + len(b"\n\n")
+)
 RESPONSES_STREAM_PRECOMMIT_MAX_BYTES = max(
     1,
-    _env_int("RESPONSES_STREAM_PRECOMMIT_MAX_BYTES", DEFAULT_MAX_EVENT_BYTES),
+    _env_int(
+        "RESPONSES_STREAM_PRECOMMIT_MAX_BYTES",
+        DEFAULT_MAX_EVENT_BYTES
+        + RESPONSES_STREAM_PRECOMMIT_MAX_ITEMS
+        * RESPONSES_CANONICAL_EVENT_MAX_OVERHEAD_BYTES,
+    ),
 )
 
 responses_stream_byte_budget = RetainedByteBudget(
@@ -4449,6 +4470,41 @@ def _encode_responses_sse_event(event_type: str, payload: Any) -> bytes:
 
 def _raw_responses_sse_event_bytes(raw_event: str) -> bytes:
     return raw_event.encode("utf-8") + b"\n\n"
+
+
+def _canonical_responses_sse_event_bytes(
+    raw_event: str,
+    *,
+    event_type: str,
+    has_event_field: bool,
+) -> tuple[bytes, bool]:
+    """Emit one data-bearing Responses event in a stable SSE shape.
+
+    A data-only event is valid SSE and its Responses type lives in the JSON
+    payload.  Add the redundant event field for downstream SDK compatibility.
+    Leading blank lines are transport no-ops left by repeated separators and
+    are removed from the canonical frame.
+    """
+
+    if raw_event.startswith("\n"):
+        normalized_raw_event = raw_event[1:]
+        normalized = True
+    else:
+        # ``raw_event`` can be a retained str subclass.  removeprefix() would
+        # copy its full payload even when no prefix is present.
+        normalized_raw_event = raw_event
+        normalized = False
+    if not has_event_field and event_type and event_type != "[DONE]":
+        encoded_event_type = event_type.encode("utf-8")
+        if (
+            len(encoded_event_type) > 256
+            or b"\r" in encoded_event_type
+            or b"\n" in encoded_event_type
+        ):
+            raise SSEProtocolError("Responses upstream event type is invalid")
+        normalized_raw_event = f"event: {event_type}\n{normalized_raw_event}"
+        normalized = True
+    return normalized_raw_event.encode("utf-8") + b"\n\n", normalized
 
 
 def _observed_responses_stream_chunk(
@@ -4777,7 +4833,12 @@ async def _prime_responses_upstream_stream(
             if diagnostics is not None:
                 for observed_event in raw_events:
                     if observed_event.strip():
-                        diagnostics.observe_complete_event(observed_event)
+                        diagnostics.observe_complete_event(
+                            observed_event,
+                            has_data_field=sse_event_has_data_field(
+                                observed_event
+                            ),
+                        )
 
             for event_index, raw_event in enumerate(raw_events):
                 if not raw_event.strip():
@@ -4790,6 +4851,18 @@ async def _prime_responses_upstream_stream(
                 event_bytes = None
                 handled = None
                 try:
+                    if event_owner.is_comment:
+                        event_bytes = _raw_responses_sse_event_bytes(raw_event)
+                        await append_buffered(event_bytes)
+                        continue
+                    if not event_owner.has_data_field:
+                        if diagnostics is not None:
+                            diagnostics.observe_normalization(
+                                "ignored_no_data_event_block",
+                                event_owner.declared_event_name,
+                            )
+                        continue
+
                     if event_type == "[DONE]":
                         raise HTTPException(
                             status_code=502,
@@ -4797,6 +4870,13 @@ async def _prime_responses_upstream_stream(
                         )
 
                     try:
+                        validate_sse_event_type_consistency(
+                            event_owner.declared_event_name,
+                            event_payload,
+                            protocol_name="Responses",
+                            has_event_field=event_owner.has_event_field,
+                            require_event_name=True,
+                        )
                         _validate_responses_terminal_payload(
                             event_type,
                             event_payload,
@@ -4825,7 +4905,23 @@ async def _prime_responses_upstream_stream(
                     if semantic_failure is not None:
                         raise semantic_failure
 
-                    event_bytes = _raw_responses_sse_event_bytes(raw_event)
+                    event_bytes, _event_was_normalized = (
+                        _canonical_responses_sse_event_bytes(
+                            raw_event,
+                            event_type=event_type,
+                            has_event_field=event_owner.has_event_field,
+                        )
+                    )
+                    if (
+                        not event_owner.has_event_field
+                        and event_type
+                        and event_type != "[DONE]"
+                        and diagnostics is not None
+                    ):
+                        diagnostics.observe_normalization(
+                            "canonicalized_data_only_event",
+                            event_type,
+                        )
                     if event_type == "keepalive" and precommit_keepalive_callback is not None:
                         handled = await precommit_keepalive_callback(event_bytes)
                         if not handled:
@@ -6013,7 +6109,13 @@ class ResponsesRequestExecution:
         usage_seen = False
         output_seen = False
         terminal_queue_handoff_completed = False
-        proxy_sse_parser = IncrementalSSEParser()
+        # Precommit may add one bounded event header to an otherwise maximum-
+        # sized upstream frame.  The owned parser below only uses this relaxed
+        # limit for chunks already accepted by the stricter upstream parser.
+        proxy_sse_parser = IncrementalSSEParser(
+            max_pending_bytes=RESPONSES_CANONICAL_EVENT_MAX_BYTES,
+            max_event_bytes=RESPONSES_CANONICAL_EVENT_MAX_BYTES,
+        )
 
         async def source_events():
             """Frame transport chunks before exposing any protocol event."""
@@ -6037,7 +6139,7 @@ class ResponsesRequestExecution:
                             transferred = reservation
                             reservation = None
                         try:
-                            yield raw_event, transferred
+                            yield raw_event, transferred, True
                         finally:
                             transferred = None
                             raw_event = None
@@ -6077,12 +6179,17 @@ class ResponsesRequestExecution:
                 chunk = None
                 for observed_event in raw_events:
                     if observed_event.strip():
-                        diagnostics.observe_complete_event(observed_event)
+                        diagnostics.observe_complete_event(
+                            observed_event,
+                            has_data_field=sse_event_has_data_field(
+                                observed_event
+                            ),
+                        )
                 try:
                     for event_index in range(len(raw_events)):
                         raw_event = raw_events[event_index]
                         try:
-                            yield raw_event, None
+                            yield raw_event, None, False
                         finally:
                             raw_event = None
                             raw_events[event_index] = ""
@@ -6096,12 +6203,15 @@ class ResponsesRequestExecution:
             raw_events = proxy_sse_parser.finish()
             for observed_event in raw_events:
                 if observed_event.strip():
-                    diagnostics.observe_complete_event(observed_event)
+                    diagnostics.observe_complete_event(
+                        observed_event,
+                        has_data_field=sse_event_has_data_field(observed_event),
+                    )
             try:
                 for event_index in range(len(raw_events)):
                     raw_event = raw_events[event_index]
                     try:
-                        yield raw_event, None
+                        yield raw_event, None, False
                     finally:
                         raw_event = None
                         raw_events[event_index] = ""
@@ -6111,7 +6221,7 @@ class ResponsesRequestExecution:
 
         source = source_events()
         try:
-            async for raw_event, reservation in source:
+            async for raw_event, reservation, from_precommit_buffer in source:
                 event_bytes = None
                 transferred = None
                 failure = None
@@ -6129,16 +6239,57 @@ class ResponsesRequestExecution:
                             yield ReservedStreamChunk(event_bytes, transferred)
                         continue
 
-                    event_owner = await parse_owned_sse_event(raw_event)
+                    event_owner = await parse_owned_sse_event(
+                        raw_event,
+                        max_event_bytes=(
+                            RESPONSES_CANONICAL_EVENT_MAX_BYTES
+                            if from_precommit_buffer
+                            else DEFAULT_MAX_EVENT_BYTES
+                        ),
+                    )
                     event_type = event_owner.event_name
                     event_payload = event_owner.payload
                     semantic_failure = None
                     terminal_success = False
                     try:
+                        if not event_owner.has_data_field:
+                            diagnostics.observe_normalization(
+                                "ignored_no_data_event_block",
+                                event_owner.declared_event_name,
+                            )
+                            continue
+
                         if event_type == "[DONE]":
                             raise SSEProtocolError(
                                 "Responses upstream emitted [DONE] without a terminal response event"
                             )
+
+                        validate_sse_event_type_consistency(
+                            event_owner.declared_event_name,
+                            event_payload,
+                            protocol_name="Responses",
+                            has_event_field=event_owner.has_event_field,
+                            require_event_name=True,
+                        )
+                        event_bytes, event_was_normalized = (
+                            _canonical_responses_sse_event_bytes(
+                                raw_event,
+                                event_type=event_type,
+                                has_event_field=event_owner.has_event_field,
+                            )
+                        )
+                        if (
+                            not event_owner.has_event_field
+                            and event_type
+                            and event_type != "[DONE]"
+                        ):
+                            diagnostics.observe_normalization(
+                                "canonicalized_data_only_event",
+                                event_type,
+                            )
+                        if event_was_normalized and reservation is not None:
+                            await reservation.release()
+                            reservation = None
 
                         _validate_responses_terminal_payload(
                             event_type,
@@ -6248,6 +6399,7 @@ class ResponsesRequestExecution:
                     event_bytes = None
                     raw_event = None
                     event_owner = None
+                    from_precommit_buffer = False
                     if reservation is not None:
                         await reservation.release()
             raise SSEProtocolError(

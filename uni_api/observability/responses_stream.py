@@ -452,6 +452,8 @@ class ResponsesStreamDiagnostics:
             "upstream_body_bytes": 0,
             "upstream_chunk_count": 0,
             "complete_event_count": 0,
+            "ignored_no_data_event_count": 0,
+            "canonicalized_data_only_event_count": 0,
             "upstream_eof_seen": False,
             "terminal_frame_seen": False,
             "upstream_terminal_seen": False,
@@ -592,7 +594,12 @@ class ResponsesStreamDiagnostics:
         ) + 1
         self._facts.setdefault("first_upstream_body_at", _utc_now())
 
-    def observe_complete_event(self, raw_event: str) -> None:
+    def observe_complete_event(
+        self,
+        raw_event: str,
+        *,
+        has_data_field: bool = True,
+    ) -> None:
         try:
             encoded = raw_event.encode("utf-8")
             digest = hashlib.sha256()
@@ -600,16 +607,17 @@ class ResponsesStreamDiagnostics:
             digest.update(b"\n\n")
             ordinal = int(self._facts.get("complete_event_count") or 0) + 1
             event_type = _event_type(raw_event)
-            if len(self._observed_event_facts) >= _MAX_EVENT_FACT_CACHE:
-                self._observed_event_facts.pop(
-                    next(iter(self._observed_event_facts)),
-                    None,
+            if has_data_field:
+                if len(self._observed_event_facts) >= _MAX_EVENT_FACT_CACHE:
+                    self._observed_event_facts.pop(
+                        next(iter(self._observed_event_facts)),
+                        None,
+                    )
+                self._observed_event_facts[id(raw_event)] = (
+                    ordinal,
+                    len(encoded) + 2,
+                    digest.hexdigest(),
                 )
-            self._observed_event_facts[id(raw_event)] = (
-                ordinal,
-                len(encoded) + 2,
-                digest.hexdigest(),
-            )
             self._facts.update(
                 {
                     "complete_event_count": ordinal,
@@ -620,7 +628,7 @@ class ResponsesStreamDiagnostics:
                     "last_event_received_at": _utc_now(),
                 }
             )
-            if event_type in {
+            if has_data_field and event_type in {
                 "response.completed",
                 "response.incomplete",
                 "response.failed",
@@ -635,6 +643,20 @@ class ResponsesStreamDiagnostics:
             self._refresh_diagnosis()
         except Exception as exc:
             self._facts["event_observer_error"] = type(exc).__name__
+
+    def observe_normalization(self, rule: str, event_type: Any) -> None:
+        safe_event_type = safe_responses_event_type(event_type)
+        if rule == "ignored_no_data_event_block":
+            key = "ignored_no_data_event_count"
+        elif rule == "canonicalized_data_only_event":
+            key = "canonicalized_data_only_event_count"
+        else:
+            self._facts["normalization_observer_error"] = "unknown_rule"
+            return
+        self._facts[key] = int(self._facts.get(key) or 0) + 1
+        self._facts["last_normalization_rule"] = rule
+        self._facts["last_normalized_event_type"] = safe_event_type
+        self._facts["normalization_applied"] = True
 
     def observe_parsed_event(
         self,
@@ -663,17 +685,16 @@ class ResponsesStreamDiagnostics:
         else:
             event_ordinal, event_bytes, event_sha256 = cached_event
         if declared_terminal:
-            self._facts.update(
-                {
-                    "terminal_frame_seen": True,
-                    "declared_terminal_type": safe_event_type,
-                    "declared_terminal_ordinal": event_ordinal,
-                    "declared_terminal_bytes": event_bytes,
-                    "declared_terminal_sha256": event_sha256,
-                    "terminal_frame_structured": True,
-                    "terminal_frame_structured_at": _utc_now(),
-                }
-            )
+            self._facts["terminal_frame_seen"] = True
+            # A precommit data-only frame may be replayed after canonicalizing
+            # it with an event field.  Preserve the first, upstream-wire
+            # identity instead of overwriting it with that local replay.
+            self._facts.setdefault("declared_terminal_type", safe_event_type)
+            self._facts.setdefault("declared_terminal_ordinal", event_ordinal)
+            self._facts.setdefault("declared_terminal_bytes", event_bytes)
+            self._facts.setdefault("declared_terminal_sha256", event_sha256)
+            self._facts["terminal_frame_structured"] = True
+            self._facts.setdefault("terminal_frame_structured_at", _utc_now())
             self._facts["terminal_frame_semantic_outcome"] = semantic_outcome
             consistent, reasons = _terminal_semantics_consistency(
                 event_type,
@@ -697,13 +718,13 @@ class ResponsesStreamDiagnostics:
                     "upstream_terminal_validated": bool(
                         self._facts.get("terminal_semantics_consistent")
                     ),
-                    "semantic_terminal_type": safe_event_type,
-                    "semantic_terminal_outcome": semantic_outcome,
-                    "semantic_terminal_bytes": event_bytes,
-                    "semantic_terminal_sha256": event_sha256,
-                    "semantic_terminal_classified_at": now,
                 }
             )
+            self._facts.setdefault("semantic_terminal_type", safe_event_type)
+            self._facts.setdefault("semantic_terminal_outcome", semantic_outcome)
+            self._facts.setdefault("semantic_terminal_bytes", event_bytes)
+            self._facts.setdefault("semantic_terminal_sha256", event_sha256)
+            self._facts.setdefault("semantic_terminal_classified_at", now)
             self._facts.setdefault(
                 "transport_end_trigger",
                 f"semantic_{semantic_outcome}",

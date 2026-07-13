@@ -79,6 +79,58 @@ def test_responses_stream_to_chat_completions_converts_text_reasoning_and_done()
     assert body.endswith("data: [DONE]\n\n")
 
 
+def test_responses_stream_to_chat_completions_ignores_event_only_blocks():
+    async def upstream_iter():
+        yield (
+            b"event: response.output_text.delta\n\n"
+            b'data: {"type":"response.output_text.delta","delta":"hello"}\n\n\n'
+            b"event: response.completed\n\n"
+            b'data: {"type":"response.completed","response":'
+            b'{"status":"completed","output":[],"usage":'
+            b'{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}\n\n\n'
+        )
+
+    async def run():
+        return "".join(
+            [
+                chunk
+                async for chunk in stream_responses_to_chat_completions(
+                    upstream_iter(),
+                    request_model="gpt-5.4",
+                )
+            ]
+        )
+
+    body = asyncio.run(run())
+
+    assert '"content": "hello"' in body
+    assert '"prompt_tokens": 3' in body
+    assert '"completion_tokens": 5' in body
+    assert body.endswith("data: [DONE]\n\n")
+
+
+def test_responses_stream_to_chat_completions_rejects_conflicting_event_types():
+    async def upstream_iter():
+        yield (
+            b"event: response.completed\n"
+            b'data: {"type":"response.created","response":'
+            b'{"status":"in_progress"}}\n\n'
+        )
+
+    async def run():
+        async for _chunk in stream_responses_to_chat_completions(
+            upstream_iter(),
+            request_model="gpt-5.4",
+        ):
+            pass
+
+    with pytest.raises(
+        SSEProtocolError,
+        match="Responses SSE event field conflicts with data.type",
+    ):
+        asyncio.run(run())
+
+
 def test_responses_output_item_collection_has_total_item_limit():
     async def upstream_iter():
         for index in range(3):

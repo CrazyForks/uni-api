@@ -24,6 +24,7 @@ from .sse import (
     SSEProtocolError,
     iter_sse_events,
     parse_owned_sse_event,
+    validate_sse_event_type_consistency,
 )
 
 
@@ -665,6 +666,11 @@ async def _stream_responses_to_chat_completions_impl(
                     if event_owner.is_comment:
                         yield event_owner.raw_event + end_of_line
                         continue
+                    if not event_owner.has_data_field:
+                        # SSE blocks without a data field do not dispatch an
+                        # event.  The following data-only block, if present,
+                        # is parsed independently and classified by payload.type.
+                        continue
                     event_type = event_owner.event_name
                     event_payload = event_owner.payload
                     if event_type == "[DONE]":
@@ -686,6 +692,14 @@ async def _stream_responses_to_chat_completions_impl(
                             return
                         yield "data: [DONE]" + end_of_line
                         return
+
+                    validate_sse_event_type_consistency(
+                        event_owner.declared_event_name,
+                        event_payload,
+                        protocol_name="Responses",
+                        has_event_field=event_owner.has_event_field,
+                        require_event_name=True,
+                    )
 
                     if event_type == "error":
                         error_seen = True

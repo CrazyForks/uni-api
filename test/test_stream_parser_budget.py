@@ -16,6 +16,7 @@ from uni_api.streaming.sse import (
     SSEProtocolError,
     StreamParserBufferBudgetExhausted,
     parse_owned_sse_event,
+    sse_event_has_data_field,
 )
 
 
@@ -80,6 +81,33 @@ def test_emitted_sse_frame_owns_bytes_until_consumer_drops_it(monkeypatch):
     del frames
     gc.collect()
     assert budget.snapshot()["used_bytes"] == 0
+
+
+def test_parser_and_emitted_frame_release_the_budget_they_reserved(monkeypatch):
+    original_budget = sse_module._StreamParserRetainedBudget(128)
+    monkeypatch.setattr(
+        sse_module,
+        "_STREAM_PARSER_RETAINED_BUDGET",
+        original_budget,
+    )
+    pending_parser = IncrementalSSEParser()
+    emitted_parser = IncrementalSSEParser()
+    assert pending_parser.feed(b"data:a") == []
+    frames = emitted_parser.feed(b"data: ok\n\n")
+    assert original_budget.snapshot()["used_bytes"] == 6 + len(b"data: ok")
+
+    replacement_budget = sse_module._StreamParserRetainedBudget(128)
+    monkeypatch.setattr(
+        sse_module,
+        "_STREAM_PARSER_RETAINED_BUDGET",
+        replacement_budget,
+    )
+    pending_parser.discard()
+    del frames
+    gc.collect()
+
+    assert original_budget.snapshot()["used_bytes"] == 0
+    assert replacement_budget.snapshot()["used_bytes"] == 0
 
 
 def test_line_parser_transfers_pending_budget_to_returned_line(monkeypatch):
@@ -153,3 +181,16 @@ def test_owned_sse_parse_failure_releases_raw_frame_immediately(monkeypatch):
         assert budget.snapshot()["used_bytes"] == 0
 
     asyncio.run(scenario())
+
+
+def test_data_field_presence_scan_does_not_materialize_payload():
+    class FailOnSlice(str):
+        def __getitem__(self, key):
+            if isinstance(key, slice):
+                raise AssertionError("field presence scan copied event text")
+            return super().__getitem__(key)
+
+    raw_event = FailOnSlice('event: response.completed\ndata: {"value":"' + "x" * 65536 + '"}')
+
+    assert sse_event_has_data_field(raw_event) is True
+    assert sse_event_has_data_field(FailOnSlice("event: response.completed")) is False

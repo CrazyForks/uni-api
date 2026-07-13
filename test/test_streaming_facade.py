@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from uni_api.streaming.sse import (
@@ -8,7 +10,10 @@ from uni_api.streaming.sse import (
     SSEOutputLimitError,
     SSEProtocolError,
     is_sse_comment_frame,
+    parse_owned_sse_event,
     parse_sse_event,
+    sse_event_has_data_field,
+    validate_sse_event_type_consistency,
 )
 
 
@@ -142,6 +147,152 @@ def test_parse_sse_event_preserves_protocol_data_whitespace_and_empty_fields():
         "note",
         " leading \n",
     )
+
+
+def test_owned_sse_event_distinguishes_missing_and_empty_data_fields():
+    async def inspect(raw_event):
+        owner = await parse_owned_sse_event(raw_event)
+        try:
+            return {
+                "event_name": owner.event_name,
+                "declared_event_name": owner.declared_event_name,
+                "payload": owner.payload,
+                "is_comment": owner.is_comment,
+                "has_event_field": owner.has_event_field,
+                "has_data_field": owner.has_data_field,
+            }
+        finally:
+            await owner.aclose()
+
+    event_only = asyncio.run(inspect("event: response.completed"))
+    assert event_only == {
+        "event_name": "response.completed",
+        "declared_event_name": "response.completed",
+        "payload": "",
+        "is_comment": False,
+        "has_event_field": True,
+        "has_data_field": False,
+    }
+    assert not sse_event_has_data_field("event: response.completed")
+
+    empty_data = asyncio.run(inspect("event: response.completed\ndata:"))
+    assert empty_data["event_name"] == "response.completed"
+    assert empty_data["payload"] == ""
+    assert empty_data["has_data_field"] is True
+    assert sse_event_has_data_field("data")
+
+    data_only = asyncio.run(
+        inspect('data: {"type":"response.completed","response":{}}')
+    )
+    assert data_only["event_name"] == "response.completed"
+    assert data_only["declared_event_name"] == ""
+    assert data_only["has_event_field"] is False
+    assert data_only["payload"] == {
+        "type": "response.completed",
+        "response": {},
+    }
+    assert data_only["has_data_field"] is True
+
+    comment = asyncio.run(inspect(": keepalive"))
+    assert comment["is_comment"] is True
+    assert comment["has_event_field"] is False
+    assert comment["has_data_field"] is False
+
+    done = asyncio.run(inspect("data: [DONE]"))
+    assert done["event_name"] == "[DONE]"
+    assert done["has_data_field"] is True
+
+
+def test_responses_event_type_consistency_rejects_only_ambiguous_records():
+    validate_sse_event_type_consistency(
+        "response.completed",
+        {"type": "response.completed"},
+        protocol_name="Responses",
+        has_event_field=True,
+        require_event_name=True,
+    )
+    validate_sse_event_type_consistency(
+        "",
+        {"type": "response.completed"},
+        protocol_name="Responses",
+        has_event_field=False,
+        require_event_name=True,
+    )
+    validate_sse_event_type_consistency(
+        "response.completed",
+        {"response": {}},
+        protocol_name="Responses",
+        has_event_field=True,
+        require_event_name=True,
+    )
+
+    with pytest.raises(
+        SSEProtocolError,
+        match="Responses SSE event field conflicts with data.type",
+    ):
+        validate_sse_event_type_consistency(
+            "response.completed",
+            {"type": "response.created"},
+            protocol_name="Responses",
+            has_event_field=True,
+            require_event_name=True,
+        )
+
+    for invalid_type in (None, 123, {"name": "response.completed"}, "", " bad "):
+        with pytest.raises(
+            SSEProtocolError,
+            match="Responses SSE data.type must be a non-empty string",
+        ):
+            validate_sse_event_type_consistency(
+                "response.completed",
+                {"type": invalid_type},
+                protocol_name="Responses",
+                has_event_field=True,
+                require_event_name=True,
+            )
+
+    with pytest.raises(SSEProtocolError, match="Responses SSE event type is missing"):
+        validate_sse_event_type_consistency(
+            "",
+            {"response": {}},
+            protocol_name="Responses",
+            has_event_field=False,
+            require_event_name=True,
+        )
+
+    with pytest.raises(
+        SSEProtocolError,
+        match="Responses SSE event field must not be empty",
+    ):
+        validate_sse_event_type_consistency(
+            "",
+            {"type": "response.completed"},
+            protocol_name="Responses",
+            has_event_field=True,
+            require_event_name=True,
+        )
+
+    with pytest.raises(
+        SSEProtocolError,
+        match="Responses SSE data must be a JSON object",
+    ):
+        validate_sse_event_type_consistency(
+            "response.completed",
+            "not-json-object",
+            protocol_name="Responses",
+            has_event_field=True,
+            require_event_name=True,
+        )
+
+    for invalid_scalar in ("\ud800", "x" * 257):
+        with pytest.raises(SSEProtocolError, match="Responses SSE data.type is invalid"):
+            validate_sse_event_type_consistency(
+                "",
+                {"type": invalid_scalar},
+                protocol_name="Responses",
+                has_event_field=False,
+                require_event_name=True,
+            )
 
 
 def test_parse_sse_event_does_not_treat_unicode_separators_as_sse_newlines():

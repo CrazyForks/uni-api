@@ -522,7 +522,10 @@ class LoggingStreamingResponse(Response):
         owner = None
         payload = None
         try:
-            owner = await parse_owned_sse_event(raw_event)
+            owner = await parse_owned_sse_event(
+                raw_event,
+                max_event_bytes=self._usage_buffer_limit_bytes,
+            )
             payload = owner.payload
             if isinstance(payload, dict):
                 self._record_usage_from_payload(payload)

@@ -42,6 +42,7 @@ from uni_api.streaming.logging_response import (
     LoggingStreamingResponse,
     await_with_hard_deadline,
 )
+from uni_api.streaming.sse import DEFAULT_MAX_PENDING_BYTES
 from uni_api.upstream.client_pool import UpstreamAdmissionRejected
 
 
@@ -69,6 +70,7 @@ class StatsMiddlewareDependencies:
     emit_request_observability: Callable[[dict[str, Any]], None]
     mark_first_byte_observed: Callable[[dict[str, Any]], None]
     moderation_handler: Callable[[ModerationRequest, BackgroundTasks, int], Awaitable[Any]]
+    responses_usage_buffer_limit_bytes: int = DEFAULT_MAX_PENDING_BYTES
     logging_response_class: type[LoggingStreamingResponse] = LoggingStreamingResponse
     debug: bool = False
 
@@ -354,6 +356,18 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 debug=deps.debug,
                 disconnect_event=current_info.get("disconnect_event"),
                 lifecycle_close=lifecycle_close,
+                usage_buffer_limit_bytes=(
+                    getattr(
+                        deps,
+                        "responses_usage_buffer_limit_bytes",
+                        DEFAULT_MAX_PENDING_BYTES,
+                    )
+                    if request.url.path in {
+                        "/v1/responses",
+                        "/v1/responses/compact",
+                    }
+                    else DEFAULT_MAX_PENDING_BYTES
+                ),
             )
         if not request.url.path.startswith("/v1") or deps.database_disabled:
             return response

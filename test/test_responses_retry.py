@@ -258,6 +258,17 @@ def _responses_sse(event_name, payload):
     return f"event: {event_name}\ndata: {json.dumps(payload)}\n\n".encode("utf-8")
 
 
+def _split_responses_sse(event_name, payload):
+    return (
+        f"event: {event_name}\n\n"
+        f"data: {json.dumps(payload)}\n\n\n"
+    ).encode("utf-8")
+
+
+def _data_only_responses_sse(payload):
+    return f"data: {json.dumps(payload)}\n\n".encode("utf-8")
+
+
 def _chained_responses_read_error():
     try:
         raise ConnectionResetError(errno.ECONNRESET, "Connection reset by peer")
@@ -1517,6 +1528,447 @@ def test_responses_semantic_terminal_closes_without_waiting_for_eof(
     )
 
 
+@pytest.mark.parametrize("chunk_size", [None, 1, 7, 1024])
+def test_responses_normalizes_split_event_and_data_blocks(
+    monkeypatch,
+    chunk_size,
+):
+    _configure_responses_test(monkeypatch, engine="codex")
+    wire = b"".join(
+        [
+            _split_responses_sse(
+                "response.created",
+                {
+                    "type": "response.created",
+                    "response": {"status": "in_progress"},
+                },
+            ),
+            _split_responses_sse(
+                "response.output_text.delta",
+                {
+                    "type": "response.output_text.delta",
+                    "delta": "hello",
+                },
+            ),
+            _split_responses_sse(
+                "response.completed",
+                {
+                    "type": "response.completed",
+                    "sequence_number": 2,
+                    "response": {
+                        "status": "completed",
+                        "output": [],
+                        "usage": {
+                            "input_tokens": 3,
+                            "output_tokens": 5,
+                            "total_tokens": 8,
+                        },
+                    },
+                },
+            ),
+        ]
+    )
+    chunks = (
+        [wire]
+        if chunk_size is None
+        else [wire[offset : offset + chunk_size] for offset in range(0, len(wire), chunk_size)]
+    )
+    main.app.state.client_manager = DummyClientManager(
+        TerminalReadTrapResponse(chunks=chunks)
+    )
+    current_info = {
+        "request_id": f"split-sse-{chunk_size}",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info=current_info,
+    )
+
+    assert response.status_code == 200
+    assert "event: error" not in body
+    for event_type in (
+        "response.created",
+        "response.output_text.delta",
+        "response.completed",
+    ):
+        assert body.count(f"event: {event_type}\n") == 1
+        assert f'event: {event_type}\ndata: {{' in body
+    assert '"delta": "hello"' in body
+    assert current_info["success"] is True
+    diagnostics = current_info["responses_stream_diagnostics"]
+    assert diagnostics["upstream_terminal_seen"] is True
+    assert diagnostics["upstream_terminal_validated"] is True
+    assert diagnostics["usage_seen"] is True
+    assert diagnostics["ignored_no_data_event_count"] == 3
+    assert diagnostics["canonicalized_data_only_event_count"] == 3
+    assert diagnostics["normalization_applied"] is True
+    assert diagnostics["diagnosis"] == "responses_completed_with_usage"
+    assert diagnostics["semantic_terminal_sha256"] == diagnostics["last_event_sha256"]
+    assert diagnostics["declared_terminal_sha256"] == diagnostics["last_event_sha256"]
+
+
+def test_responses_max_sized_data_only_terminal_survives_canonicalization(
+    monkeypatch,
+):
+    _configure_responses_test(monkeypatch, engine="codex")
+    payload = {
+        "type": "response.completed",
+        "response": {
+            "status": "completed",
+            "output": [],
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 2,
+            },
+        },
+        "padding": "",
+    }
+    initial = _data_only_responses_sse(payload)
+    padding_bytes = main.DEFAULT_MAX_EVENT_BYTES - len(initial) + 2
+    assert padding_bytes > 0
+    payload["padding"] = "x" * padding_bytes
+    wire = _data_only_responses_sse(payload)
+    assert len(wire) - 2 == main.DEFAULT_MAX_EVENT_BYTES
+
+    main.app.state.client_manager = DummyClientManager(
+        TerminalReadTrapResponse(chunks=[wire])
+    )
+    current_info = {
+        "request_id": "max-sized-data-only-terminal",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+    request_token = main.request_info.set(current_info)
+
+    async def run():
+        handler = main.ResponsesRequestHandler()
+        response = await handler.request_responses(
+            http_request=SimpleNamespace(
+                headers={},
+                state=SimpleNamespace(uni_api_request_info=current_info),
+            ),
+            request_data=ResponsesRequest(
+                model="gpt-5.4",
+                input=["hello"],
+                stream=True,
+            ),
+            api_index=0,
+            background_tasks=BackgroundTasks(),
+        )
+        sent_bytes = 0
+
+        async def send(message):
+            nonlocal sent_bytes
+            sent_bytes += len(message.get("body", b""))
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        wrapped = main.LoggingStreamingResponse(
+            response.body_iterator,
+            status_code=response.status_code,
+            headers=response.headers,
+            media_type=response.media_type,
+            current_info=current_info,
+            usage_buffer_limit_bytes=main.RESPONSES_CANONICAL_EVENT_MAX_BYTES,
+        )
+        await wrapped(
+            {"type": "http", "method": "POST", "path": "/v1/responses"},
+            receive,
+            send,
+        )
+        return response.status_code, sent_bytes
+
+    try:
+        status_code, sent_bytes = asyncio.run(run())
+    finally:
+        main.request_info.reset(request_token)
+
+    assert status_code == 200
+    assert sent_bytes > main.DEFAULT_MAX_EVENT_BYTES
+    assert current_info["success"] is True
+    assert current_info["prompt_tokens"] == 1
+    assert current_info["completion_tokens"] == 1
+    assert current_info["total_tokens"] == 2
+    assert current_info["usage_seen"] is True
+    diagnostics = current_info["responses_stream_diagnostics"]
+    assert diagnostics["upstream_terminal_validated"] is True
+    assert diagnostics["downstream_usage_observer_status"] == "completed"
+    assert diagnostics["downstream_usage_seen"] is True
+
+
+def test_responses_event_only_terminal_is_ignored_but_empty_data_is_rejected(
+    monkeypatch,
+):
+    _configure_responses_test(monkeypatch, engine="codex")
+    main.app.state.client_manager = DummyClientManager(
+        DummyStreamingUpstreamResponse(
+            chunks=[b"event: response.completed\n\n"],
+        )
+    )
+    ignored_info = {
+        "request_id": "event-only-terminal",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+
+    ignored_response, _body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info=ignored_info,
+    )
+
+    assert ignored_response.status_code == 502
+    ignored_diagnostics = ignored_info["responses_stream_diagnostics"]
+    assert ignored_diagnostics["ignored_no_data_event_count"] == 1
+    assert ignored_diagnostics["terminal_frame_seen"] is False
+
+    main.app.state.client_manager = DummyClientManager(
+        DummyStreamingUpstreamResponse(
+            chunks=[b"event: response.completed\ndata:\n\n"],
+        )
+    )
+    empty_info = {
+        "request_id": "empty-data-terminal",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+
+    empty_response, _body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info=empty_info,
+    )
+
+    assert empty_response.status_code == 502
+    empty_diagnostics = empty_info["responses_stream_diagnostics"]
+    assert empty_diagnostics["ignored_no_data_event_count"] == 0
+    assert empty_diagnostics["terminal_frame_seen"] is True
+    assert empty_diagnostics["diagnosis"] == "responses_sse_protocol_error"
+
+
+def test_responses_drops_no_data_control_block_before_data_only_terminal(
+    monkeypatch,
+):
+    _configure_responses_test(monkeypatch, engine="codex")
+    terminal = _data_only_responses_sse(
+        {
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [],
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2,
+                },
+            },
+        }
+    )
+    main.app.state.client_manager = DummyClientManager(
+        TerminalReadTrapResponse(
+            chunks=[
+                b"event: response.completed\nid: 42\nretry: 1000\n\n"
+                + terminal
+            ]
+        )
+    )
+    current_info = {
+        "request_id": "no-data-control-block",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info=current_info,
+    )
+
+    assert response.status_code == 200
+    assert "id: 42" not in body
+    assert "retry: 1000" not in body
+    assert "event: response.completed\ndata:" in body
+    diagnostics = current_info["responses_stream_diagnostics"]
+    assert diagnostics["ignored_no_data_event_count"] == 1
+    assert diagnostics["canonicalized_data_only_event_count"] == 1
+
+
+def test_responses_rejects_conflicting_wire_and_payload_event_types(monkeypatch):
+    _configure_responses_test(monkeypatch, engine="codex")
+    main.app.state.client_manager = DummyClientManager(
+        TerminalReadTrapResponse(
+            chunks=[
+                _responses_sse(
+                    "response.completed",
+                    {
+                        "type": "response.created",
+                        "response": {
+                            "status": "in_progress",
+                            "usage": None,
+                        },
+                    },
+                )
+            ]
+        )
+    )
+    current_info = {
+        "request_id": "conflicting-event-types",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info=current_info,
+    )
+
+    assert response.status_code == 502
+    assert "conflicts with data.type" in body
+    assert current_info["success"] is False
+    diagnostics = current_info["responses_stream_diagnostics"]
+    assert diagnostics["upstream_terminal_validated"] is False
+    assert diagnostics["diagnosis"] == "responses_sse_protocol_error"
+
+
+def test_responses_rejects_explicit_empty_wire_event_type(monkeypatch):
+    _configure_responses_test(monkeypatch, engine="codex")
+    main.app.state.client_manager = DummyClientManager(
+        DummyStreamingUpstreamResponse(
+            chunks=[
+                b"event:\n"
+                b'data: {"type":"response.completed","response":'
+                b'{"status":"completed","output":[]}}\n\n'
+            ],
+        )
+    )
+
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info={
+            "request_id": "empty-wire-event-type",
+            "api_key": "sk-test",
+            "disconnect_event": None,
+        },
+    )
+
+    assert response.status_code == 502
+    assert "event field must not be empty" in body
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"response": {"status": "in_progress"}},
+        {"type": 123, "response": {"status": "in_progress"}},
+        {"type": {"name": "response.created"}},
+        "not-a-json-object",
+    ],
+)
+def test_responses_rejects_data_only_event_without_valid_string_type(
+    monkeypatch,
+    payload,
+):
+    _configure_responses_test(monkeypatch, engine="codex")
+    main.app.state.client_manager = DummyClientManager(
+        DummyStreamingUpstreamResponse(
+            chunks=[_data_only_responses_sse(payload)],
+        )
+    )
+
+    response, _body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info={
+            "request_id": "invalid-data-only-event-type",
+            "api_key": "sk-test",
+            "disconnect_event": None,
+        },
+    )
+
+    assert response.status_code == 502
+
+
+@pytest.mark.parametrize("line_ending", [b"\n", b"\r\n", b"\r"])
+def test_responses_normalizes_split_terminal_for_all_sse_line_endings(
+    monkeypatch,
+    line_ending,
+):
+    _configure_responses_test(monkeypatch, engine="codex")
+    wire = _split_responses_sse(
+        "response.completed",
+        {
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [],
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 2,
+                    "total_tokens": 3,
+                },
+            },
+        },
+    ).replace(b"\n", line_ending)
+    main.app.state.client_manager = DummyClientManager(
+        TerminalReadTrapResponse(chunks=[bytes((value,)) for value in wire])
+    )
+    current_info = {
+        "request_id": f"split-terminal-{line_ending!r}",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info=current_info,
+    )
+
+    assert response.status_code == 200
+    assert "event: error" not in body
+    assert "event: response.completed\ndata: {" in body
+    diagnostics = current_info["responses_stream_diagnostics"]
+    assert diagnostics["upstream_terminal_validated"] is True
+    assert diagnostics["usage_seen"] is True
+    assert diagnostics["ignored_no_data_event_count"] == 1
+    assert diagnostics["canonicalized_data_only_event_count"] == 1
+
+
+def test_responses_split_error_waits_for_data_payload(monkeypatch):
+    _configure_responses_test(monkeypatch, engine="codex")
+    main.app.state.client_manager = DummyClientManager(
+        DummyStreamingUpstreamResponse(
+            chunks=[
+                _split_responses_sse(
+                    "error",
+                    {
+                        "type": "error",
+                        "error": {
+                            "status_code": 429,
+                            "message": "provider rate limited",
+                        },
+                    },
+                )
+            ]
+        )
+    )
+    current_info = {
+        "request_id": "split-error",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+
+    response, _body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info=current_info,
+    )
+
+    assert response.status_code == 429
+    diagnostics = current_info["responses_stream_diagnostics"]
+    assert diagnostics["ignored_no_data_event_count"] == 1
+    assert diagnostics["semantic_status"] == "failed"
+
+
 @pytest.mark.parametrize("coalesced", [False, True])
 def test_responses_failure_terminal_is_forwarded_at_event_boundaries(
     monkeypatch,
@@ -1657,7 +2109,7 @@ def test_responses_failed_label_without_failure_semantics_is_not_a_terminal(
                 _responses_sse(
                     "response.failed",
                     {
-                        "type": "response.created",
+                        "type": "response.failed",
                         "response": {"status": "in_progress"},
                     },
                 )

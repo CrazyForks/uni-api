@@ -132,6 +132,7 @@ class StreamParserRetainedLease:
     """Explicit ownership for custom protocol accumulators."""
 
     def __init__(self) -> None:
+        self._retained_budget = _STREAM_PARSER_RETAINED_BUDGET
         self.size = 0
         self._released = False
 
@@ -141,7 +142,7 @@ class StreamParserRetainedLease:
             raise ValueError("parser reservation cannot grow by a negative size")
         if self._released:
             raise RuntimeError("parser reservation is released")
-        _STREAM_PARSER_RETAINED_BUDGET.reserve(additional_bytes)
+        self._retained_budget.reserve(additional_bytes)
         self.size += additional_bytes
 
     def shrink(self, released_bytes: int) -> None:
@@ -151,7 +152,7 @@ class StreamParserRetainedLease:
         if self._released:
             raise RuntimeError("parser reservation is released")
         self.size -= released_bytes
-        _STREAM_PARSER_RETAINED_BUDGET.release(released_bytes)
+        self._retained_budget.release(released_bytes)
 
     def release(self) -> None:
         if self._released:
@@ -159,7 +160,7 @@ class StreamParserRetainedLease:
         self._released = True
         retained = self.size
         self.size = 0
-        _STREAM_PARSER_RETAINED_BUDGET.release(retained)
+        self._retained_budget.release(retained)
 
     def __del__(self) -> None:
         try:
@@ -218,9 +219,15 @@ async def _release_sse_owned_resources_safely(
 class _RetainedTextFrame(str):
     """A parsed frame keeps its process-wide raw-byte ownership until GC."""
 
-    def __new__(cls, value: str, retained_bytes: int):
+    def __new__(
+        cls,
+        value: str,
+        retained_bytes: int,
+        retained_budget: _StreamParserRetainedBudget,
+    ):
         instance = str.__new__(cls, value)
         instance._retained_bytes = int(retained_bytes)
+        instance._retained_budget = retained_budget
         instance._released = False
         return instance
 
@@ -228,7 +235,7 @@ class _RetainedTextFrame(str):
         if self._released:
             return
         self._released = True
-        _STREAM_PARSER_RETAINED_BUDGET.release(self._retained_bytes)
+        self._retained_budget.release(self._retained_bytes)
         self._retained_bytes = 0
 
     def __del__(self) -> None:
@@ -246,11 +253,16 @@ def retain_joined_parser_text(
     """Reserve the joined copy before materializing it."""
 
     retained_bytes = int(retained_bytes)
-    _STREAM_PARSER_RETAINED_BUDGET.reserve(retained_bytes)
+    retained_budget = _STREAM_PARSER_RETAINED_BUDGET
+    retained_budget.reserve(retained_bytes)
     try:
-        return _RetainedTextFrame("".join(parts), retained_bytes)
+        return _RetainedTextFrame(
+            "".join(parts),
+            retained_bytes,
+            retained_budget,
+        )
     except BaseException:
-        _STREAM_PARSER_RETAINED_BUDGET.release(retained_bytes)
+        retained_budget.release(retained_bytes)
         raise
 
 
@@ -262,17 +274,23 @@ class OwnedSSEEvent:
         *,
         raw_event: str,
         event_name: str,
+        declared_event_name: str,
         payload: Any,
         json_owner: OwnedJSONValue | None,
         workspace_reservation: Any | None,
         is_comment: bool,
+        has_event_field: bool,
+        has_data_field: bool,
     ) -> None:
         self._raw_event: str | None = raw_event
         self._event_name: str | None = event_name
+        self._declared_event_name: str | None = declared_event_name
         self._payload = payload
         self._json_owner = json_owner
         self._workspace_reservation = workspace_reservation
         self._is_comment = bool(is_comment)
+        self._has_event_field = bool(has_event_field)
+        self._has_data_field = bool(has_data_field)
         self._payload_reservation_transferred = False
         self._closed = False
         self._closing = False
@@ -292,6 +310,14 @@ class OwnedSSEEvent:
         return self._event_name
 
     @property
+    def declared_event_name(self) -> str:
+        """Return only the event name present on the wire, if any."""
+
+        if self._closed or self._closing or self._declared_event_name is None:
+            raise RuntimeError("owned SSE event is closed")
+        return self._declared_event_name
+
+    @property
     def payload(self) -> Any:
         if self._closed or self._closing:
             raise RuntimeError("owned SSE event is closed")
@@ -302,6 +328,23 @@ class OwnedSSEEvent:
     @property
     def is_comment(self) -> bool:
         return self._is_comment
+
+    @property
+    def has_event_field(self) -> bool:
+        """Whether the wire block explicitly contained an ``event`` field."""
+
+        return self._has_event_field
+
+    @property
+    def has_data_field(self) -> bool:
+        """Whether this SSE block contained at least one ``data`` field.
+
+        Presence is intentionally distinct from a joined data value of ``""``.
+        WHATWG dispatch ignores a block with no data field, while an explicit
+        empty ``data:`` field still dispatches an event with an empty payload.
+        """
+
+        return self._has_data_field
 
     def take_payload_reservation(self):
         """Transfer parsed-graph ownership to a persistent consumer once."""
@@ -338,6 +381,7 @@ class OwnedSSEEvent:
             # either budget.  Callers follow the same rule for local aliases.
             self._payload = None
             self._event_name = None
+            self._declared_event_name = None
             self._raw_event = None
             self._json_owner = None
             self._workspace_reservation = None
@@ -447,6 +491,7 @@ class IncrementalSSEParser:
         self.max_events_per_feed = max_events_per_feed
         self.max_feed_bytes = max_feed_bytes
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+        self._retained_budget = _STREAM_PARSER_RETAINED_BUDGET
         # Retain only the current event.  A bytearray lets feed() append each
         # decoded fragment once instead of repeatedly copying/rescanning the
         # entire partial event when upstream sends very small chunks.
@@ -693,6 +738,7 @@ class IncrementalSSEParser:
                     frame = _RetainedTextFrame(
                         self._event.decode("utf-8"),
                         retained_bytes,
+                        self._retained_budget,
                     )
                 except BaseException:
                     self._clear_pending_event()
@@ -772,20 +818,20 @@ class IncrementalSSEParser:
         return len(self._event) + len(undecoded_bytes)
 
     def _reserve_pending_bytes(self, size: int) -> None:
-        _STREAM_PARSER_RETAINED_BUDGET.reserve(size)
+        self._retained_budget.reserve(size)
         self._pending_budget_bytes += size
 
     def _release_pending_bytes(self, size: int) -> None:
         if size > self._pending_budget_bytes:
             raise RuntimeError("SSE parser pending-byte budget underflow")
         self._pending_budget_bytes -= size
-        _STREAM_PARSER_RETAINED_BUDGET.release(size)
+        self._retained_budget.release(size)
 
     def _release_pending_budget(self) -> None:
         retained = self._pending_budget_bytes
         self._pending_budget_bytes = 0
         if retained:
-            _STREAM_PARSER_RETAINED_BUDGET.release(retained)
+            self._retained_budget.release(retained)
 
     def _clear_pending_event(self) -> None:
         self._event = bytearray()
@@ -824,6 +870,7 @@ class IncrementalLineParser:
         self.max_lines_per_feed = max_lines_per_feed
         self.max_feed_bytes = max_feed_bytes
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+        self._retained_budget = _STREAM_PARSER_RETAINED_BUDGET
         self._line = bytearray()
         self._pending_budget_bytes = 0
         self._pending_cr = False
@@ -993,13 +1040,13 @@ class IncrementalLineParser:
             raise SSEProtocolError(
                 "line text contains an invalid Unicode scalar"
             ) from exc
-        _STREAM_PARSER_RETAINED_BUDGET.reserve(len(encoded))
+        self._retained_budget.reserve(len(encoded))
         self._pending_budget_bytes += len(encoded)
         try:
             self._line.extend(encoded)
         except BaseException:
             self._pending_budget_bytes -= len(encoded)
-            _STREAM_PARSER_RETAINED_BUDGET.release(len(encoded))
+            self._retained_budget.release(len(encoded))
             raise
         self._validate_complete_line()
 
@@ -1026,7 +1073,11 @@ class IncrementalLineParser:
     def _transfer_line_frame(self) -> str:
         retained = self._pending_budget_bytes
         try:
-            frame = _RetainedTextFrame(self._line.decode("utf-8"), retained)
+            frame = _RetainedTextFrame(
+                self._line.decode("utf-8"),
+                retained,
+                self._retained_budget,
+            )
         except BaseException:
             self._clear_pending_line()
             raise
@@ -1038,7 +1089,7 @@ class IncrementalLineParser:
         retained = self._pending_budget_bytes
         self._pending_budget_bytes = 0
         if retained:
-            _STREAM_PARSER_RETAINED_BUDGET.release(retained)
+            self._retained_budget.release(retained)
 
     def _clear_pending_line(self) -> None:
         self._line = bytearray()
@@ -1151,13 +1202,127 @@ def is_sse_comment_frame(raw_event: str) -> bool:
 
 
 def parse_sse_event(raw_event: str) -> tuple[str, Any]:
-    event_name, data_str = _extract_sse_event_fields(raw_event)
+    event_name, data_str, _has_event_field, _has_data_field = (
+        _extract_sse_event_fields(raw_event)
+    )
     return _parse_sse_event_data(event_name, data_str)
 
 
-def _extract_sse_event_fields(raw_event: str) -> tuple[str, str]:
+def sse_event_has_data_field(raw_event: str) -> bool:
+    """Return field presence without materializing the event payload.
+
+    Diagnostics call this before the owned parser has reserved its temporary
+    workspace.  Keep the scan allocation-free with respect to field values so
+    an attacker-sized ``data`` line is not copied outside admission accounting.
+    """
+
+    start = 0
+    observed = 0
+    raw_length = len(raw_event)
+    while True:
+        newline = raw_event.find("\n", start)
+        line_end = raw_length if newline < 0 else newline
+        observed += 1
+        if observed > DEFAULT_MAX_FIELDS_PER_EVENT:
+            raise SSEOutputLimitError(
+                output_name="fields per event",
+                limit=DEFAULT_MAX_FIELDS_PER_EVENT,
+                observed=observed,
+            )
+
+        colon = raw_event.find(":", start, line_end)
+        field_end = line_end if colon < 0 else colon
+        if field_end - start == 4 and raw_event.startswith("data", start):
+            return True
+
+        if newline < 0:
+            return False
+        start = newline + 1
+
+
+def validate_sse_event_type_consistency(
+    declared_event_name: str,
+    payload: Any,
+    *,
+    protocol_name: str,
+    has_event_field: bool,
+    require_event_name: bool = False,
+) -> None:
+    """Reject an ambiguous protocol event when both type sources disagree.
+
+    SSE itself does not assign meaning to a JSON ``type`` member, so callers
+    opt in only for protocols such as Responses that define both fields as the
+    same semantic event type.
+    """
+
+    if require_event_name and not isinstance(payload, dict):
+        raise SSEProtocolError(
+            f"{protocol_name} SSE data must be a JSON object"
+        )
+    if has_event_field and not declared_event_name:
+        raise SSEProtocolError(
+            f"{protocol_name} SSE event field must not be empty"
+        )
+    if declared_event_name:
+        if len(declared_event_name) > 256:
+            raise SSEProtocolError(
+                f"{protocol_name} SSE event type exceeds 256 bytes"
+            )
+        try:
+            declared_event_name_bytes = declared_event_name.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise SSEProtocolError(
+                f"{protocol_name} SSE event type is invalid"
+            ) from exc
+        if len(declared_event_name_bytes) > 256:
+            raise SSEProtocolError(
+                f"{protocol_name} SSE event type exceeds 256 bytes"
+            )
+
+    payload_event_name = ""
+    if isinstance(payload, dict) and "type" in payload:
+        raw_payload_event_name = payload.get("type")
+        if not isinstance(raw_payload_event_name, str):
+            raise SSEProtocolError(
+                f"{protocol_name} SSE data.type must be a non-empty string"
+            )
+        payload_event_name = raw_payload_event_name
+        if len(payload_event_name) > 256:
+            raise SSEProtocolError(
+                f"{protocol_name} SSE data.type is invalid"
+            )
+        if not payload_event_name or payload_event_name.strip() != payload_event_name:
+            raise SSEProtocolError(
+                f"{protocol_name} SSE data.type must be a non-empty string"
+            )
+        try:
+            payload_event_name_bytes = payload_event_name.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise SSEProtocolError(
+                f"{protocol_name} SSE data.type is invalid"
+            ) from exc
+        if len(payload_event_name_bytes) > 256 or "\r" in payload_event_name or "\n" in payload_event_name:
+            raise SSEProtocolError(
+                f"{protocol_name} SSE data.type is invalid"
+            )
+
+    if (
+        declared_event_name
+        and payload_event_name
+        and declared_event_name != payload_event_name
+    ):
+        raise SSEProtocolError(
+            f"{protocol_name} SSE event field conflicts with data.type"
+        )
+    if require_event_name and not (declared_event_name or payload_event_name):
+        raise SSEProtocolError(f"{protocol_name} SSE event type is missing")
+
+
+def _extract_sse_event_fields(raw_event: str) -> tuple[str, str, bool, bool]:
     event_name = ""
     data_lines: list[str] = []
+    has_event_field = False
+    has_data_field = False
     for line in _iter_bounded_event_lines(raw_event):
         if ":" in line:
             field, value = line.split(":", 1)
@@ -1166,11 +1331,13 @@ def _extract_sse_event_fields(raw_event: str) -> tuple[str, str]:
         else:
             field, value = line, ""
         if field == "event":
+            has_event_field = True
             event_name = value
         elif field == "data":
+            has_data_field = True
             data_lines.append(value)
 
-    return event_name, "\n".join(data_lines)
+    return event_name, "\n".join(data_lines), has_event_field, has_data_field
 
 
 def _parse_sse_event_data(event_name: str, data_str: str) -> tuple[str, Any]:
@@ -1185,7 +1352,9 @@ def _parse_sse_event_data(event_name: str, data_str: str) -> tuple[str, Any]:
             parsed_payload = data_str
 
     if not event_name and isinstance(parsed_payload, dict):
-        event_name = str(parsed_payload.get("type") or "").strip()
+        payload_event_name = parsed_payload.get("type")
+        if isinstance(payload_event_name, str) and len(payload_event_name) <= 256:
+            event_name = payload_event_name.strip()
 
     return event_name, parsed_payload
 
@@ -1214,9 +1383,15 @@ def _iter_bounded_event_lines(raw_event: str):
         start = newline + 1
 
 
-async def parse_owned_sse_event(raw_event: str) -> OwnedSSEEvent:
+async def parse_owned_sse_event(
+    raw_event: str,
+    *,
+    max_event_bytes: int = DEFAULT_MAX_EVENT_BYTES,
+) -> OwnedSSEEvent:
     """Parse one bounded event and return explicit transferable ownership."""
 
+    if max_event_bytes <= 0:
+        raise ValueError("max_event_bytes must be greater than zero")
     request_lease = get_request_admission_lease()
     # Field splitting can temporarily retain line/value slices plus the joined
     # data string.  Reserve a conservative copy workspace before performing
@@ -1225,10 +1400,10 @@ async def parse_owned_sse_event(raw_event: str) -> OwnedSSEEvent:
     workspace_reservation = None
     json_owner: OwnedJSONValue | None = None
     try:
-        if len(raw_event) > DEFAULT_MAX_EVENT_BYTES:
+        if len(raw_event) > max_event_bytes:
             raise SSEBufferOverflowError(
                 buffer_name="event",
-                limit_bytes=DEFAULT_MAX_EVENT_BYTES,
+                limit_bytes=max_event_bytes,
                 observed_bytes=len(raw_event),
             )
         if request_lease is not None:
@@ -1239,42 +1414,57 @@ async def parse_owned_sse_event(raw_event: str) -> OwnedSSEEvent:
             )
         observed_bytes = _bounded_utf8_size(
             raw_event,
-            limit_bytes=DEFAULT_MAX_EVENT_BYTES,
+            limit_bytes=max_event_bytes,
         )
-        if observed_bytes > DEFAULT_MAX_EVENT_BYTES:
+        if observed_bytes > max_event_bytes:
             raise SSEBufferOverflowError(
                 buffer_name="event",
-                limit_bytes=DEFAULT_MAX_EVENT_BYTES,
+                limit_bytes=max_event_bytes,
                 observed_bytes=observed_bytes,
             )
         if is_sse_comment_frame(raw_event):
             return OwnedSSEEvent(
                 raw_event=raw_event,
                 event_name="",
+                declared_event_name="",
                 payload=None,
                 json_owner=None,
                 workspace_reservation=workspace_reservation,
                 is_comment=True,
+                has_event_field=False,
+                has_data_field=False,
             )
 
-        event_name, data_str = _extract_sse_event_fields(raw_event)
+        (
+            declared_event_name,
+            data_str,
+            has_event_field,
+            has_data_field,
+        ) = _extract_sse_event_fields(raw_event)
+        event_name = declared_event_name
         if data_str == "[DONE]":
             return OwnedSSEEvent(
                 raw_event=raw_event,
                 event_name="[DONE]",
+                declared_event_name=declared_event_name,
                 payload="[DONE]",
                 json_owner=None,
                 workspace_reservation=workspace_reservation,
                 is_comment=False,
+                has_event_field=has_event_field,
+                has_data_field=has_data_field,
             )
         if not data_str:
             return OwnedSSEEvent(
                 raw_event=raw_event,
                 event_name=event_name,
+                declared_event_name=declared_event_name,
                 payload=data_str,
                 json_owner=None,
                 workspace_reservation=workspace_reservation,
                 is_comment=False,
+                has_event_field=has_event_field,
+                has_data_field=has_data_field,
             )
 
         json_owner = await parse_owned_json_value(
@@ -1284,14 +1474,19 @@ async def parse_owned_sse_event(raw_event: str) -> OwnedSSEEvent:
         )
         parsed_payload = json_owner.value
         if not event_name and isinstance(parsed_payload, dict):
-            event_name = str(parsed_payload.get("type") or "").strip()
+            payload_event_name = parsed_payload.get("type")
+            if isinstance(payload_event_name, str) and len(payload_event_name) <= 256:
+                event_name = payload_event_name.strip()
         return OwnedSSEEvent(
             raw_event=raw_event,
             event_name=event_name,
+            declared_event_name=declared_event_name,
             payload=None,
             json_owner=json_owner,
             workspace_reservation=workspace_reservation,
             is_comment=False,
+            has_event_field=has_event_field,
+            has_data_field=has_data_field,
         )
     except JSONMemoryComplexityError as exc:
         await _release_sse_owned_resources_safely(

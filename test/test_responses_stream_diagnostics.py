@@ -445,6 +445,23 @@ def test_malformed_completed_label_is_not_reported_as_semantic_completion():
     assert tracker.facts["diagnosis"] == "responses_sse_protocol_error"
 
 
+def test_no_data_terminal_frame_is_observed_without_becoming_a_terminal():
+    tracker, _current_info = _tracker()
+    raw_event = "event: response.completed"
+
+    tracker.observe_complete_event(raw_event, has_data_field=False)
+    tracker.observe_normalization(
+        "ignored_no_data_event_block",
+        "response.completed",
+    )
+
+    assert tracker.facts["complete_event_count"] == 1
+    assert tracker.facts["last_event_type"] == "response.completed"
+    assert tracker.facts["terminal_frame_seen"] is False
+    assert tracker.facts["ignored_no_data_event_count"] == 1
+    assert tracker.facts["normalization_applied"] is True
+
+
 def test_validated_terminal_is_not_completed_until_ember_queue_handoff():
     tracker, _current_info = _tracker()
     raw_event = _completed_event().decode("utf-8").rstrip("\n")

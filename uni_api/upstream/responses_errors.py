@@ -39,6 +39,7 @@ RESPONSES_FAILURE_STATUS_BY_TYPE = {
 }
 
 _FAILURE_EVENT_TYPES = frozenset({"error", "response.failed"})
+_MAX_SEQUENCE_NUMBER = (1 << 63) - 1
 
 
 def _bounded_optional_text(value: Any, *, limit_bytes: int = 256) -> str | None:
@@ -46,6 +47,87 @@ def _bounded_optional_text(value: Any, *, limit_bytes: int = 256) -> str | None:
         return None
     text = bounded_stream_error_text(value, limit_bytes=limit_bytes).strip()
     return text or None
+
+
+def _bounded_identifier(value: Any) -> str | None:
+    text = _bounded_optional_text(value)
+    return text.lower() if text is not None else None
+
+
+def _normalized_protocol_token(
+    value: Any,
+    *,
+    limit_bytes: int = 128,
+) -> tuple[str, bool]:
+    if value is None:
+        return "", True
+    if not isinstance(value, str):
+        return "", False
+    text = _bounded_optional_text(value, limit_bytes=limit_bytes)
+    return (text or "").lower(), True
+
+
+def _canonical_response_failed_payload(
+    payload: dict[str, Any],
+    *,
+    message: str,
+    error_code: str | None,
+    error_type: str | None,
+    param: str | None,
+) -> dict[str, Any] | None:
+    """Build a small, SDK-compatible Responses failure terminal.
+
+    Keep only bounded protocol fields instead of retaining the parsed upstream
+    object graph behind an exception.  This is used only when the provider
+    explicitly emitted ``response.failed``; transport failures and generic
+    ``error`` events must never be promoted to this terminal.
+    """
+
+    response_obj = payload.get("response")
+    if not isinstance(response_obj, dict):
+        return None
+
+    if "status" in response_obj:
+        response_status, valid_response_status = _normalized_protocol_token(
+            response_obj.get("status"),
+        )
+        if (
+            not valid_response_status
+            or response_status not in {"", "failed"}
+        ):
+            return None
+
+    normalized_error: dict[str, Any] = {"message": message}
+    normalized_error_type = _bounded_identifier(error_type)
+    normalized_error_code = _bounded_identifier(error_code)
+    if normalized_error_type:
+        normalized_error["type"] = normalized_error_type
+    if normalized_error_code:
+        normalized_error["code"] = normalized_error_code
+    if param:
+        normalized_error["param"] = param
+
+    normalized_response: dict[str, Any] = {
+        "status": "failed",
+        "error": normalized_error,
+    }
+    for key in ("id", "object", "model"):
+        value = _bounded_optional_text(response_obj.get(key))
+        if value is not None:
+            normalized_response[key] = value
+
+    normalized_payload: dict[str, Any] = {
+        "type": "response.failed",
+        "response": normalized_response,
+    }
+    sequence_number = payload.get("sequence_number")
+    if (
+        isinstance(sequence_number, int)
+        and not isinstance(sequence_number, bool)
+        and 0 <= sequence_number <= _MAX_SEQUENCE_NUMBER
+    ):
+        normalized_payload["sequence_number"] = sequence_number
+    return normalized_payload
 
 
 def _explicit_status_code(*values: Any) -> int | None:
@@ -138,6 +220,7 @@ class ResponsesSemanticError(Exception):
         param: str | None,
         wire_status_code: int | None = None,
         passthrough_error_body: dict[str, Any] | None = None,
+        responses_sse_payload: dict[str, Any] | None = None,
     ) -> None:
         self.status_code = int(status_code)
         self.event_type = event_type
@@ -165,6 +248,14 @@ class ResponsesSemanticError(Exception):
 
         self.error_body = {"error": normalized_error}
         self.sse_payload = {"type": "error", **self.error_body}
+        self.responses_sse_event_type = "error"
+        self.responses_sse_payload = self.sse_payload
+        if event_type == "response.failed" and isinstance(
+            responses_sse_payload,
+            dict,
+        ):
+            self.responses_sse_event_type = "response.failed"
+            self.responses_sse_payload = responses_sse_payload
         self.detail_json = json.dumps(
             self.error_body,
             ensure_ascii=False,
@@ -183,15 +274,24 @@ def responses_failure_error(
     if not isinstance(payload, dict):
         return None
 
-    normalized_event_type = str(
+    raw_event_type = (
         event_type
-        or safe_get(payload, "type", default="")
-        or ""
-    ).strip().lower()
-    response_status = str(
-        safe_get(payload, "response", "status", default="") or ""
-    ).strip().lower()
-    payload_status = str(safe_get(payload, "status", default="") or "").strip().lower()
+        if event_type is not None
+        else safe_get(payload, "type", default=None)
+    )
+    normalized_event_type, valid_event_type = _normalized_protocol_token(
+        raw_event_type,
+    )
+    if not valid_event_type:
+        normalized_event_type = ""
+    response_status, valid_response_status = _normalized_protocol_token(
+        safe_get(payload, "response", "status", default=None),
+    )
+    payload_status, valid_payload_status = _normalized_protocol_token(
+        safe_get(payload, "status", default=None),
+    )
+    if not valid_payload_status:
+        payload_status = ""
 
     error_obj: Any = None
     if normalized_event_type == "error":
@@ -240,12 +340,13 @@ def responses_failure_error(
         return None
     if (
         normalized_event_type == "response.failed"
-        and error_obj is None
-        and response_status
-        and response_status != "failed"
+        and (
+            not valid_response_status
+            or (response_status and response_status != "failed")
+        )
     ):
-        # A contradictory label without failure semantics is a protocol
-        # problem, not a provider-declared semantic failure.
+        # A contradictory/ill-typed status is a protocol problem, not a
+        # provider-declared semantic failure.
         return None
 
     if isinstance(error_obj, dict):
@@ -262,6 +363,27 @@ def responses_failure_error(
     if message is None:
         message = f"Responses upstream returned {normalized_event_type or 'a failure terminal'}"
 
+    passthrough_error_body = None
+    if preserve_error_body:
+        bounded_error: dict[str, Any] = {"message": message}
+        if error_type:
+            bounded_error["type"] = error_type
+        if error_code:
+            bounded_error["code"] = error_code
+        if param:
+            bounded_error["param"] = param
+        passthrough_error_body = {"error": bounded_error}
+
+    responses_sse_payload = None
+    if normalized_event_type == "response.failed":
+        responses_sse_payload = _canonical_response_failed_payload(
+            payload,
+            message=message,
+            error_code=error_code,
+            error_type=error_type,
+            param=param,
+        )
+
     return ResponsesSemanticError(
         status_code=responses_error_status_code(error_obj, payload=payload),
         event_type=normalized_event_type or "error",
@@ -270,9 +392,6 @@ def responses_failure_error(
         error_type=error_type,
         param=param,
         wire_status_code=wire_status_code,
-        passthrough_error_body=(
-            {"error": error_obj}
-            if preserve_error_body and error_obj is not None
-            else None
-        ),
+        passthrough_error_body=passthrough_error_body,
+        responses_sse_payload=responses_sse_payload,
     )

@@ -337,6 +337,85 @@ def _configure_responses_test(monkeypatch, *, engine, provider_preferences=None)
     return client_manager
 
 
+def _configure_two_provider_responses_test(
+    monkeypatch,
+    responses,
+    *,
+    engine="codex",
+):
+    provider_names = ("provider-a", "provider-b")
+    for suffix, provider_name in zip(("a", "b"), provider_names):
+        monkeypatch.setitem(
+            main.provider_api_circular_list,
+            provider_name,
+            DummyCircularList([f"key-{suffix}"]),
+        )
+
+    async def fake_get_right_order_providers(
+        request_model_name,
+        config,
+        api_index,
+        scheduling_algorithm,
+    ):
+        return [
+            {
+                "provider": provider_name,
+                "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
+                "base_url": (
+                    f"https://{provider_name}.example/v1/responses"
+                ),
+                "api": [f"key-{suffix}"],
+                "preferences": {},
+            }
+            for suffix, provider_name in zip(("a", "b"), provider_names)
+        ]
+
+    monkeypatch.setattr(
+        main,
+        "get_right_order_providers",
+        fake_get_right_order_providers,
+    )
+    monkeypatch.setattr(
+        main,
+        "get_engine",
+        lambda provider, endpoint=None, original_model=None: (engine, None),
+    )
+    if engine == "codex":
+        monkeypatch.setattr(
+            main,
+            "_split_codex_api_key",
+            lambda raw: ("account-1", "refresh-1"),
+        )
+
+        async def fake_get_codex_access_token(
+            provider_name,
+            provider_api_key_raw,
+            proxy,
+        ):
+            return "codex-access-token"
+
+        monkeypatch.setattr(
+            main,
+            "_get_codex_access_token",
+            fake_get_codex_access_token,
+        )
+
+    main.app.state.config = {
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["gpt-5.4"],
+                "preferences": {"AUTO_RETRY": True},
+            }
+        ]
+    }
+    main.app.state.provider_timeouts = {"global": {"default": 30}}
+    main.app.state.timeout_policy = main.init_timeout_policy({})
+    client_manager = DummyClientManager(responses)
+    main.app.state.client_manager = client_manager
+    return client_manager
+
+
 def _run_responses_request(request, *, endpoint="/v1/responses", http_headers=None):
     request_info_value = {
         "request_id": "req-test",
@@ -2018,6 +2097,236 @@ def test_responses_failure_terminal_is_forwarded_at_event_boundaries(
     assert "event: error" not in body
     assert current_info["success"] is False
     assert current_info["stream_outcome"] == "upstream_failure_terminal"
+
+
+def test_oaix_keepalive_then_context_failure_preserves_response_failed_terminal(
+    monkeypatch,
+):
+    client_manager = _configure_responses_test(monkeypatch, engine="codex")
+    main.app.state.config["api_keys"][0]["preferences"]["AUTO_RETRY"] = True
+    client_manager.response = DummyStreamingUpstreamResponse(
+        chunks=[
+            _responses_sse(
+                "keepalive",
+                {"type": "keepalive", "sequence_number": 0},
+            ),
+            _responses_sse(
+                "response.failed",
+                {
+                    "type": "response.failed",
+                    "sequence_number": 4,
+                    "response": {
+                        "id": "resp_context_failure",
+                        "object": "response",
+                        "model": "gpt-5.4",
+                        "status": "failed",
+                        "error": {
+                            "code": "context_length_exceeded",
+                            "type": "invalid_request_error",
+                            "message": "Your input exceeds the context window.",
+                            "param": "input",
+                        },
+                    },
+                },
+            ),
+        ]
+    )
+    current_info = {
+        "request_id": "oaix-context-failure",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info=current_info,
+    )
+
+    assert response.status_code == 200
+    assert body.count("event: response.failed") == 1
+    assert body.count('"type":"response.failed"') == 1
+    assert '"code":"context_length_exceeded"' in body
+    assert '"message":"Your input exceeds the context window."' in body
+    assert "event: error" not in body
+    assert "data: [DONE]" not in body
+    assert len(client_manager.stream_calls) == 1
+    assert current_info["stream_error_status_code"] == 400
+    assert current_info["stream_error_event_type"] == "response.failed"
+    assert current_info["stream_outcome"] == "upstream_failure_terminal"
+    assert current_info["routing_attempts"][-1]["retry_decision"] is False
+
+
+def test_context_failure_before_commit_remains_http_400(monkeypatch):
+    client_manager = _configure_responses_test(monkeypatch, engine="codex")
+    main.app.state.config["api_keys"][0]["preferences"]["AUTO_RETRY"] = True
+    client_manager.response = DummyStreamingUpstreamResponse(
+        chunks=[
+            _responses_sse(
+                "response.failed",
+                {
+                    "type": "response.failed",
+                    "response": {
+                        "status": "failed",
+                        "error": {
+                            "code": "context_length_exceeded",
+                            "type": "invalid_request_error",
+                            "message": "input is too long",
+                        },
+                    },
+                },
+            )
+        ]
+    )
+
+    current_info = {
+        "request_id": "context-failure-before-commit",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info=current_info,
+    )
+
+    assert response.status_code == 400
+    assert json.loads(body) == {
+        "error": {
+            "code": "context_length_exceeded",
+            "type": "invalid_request_error",
+            "message": "input is too long",
+        }
+    }
+    assert len(client_manager.stream_calls) == 1
+
+
+def test_retry_success_does_not_leak_previous_response_failed_terminal(
+    monkeypatch,
+):
+    client_manager = _configure_two_provider_responses_test(
+        monkeypatch,
+        {
+            "https://provider-a.example/v1/responses": DummyStreamingUpstreamResponse(
+                chunks=[
+                    _responses_sse(
+                        "keepalive",
+                        {"type": "keepalive", "sequence_number": 0},
+                    ),
+                    _responses_sse(
+                        "response.failed",
+                        {
+                            "type": "response.failed",
+                            "response": {
+                                "status": "failed",
+                                "error": {
+                                    "code": "rate_limit_exceeded",
+                                    "message": "retry provider a",
+                                },
+                            },
+                        },
+                    ),
+                ]
+            ),
+            "https://provider-b.example/v1/responses": DummyStreamingUpstreamResponse(
+                chunks=[
+                    _responses_sse(
+                        "response.output_text.delta",
+                        {
+                            "type": "response.output_text.delta",
+                            "delta": "provider-b-success",
+                        },
+                    ),
+                    _responses_sse(
+                        "response.completed",
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "status": "completed",
+                                "usage": {
+                                    "input_tokens": 1,
+                                    "output_tokens": 1,
+                                    "total_tokens": 2,
+                                },
+                            },
+                        },
+                    ),
+                ]
+            ),
+        },
+    )
+
+    current_info = {
+        "request_id": "retry-success-clears-failure-terminal",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info=current_info,
+    )
+
+    assert response.status_code == 200
+    assert "provider-b-success" in body
+    assert "response.failed" not in body
+    assert "retry provider a" not in body
+    assert current_info.get("stream_error_status_code") is None
+    assert current_info.get("stream_error_event_type") is None
+    assert current_info.get("stream_error_code") is None
+    assert current_info.get("stream_outcome") != "upstream_failure_terminal"
+    assert current_info["success"] is True
+    assert [call["url"] for call in client_manager.stream_calls] == [
+        "https://provider-a.example/v1/responses",
+        "https://provider-b.example/v1/responses",
+    ]
+
+
+def test_transport_failure_does_not_reuse_previous_response_failed_terminal(
+    monkeypatch,
+):
+    _configure_two_provider_responses_test(
+        monkeypatch,
+        {
+            "https://provider-a.example/v1/responses": DummyStreamingUpstreamResponse(
+                chunks=[
+                    _responses_sse(
+                        "keepalive",
+                        {"type": "keepalive", "sequence_number": 0},
+                    ),
+                    _responses_sse(
+                        "response.failed",
+                        {
+                            "type": "response.failed",
+                            "response": {
+                                "status": "failed",
+                                "error": {
+                                    "code": "rate_limit_exceeded",
+                                    "message": "stale provider failure",
+                                },
+                            },
+                        },
+                    ),
+                ]
+            ),
+            "https://provider-b.example/v1/responses": DummyStreamingUpstreamResponse(
+                stream_error=httpx.ReadError(
+                    "provider b connection closed",
+                    request=httpx.Request(
+                        "POST",
+                        "https://provider-b.example/v1/responses",
+                    ),
+                )
+            ),
+        },
+    )
+
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True)
+    )
+
+    assert response.status_code == 200
+    assert "event: error" in body
+    assert "data: [DONE]" in body
+    assert "response.failed" not in body
+    assert "stale provider failure" not in body
 
 
 def test_responses_request_scoped_failure_terminal_does_not_mark_channel_failure(

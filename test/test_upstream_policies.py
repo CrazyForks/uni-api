@@ -90,6 +90,120 @@ def test_responses_semantic_error_bounds_attacker_sized_message():
     assert error.passthrough_error_body is None
 
 
+def test_response_failed_has_detached_bounded_responses_terminal():
+    error = responses_failure_error(
+        {
+            "type": "response.failed",
+            "sequence_number": 7,
+            "response": {
+                "id": "resp_ctx",
+                "object": "response",
+                "model": "gpt-test",
+                "status": "failed",
+                "error": {
+                    "code": " Context_Length_Exceeded ",
+                    "type": " Invalid_Request_Error ",
+                    "message": "x" * (1024 * 1024),
+                    "param": "input",
+                    "ignored": {"large": "y" * (1024 * 1024)},
+                },
+                "ignored": ["z" * (1024 * 1024)],
+            },
+        },
+        event_type="response.failed",
+        wire_status_code=200,
+    )
+
+    assert error is not None
+    assert error.sse_payload["type"] == "error"
+    assert error.responses_sse_event_type == "response.failed"
+    assert error.responses_sse_payload == {
+        "type": "response.failed",
+        "sequence_number": 7,
+        "response": {
+            "id": "resp_ctx",
+            "object": "response",
+            "model": "gpt-test",
+            "status": "failed",
+            "error": {
+                "code": "context_length_exceeded",
+                "type": "invalid_request_error",
+                "message": error.message,
+                "param": "input",
+            },
+        },
+    }
+    assert len(str(error.responses_sse_payload).encode("utf-8")) < 8192
+
+
+def test_preserved_response_failed_http_body_does_not_retain_large_graph():
+    ignored = "y" * (7 * 1024 * 1024)
+    error = responses_failure_error(
+        {
+            "type": "response.failed",
+            "response": {
+                "status": "failed",
+                "error": {
+                    "code": "context_length_exceeded",
+                    "message": "input is too long",
+                    "ignored": {"attacker_owned": ignored},
+                },
+            },
+        },
+        event_type="response.failed",
+        preserve_error_body=True,
+    )
+
+    assert error is not None
+    assert error.passthrough_error_body == {
+        "error": {
+            "code": "context_length_exceeded",
+            "message": "input is too long",
+        }
+    }
+    assert ignored not in str(error.passthrough_error_body)
+    assert len(str(error.passthrough_error_body).encode("utf-8")) < 8192
+
+
+def test_generic_error_event_is_not_promoted_to_response_failed():
+    error = responses_failure_error(
+        {
+            "type": "error",
+            "error": {
+                "code": "context_length_exceeded",
+                "message": "input is too long",
+            },
+        },
+        event_type="error",
+    )
+
+    assert error is not None
+    assert error.responses_sse_event_type == "error"
+    assert error.responses_sse_payload is error.sse_payload
+
+
+def test_response_failed_rejects_non_string_status_without_stringifying():
+    class ExplosiveStatus(list):
+        def __str__(self):
+            raise AssertionError("protocol status must not be stringified")
+
+    error = responses_failure_error(
+        {
+            "type": "response.failed",
+            "response": {
+                "status": ExplosiveStatus(["x" * (1024 * 1024)]),
+                "error": {
+                    "code": "context_length_exceeded",
+                    "message": "input is too long",
+                },
+            },
+        },
+        event_type="response.failed",
+    )
+
+    assert error is None
+
+
 def test_retry_policy_does_not_retry_missing_persisted_response_item():
     classifier = ProviderErrorClassifier(_safe_get)
     retry_policy = RetryPolicy(classifier, _get_engine)

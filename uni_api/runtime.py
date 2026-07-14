@@ -5150,6 +5150,14 @@ async def _finish_stream_queue_cleanup_task(
         raise pending_cancel
 
 
+@dataclass(frozen=True, slots=True)
+class CachedResponsesFailureTerminal:
+    data: bytes
+    status_code: int
+    error_code: Optional[str]
+    error_type: Optional[str]
+
+
 @dataclass(slots=True)
 class ResponsesRequestExecution:
     handler: Any
@@ -5171,6 +5179,7 @@ class ResponsesRequestExecution:
     stream_body_started: bool = False
     stream_keepalive_sent: bool = False
     stream_precommit_chunks: Optional[ReservedChunkBuffer] = None
+    last_response_failed_terminal: Optional[CachedResponsesFailureTerminal] = None
 
     @classmethod
     async def create(
@@ -5379,6 +5388,33 @@ class ResponsesRequestExecution:
                     await self.stream_output_queue.put(response)
                     return
                 if response.status_code != 499:
+                    if self.last_response_failed_terminal is not None:
+                        terminal = self.last_response_failed_terminal
+                        await self._emit_stream_chunk(
+                            ObservedStreamChunk(
+                                terminal.data,
+                                event_type="response.failed",
+                                semantic_outcome="failed",
+                            )
+                        )
+                        self.last_response_failed_terminal = None
+                        self.current_info["stream_error_status_code"] = int(
+                            terminal.status_code
+                        )
+                        self.current_info["stream_error_code"] = (
+                            terminal.error_code
+                        )
+                        self.current_info["stream_error_type"] = (
+                            terminal.error_type
+                        )
+                        self.current_info["stream_error_event_type"] = (
+                            "response.failed"
+                        )
+                        self.current_info["stream_outcome"] = (
+                            "upstream_failure_terminal"
+                        )
+                        self.current_info["success"] = False
+                        return
                     await self._emit_stream_chunk(_stream_error_event_from_response(response))
                     await self._emit_stream_chunk(b"data: [DONE]\n\n")
             elif response is not None:
@@ -6798,6 +6834,7 @@ class ResponsesRequestExecution:
         )
 
     def _mark_success(self, channel_id: str, provider_api_key: Optional[str]) -> None:
+        self.last_response_failed_terminal = None
         self._schedule_channel_stats(channel_id, success=True, provider_api_key=provider_api_key)
         self.current_info["first_response_time"] = 0
         self.current_info["success"] = True
@@ -6806,11 +6843,28 @@ class ResponsesRequestExecution:
     def _after_failure(self, attempt: Any, exc: Exception, status_code: int, error_message: Any) -> None:
         _record_local_admission_rejection(self.current_info, exc)
         self.last_error_response.clear()
+        # A previous retryable provider failure must never leak into the final
+        # result of a later attempt.  Retain only one detached, bounded terminal
+        # from the current provider-declared response.failed event.
+        self.last_response_failed_terminal = None
         if (
             isinstance(exc, ResponsesSemanticError)
             and isinstance(exc.passthrough_error_body, dict)
         ):
             self.last_error_response.update(exc.passthrough_error_body)
+        if (
+            isinstance(exc, ResponsesSemanticError)
+            and exc.responses_sse_event_type == "response.failed"
+        ):
+            self.last_response_failed_terminal = CachedResponsesFailureTerminal(
+                data=_encode_responses_sse_event(
+                    exc.responses_sse_event_type,
+                    exc.responses_sse_payload,
+                ),
+                status_code=int(exc.status_code),
+                error_code=exc.error_code,
+                error_type=exc.error_type,
+            )
         self._record_upstream_attempt_result(
             attempt,
             status_code=status_code,

@@ -21,8 +21,10 @@ from core.utils import safe_get
 from uni_api.admission import AdmissionRejected
 from uni_api.http_content import is_json_media_type
 from uni_api.middleware.request_decompression import (
+    REQUEST_BODY_COMPLEXITY_INFO_KEY,
     RequestBodyTooComplex,
     RequestBodyTooLarge,
+    capture_request_body_complexity_diagnostics,
 )
 from uni_api.middleware.request_decompression import (
     DOWNSTREAM_DISCONNECT_EVENT_SCOPE_KEY,
@@ -601,7 +603,7 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 current_info["admission_reason"] = "body_too_large"
                 current_info["success"] = False
             raise
-        except RequestBodyTooComplex:
+        except RequestBodyTooComplex as exc:
             # The outer body middleware owns the protocol-safe 413 response.
             # This dedicated type cannot be confused with complexity failures
             # while parsing upstream responses or SSE events.
@@ -611,6 +613,14 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 current_info["admission_rejected"] = True
                 current_info["admission_reason"] = "body_too_complex"
                 current_info["success"] = False
+                diagnostics = capture_request_body_complexity_diagnostics(
+                    request.scope,
+                    exc,
+                )
+                if diagnostics:
+                    current_info[REQUEST_BODY_COMPLEXITY_INFO_KEY] = diagnostics
+                    rejection_trace = current_info.get("trace") or trace
+                    rejection_trace.mark("request_body_rejected")
             raise
         except RequestBodyDisconnected:
             if current_info is not None:

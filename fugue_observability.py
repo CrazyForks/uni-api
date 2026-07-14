@@ -24,6 +24,17 @@ _DEFAULT_QUEUE_MAX_SIZE = 10000
 _DEFAULT_EXPORT_WORKER_COUNT = 4
 _DEFAULT_EXPORT_TIMEOUT_SECONDS = 2.0
 _DEFAULT_SAMPLE_RATE = 1.0
+_REQUEST_BODY_COMPLEXITY_REASONS = frozenset(
+    {"max_depth", "max_scalar_bytes", "max_estimated_bytes"}
+)
+_REQUEST_BODY_COMPLEXITY_TRIGGER_PHASES = frozenset(
+    {
+        "chunk_raw_charge",
+        "structural_item_scan",
+        "depth_scan",
+        "scalar_scan",
+    }
+)
 
 _STAGE_ORDER = [
     "request_received",
@@ -269,6 +280,9 @@ def build_uni_api_ember_request_telemetry(
     is_stream = _safe_bool(current_info.get("stream"))
     api_key_hash = _secret_hash(current_info.get("api_key"))
     responses_diagnostics = _responses_stream_diagnostics(current_info)
+    request_body_complexity_attrs = _request_body_complexity_attrs(
+        current_info
+    )
 
     base = _base_attrs(
         service_name=service_name,
@@ -352,6 +366,7 @@ def build_uni_api_ember_request_telemetry(
                     "downstream_disconnected": _bool_text(
                         _safe_bool(current_info.get("downstream_disconnected"))
                     ),
+                    **request_body_complexity_attrs,
                 }
             ),
             "summary": _drop_empty(
@@ -402,6 +417,7 @@ def build_uni_api_ember_request_telemetry(
                         )
                     ),
                     "waiting_first_byte": _int_text(_runtime_int(runtime_metrics, "waiting_first_byte")),
+                    **request_body_complexity_attrs,
                     "upstream_pool_in_use": _int_text(
                         _runtime_int(runtime_metrics, "upstream_pool_in_use")
                     ),
@@ -589,6 +605,35 @@ def build_uni_api_ember_request_telemetry(
                 ),
             }
         )
+    if request_body_complexity_attrs:
+        traces.append(
+            {
+                "timestamp": _iso_timestamp(now),
+                "kind": "span",
+                "event_type": "request_span",
+                "source": service_name,
+                "message": "request_body_rejected",
+                "attributes": _drop_empty(
+                    {
+                        **base,
+                        **request_body_complexity_attrs,
+                        "span_id": _span_id(
+                            trace_id,
+                            request_id,
+                            "request_body_rejected",
+                        ),
+                        "parent_span_id": _safe_text(
+                            current_info.get("parent_span_id")
+                            or spans.get("parent_span_id")
+                        ),
+                        "stage": "request_body_rejected",
+                        "stage_ms": _int_text(
+                            _span_ms(spans, "request_body_rejected")
+                        ),
+                    }
+                ),
+            }
+        )
 
     metrics = _request_metric_events(
         service_name=service_name,
@@ -669,6 +714,79 @@ def build_uni_api_ember_request_telemetry(
         },
     )
     return {"logs": logs, "traces": traces, "metrics": metrics}
+
+
+def _request_body_complexity_attrs(
+    current_info: dict[str, Any],
+) -> dict[str, str]:
+    """Allowlist body-free request diagnostics for Fugue ingestion."""
+
+    raw = current_info.get("request_body_complexity")
+    if not isinstance(raw, dict):
+        return {}
+    reason = _safe_text(raw.get("reason"), max_len=32)
+    if reason not in _REQUEST_BODY_COMPLEXITY_REASONS:
+        return {}
+    trigger_phase = _safe_text(raw.get("trigger_phase"), max_len=32)
+    if trigger_phase not in _REQUEST_BODY_COMPLEXITY_TRIGGER_PHASES:
+        trigger_phase = None
+    return _drop_empty(
+        {
+            "request_body_complexity_schema_version": _optional_int_text(
+                raw.get("schema_version")
+            ),
+            "request_body_complexity_reason": reason,
+            "request_body_complexity_trigger_phase": trigger_phase,
+            "request_body_complexity_raw_bytes": _optional_int_text(
+                raw.get("raw_bytes")
+            ),
+            "request_body_complexity_structural_item_count": (
+                _optional_int_text(raw.get("structural_item_count"))
+            ),
+            "request_body_complexity_depth": _optional_int_text(
+                raw.get("depth")
+            ),
+            "request_body_complexity_peak_depth": _optional_int_text(
+                raw.get("peak_depth")
+            ),
+            "request_body_complexity_scalar_bytes": _optional_int_text(
+                raw.get("scalar_bytes")
+            ),
+            "request_body_complexity_estimated_bytes": _optional_int_text(
+                raw.get("estimated_bytes")
+            ),
+            "request_body_complexity_configured_limit": _optional_int_text(
+                raw.get("configured_limit")
+            ),
+            "request_body_complexity_max_depth": _optional_int_text(
+                raw.get("max_depth")
+            ),
+            "request_body_complexity_max_scalar_bytes": _optional_int_text(
+                raw.get("max_scalar_bytes")
+            ),
+            "request_body_complexity_max_estimated_bytes": (
+                _optional_int_text(raw.get("max_estimated_bytes"))
+            ),
+            "request_body_complexity_raw_memory_multiplier": (
+                _optional_int_text(raw.get("raw_memory_multiplier"))
+            ),
+            "request_body_complexity_structural_item_memory_bytes": (
+                _optional_int_text(raw.get("structural_item_memory_bytes"))
+            ),
+            "request_body_reserved_weighted_bytes_at_rejection": (
+                _optional_int_text(
+                    raw.get("reserved_weighted_bytes_at_rejection")
+                )
+            ),
+            "json_memory_reserved_target_bytes_at_rejection": (
+                _optional_int_text(
+                    raw.get(
+                        "json_memory_reserved_target_bytes_at_rejection"
+                    )
+                )
+            ),
+        }
+    )
 
 
 def _routing_attempt_log_events(

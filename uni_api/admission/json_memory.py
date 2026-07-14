@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 
 
 DEFAULT_JSON_RAW_MEMORY_MULTIPLIER = 5
@@ -11,8 +12,56 @@ DEFAULT_JSON_MAX_ESTIMATED_BYTES = 256 * 1024 * 1024
 _TEXT_SCAN_CHUNK_CHARACTERS = 256 * 1024
 
 
+class JSONMemoryComplexityReason(StrEnum):
+    MAX_DEPTH = "max_depth"
+    MAX_SCALAR_BYTES = "max_scalar_bytes"
+    MAX_ESTIMATED_BYTES = "max_estimated_bytes"
+
+
+class JSONMemoryComplexityTriggerPhase(StrEnum):
+    CHUNK_RAW_CHARGE = "chunk_raw_charge"
+    STRUCTURAL_ITEM_SCAN = "structural_item_scan"
+    DEPTH_SCAN = "depth_scan"
+    SCALAR_SCAN = "scalar_scan"
+
+
+@dataclass(frozen=True, slots=True)
+class JSONMemoryComplexityObservation:
+    """Body-free primitives captured at the exact rejection decision.
+
+    The scanner preserves its existing whole-chunk raw-memory charge. The
+    cumulative ``raw_bytes`` and low-cardinality trigger phase identify the
+    rejected input frame without adding per-byte work to accepted requests.
+    """
+
+    schema_version: int
+    reason: JSONMemoryComplexityReason
+    trigger_phase: JSONMemoryComplexityTriggerPhase
+    raw_bytes: int
+    structural_item_count: int
+    depth: int
+    peak_depth: int
+    scalar_bytes: int
+    estimated_bytes: int
+    configured_limit: int
+    max_depth: int
+    max_scalar_bytes: int
+    max_estimated_bytes: int
+    raw_memory_multiplier: int
+    structural_item_memory_bytes: int
+
+
 class JSONMemoryComplexityError(ValueError):
     """A JSON document exceeds a finite structural/memory envelope."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        observation: JSONMemoryComplexityObservation | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.observation = observation
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +135,17 @@ class IncrementalJSONMemoryEstimator:
     def feed(self, chunk: bytes | bytearray | memoryview) -> int:
         view = memoryview(chunk).cast("B")
         self.raw_bytes += len(view)
-        self._raise_if_estimate_exceeded()
+        if self.estimated_bytes > self.max_estimated_bytes:
+            self._raise_complexity(
+                reason=JSONMemoryComplexityReason.MAX_ESTIMATED_BYTES,
+                trigger_phase=(
+                    JSONMemoryComplexityTriggerPhase.CHUNK_RAW_CHARGE
+                ),
+                message=(
+                    "JSON materialization estimate exceeds "
+                    f"{self.max_estimated_bytes} bytes"
+                ),
+            )
 
         for value in view:
             if self._in_string:
@@ -110,8 +169,10 @@ class IncrementalJSONMemoryEstimator:
                 self.depth += 1
                 self.peak_depth = max(self.peak_depth, self.depth)
                 if self.depth > self.max_depth:
-                    raise JSONMemoryComplexityError(
-                        f"JSON nesting exceeds {self.max_depth} levels"
+                    self._raise_complexity(
+                        reason=JSONMemoryComplexityReason.MAX_DEPTH,
+                        trigger_phase=JSONMemoryComplexityTriggerPhase.DEPTH_SCAN,
+                        message=f"JSON nesting exceeds {self.max_depth} levels",
                     )
                 continue
 
@@ -131,22 +192,64 @@ class IncrementalJSONMemoryEstimator:
                 self._count_token()
             self._scalar_bytes += 1
             if self._scalar_bytes > self.max_scalar_bytes:
-                raise JSONMemoryComplexityError(
-                    f"JSON scalar exceeds {self.max_scalar_bytes} bytes"
+                self._raise_complexity(
+                    reason=JSONMemoryComplexityReason.MAX_SCALAR_BYTES,
+                    trigger_phase=JSONMemoryComplexityTriggerPhase.SCALAR_SCAN,
+                    message=(
+                        f"JSON scalar exceeds {self.max_scalar_bytes} bytes"
+                    ),
                 )
 
         return self.estimated_bytes
 
     def _count_token(self) -> None:
         self.tokens += 1
-        self._raise_if_estimate_exceeded()
-
-    def _raise_if_estimate_exceeded(self) -> None:
         if self.estimated_bytes > self.max_estimated_bytes:
-            raise JSONMemoryComplexityError(
-                "JSON materialization estimate exceeds "
-                f"{self.max_estimated_bytes} bytes"
+            self._raise_complexity(
+                reason=JSONMemoryComplexityReason.MAX_ESTIMATED_BYTES,
+                trigger_phase=(
+                    JSONMemoryComplexityTriggerPhase.STRUCTURAL_ITEM_SCAN
+                ),
+                message=(
+                    "JSON materialization estimate exceeds "
+                    f"{self.max_estimated_bytes} bytes"
+                ),
             )
+
+    def _raise_complexity(
+        self,
+        *,
+        reason: JSONMemoryComplexityReason,
+        trigger_phase: JSONMemoryComplexityTriggerPhase,
+        message: str,
+    ) -> None:
+        configured_limit = {
+            JSONMemoryComplexityReason.MAX_DEPTH: self.max_depth,
+            JSONMemoryComplexityReason.MAX_SCALAR_BYTES: self.max_scalar_bytes,
+            JSONMemoryComplexityReason.MAX_ESTIMATED_BYTES: (
+                self.max_estimated_bytes
+            ),
+        }[reason]
+        raise JSONMemoryComplexityError(
+            message,
+            observation=JSONMemoryComplexityObservation(
+                schema_version=1,
+                reason=reason,
+                trigger_phase=trigger_phase,
+                raw_bytes=self.raw_bytes,
+                structural_item_count=self.tokens,
+                depth=self.depth,
+                peak_depth=self.peak_depth,
+                scalar_bytes=self._scalar_bytes,
+                estimated_bytes=self.estimated_bytes,
+                configured_limit=configured_limit,
+                max_depth=self.max_depth,
+                max_scalar_bytes=self.max_scalar_bytes,
+                max_estimated_bytes=self.max_estimated_bytes,
+                raw_memory_multiplier=self.raw_memory_multiplier,
+                structural_item_memory_bytes=self.token_memory_bytes,
+            ),
+        )
 
     def _finish_scalar(self) -> None:
         self._scalar_active = False

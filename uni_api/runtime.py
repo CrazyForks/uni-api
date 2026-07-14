@@ -158,7 +158,9 @@ from uni_api.admission.resources import (
 from uni_api.middleware.admission import RequestAdmissionMiddleware
 from uni_api.middleware.request_decompression import (
     REQUEST_BODY_CPU_WORKERS,
+    REQUEST_BODY_COMPLEXITY_INFO_KEY,
     RequestBodyDecompressionMiddleware,
+    request_body_complexity_diagnostics_from_scope,
 )
 from uni_api.persistence.repositories import StatsRepository
 from uni_api.providers import ProviderRegistry
@@ -2401,6 +2403,9 @@ def _observe_early_request_outcome(
         "request_disconnected",
     }
     state = scope.get("state")
+    body_complexity_diagnostics = (
+        request_body_complexity_diagnostics_from_scope(scope)
+    )
     if isinstance(state, dict):
         existing_info = state.get("uni_api_request_info")
         if isinstance(existing_info, dict):
@@ -2413,6 +2418,11 @@ def _observe_early_request_outcome(
             if downstream_disconnected:
                 existing_info["downstream_disconnected"] = True
                 existing_info["stream_outcome"] = "downstream_disconnected"
+            if body_complexity_diagnostics:
+                existing_info.setdefault(
+                    REQUEST_BODY_COMPLEXITY_INFO_KEY,
+                    body_complexity_diagnostics,
+                )
             # Stats owns normal emission once it has created request context.
             if not existing_info.get("_fugue_observability_emitted"):
                 _emit_request_observability(existing_info)
@@ -2431,6 +2441,8 @@ def _observe_early_request_outcome(
     )
     trace.mark("request_received")
     trace.add_ms("request_admission_wait_ms", wait_ms)
+    if body_complexity_diagnostics:
+        trace.mark("request_body_rejected")
     method = str(scope.get("method") or "").upper()
     path = str(scope.get("path") or "/")
     started_at = time() - max(0.0, wait_ms) / 1000.0
@@ -2452,6 +2464,10 @@ def _observe_early_request_outcome(
     if admission_rejected:
         current_info["admission_rejected"] = True
         current_info["admission_reason"] = str(reason)
+    if body_complexity_diagnostics:
+        current_info[REQUEST_BODY_COMPLEXITY_INFO_KEY] = (
+            body_complexity_diagnostics
+        )
     if downstream_disconnected:
         current_info["downstream_disconnected"] = True
         current_info["stream_outcome"] = "downstream_disconnected"

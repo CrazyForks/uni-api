@@ -11,9 +11,11 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from core.log_config import logger
+from uni_api.admission import get_request_admission_lease
 from uni_api.admission.json_memory import (
     IncrementalJSONMemoryEstimator,
     JSONMemoryComplexityError,
+    JSONMemoryComplexityObservation,
 )
 from uni_api.admission.resources import startup_cpu_worker_count
 from uni_api.disconnect import DOWNSTREAM_DISCONNECT_EVENT_SCOPE_KEY
@@ -76,10 +78,99 @@ BodyBytesReservationCallback = Callable[[int], Awaitable[None]]
 BODY_BYTES_RESERVATION_SCOPE_KEY = "uni_api_reserve_body_bytes"
 BODY_REJECTION_RECORDER_SCOPE_KEY = "uni_api_record_body_rejection"
 BODY_EARLY_RESPONSE_OBSERVER_SCOPE_KEY = "uni_api_observe_body_early_response"
+BODY_COMPLEXITY_DIAGNOSTICS_SCOPE_KEY = "uni_api_request_body_complexity"
+REQUEST_BODY_COMPLEXITY_INFO_KEY = "request_body_complexity"
 
 
 class RequestBodyTooComplex(JSONMemoryComplexityError):
     """A request body exceeds the structural JSON admission envelope."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        observation: JSONMemoryComplexityObservation | None = None,
+        json_memory_reserved_target_bytes: int = 0,
+    ) -> None:
+        super().__init__(message, observation=observation)
+        self.json_memory_reserved_target_bytes = max(
+            0,
+            int(json_memory_reserved_target_bytes),
+        )
+
+    @classmethod
+    def from_json_memory_error(
+        cls,
+        exc: JSONMemoryComplexityError,
+        *,
+        json_memory_reserved_target_bytes: int,
+    ) -> RequestBodyTooComplex:
+        return cls(
+            str(exc),
+            observation=exc.observation,
+            json_memory_reserved_target_bytes=(
+                json_memory_reserved_target_bytes
+            ),
+        )
+
+
+def capture_request_body_complexity_diagnostics(
+    scope: Scope,
+    exc: RequestBodyTooComplex,
+) -> dict[str, int | str]:
+    """Snapshot body-free rejection facts before the request lease is freed."""
+
+    observation = exc.observation
+    if observation is None:
+        return {}
+    diagnostics: dict[str, int | str] = {
+        "schema_version": observation.schema_version,
+        "reason": str(observation.reason),
+        "trigger_phase": str(observation.trigger_phase),
+        "raw_bytes": observation.raw_bytes,
+        "structural_item_count": observation.structural_item_count,
+        "depth": observation.depth,
+        "peak_depth": observation.peak_depth,
+        "scalar_bytes": observation.scalar_bytes,
+        "estimated_bytes": observation.estimated_bytes,
+        "configured_limit": observation.configured_limit,
+        "max_depth": observation.max_depth,
+        "max_scalar_bytes": observation.max_scalar_bytes,
+        "max_estimated_bytes": observation.max_estimated_bytes,
+        "raw_memory_multiplier": observation.raw_memory_multiplier,
+        "structural_item_memory_bytes": (
+            observation.structural_item_memory_bytes
+        ),
+        "json_memory_reserved_target_bytes_at_rejection": (
+            exc.json_memory_reserved_target_bytes
+        ),
+    }
+    lease = get_request_admission_lease()
+    if lease is not None:
+        diagnostics["reserved_weighted_bytes_at_rejection"] = max(
+            0,
+            int(lease.reserved_body_bytes),
+        )
+    state = scope.setdefault("state", {})
+    if isinstance(state, dict):
+        state[BODY_COMPLEXITY_DIAGNOSTICS_SCOPE_KEY] = dict(diagnostics)
+    return diagnostics
+
+
+def request_body_complexity_diagnostics_from_scope(
+    scope: Scope,
+) -> dict[str, int | str]:
+    state = scope.get("state")
+    if not isinstance(state, dict):
+        return {}
+    diagnostics = state.get(BODY_COMPLEXITY_DIAGNOSTICS_SCOPE_KEY)
+    if not isinstance(diagnostics, dict):
+        return {}
+    return {
+        str(key): value
+        for key, value in diagnostics.items()
+        if isinstance(value, (int, str)) and not isinstance(value, bool)
+    }
 
 
 class _RequestBodyMemoryBudget:
@@ -104,7 +195,10 @@ class _RequestBodyMemoryBudget:
                 # Give request-body control flow a distinct type.  The generic
                 # JSON complexity error is also used for upstream/SSE payloads
                 # and those must never be mislabeled as a client-body 413.
-                raise RequestBodyTooComplex(str(exc)) from exc
+                raise RequestBodyTooComplex.from_json_memory_error(
+                    exc,
+                    json_memory_reserved_target_bytes=self._reserved_target,
+                ) from exc
         else:
             self._observed_bytes += len(chunk)
             target = (
@@ -286,7 +380,8 @@ class RequestBodyDecompressionMiddleware:
                 reason="body_too_large",
             )
             return
-        except RequestBodyTooComplex:
+        except RequestBodyTooComplex as exc:
+            capture_request_body_complexity_diagnostics(scope, exc)
             _record_body_rejection(scope, "body_too_complex")
             await _json_error(
                 scope,
@@ -482,9 +577,10 @@ class RequestBodyDecompressionMiddleware:
                 "request body too large",
                 reason="body_too_large",
             )
-        except RequestBodyTooComplex:
+        except RequestBodyTooComplex as exc:
             if response_started:
                 raise
+            capture_request_body_complexity_diagnostics(scope, exc)
             _record_body_rejection(scope, "body_too_complex")
             await _json_error(
                 scope,

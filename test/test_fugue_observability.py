@@ -20,6 +20,114 @@ def test_fugue_observability_disabled_without_endpoint(monkeypatch):
     assert config.enabled is False
 
 
+def test_body_complexity_diagnostics_reach_fact_log_and_dedicated_span_safely():
+    sentinel = "never-export-this-request-body"
+    telemetry = build_uni_api_ember_request_telemetry(
+        service_name="uni-api-ember",
+        service_version="test",
+        identity_attrs={"tenant_id": "tenant_123", "app_id": "app_123"},
+        current_info={
+            "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+            "request_id": "request_body_complexity_123",
+            "endpoint": "POST /v1/responses",
+            "status_code": 413,
+            "process_time": 0.004,
+            "body": sentinel,
+            "request_body_complexity": {
+                "schema_version": 1,
+                "reason": "max_estimated_bytes",
+                "trigger_phase": "structural_item_scan",
+                "raw_bytes": 2048,
+                "structural_item_count": 8192,
+                "depth": 7,
+                "peak_depth": 14,
+                "scalar_bytes": 0,
+                "estimated_bytes": 9_000_000,
+                "configured_limit": 8_000_000,
+                "max_depth": 128,
+                "max_scalar_bytes": 4096,
+                "max_estimated_bytes": 8_000_000,
+                "raw_memory_multiplier": 5,
+                "structural_item_memory_bytes": 1024,
+                "reserved_weighted_bytes_at_rejection": 7_000_000,
+                "json_memory_reserved_target_bytes_at_rejection": 6_000_000,
+                "body": sentinel,
+                "authorization": "Bearer never-export",
+            },
+            "timing_spans": {
+                "request_received": 0,
+                "request_body_rejected": 3,
+                "stream_end": 4,
+            },
+        },
+        runtime_metrics={},
+    )
+
+    summary_log = telemetry["logs"][0]
+    expected = {
+        "request_body_complexity_schema_version": "1",
+        "request_body_complexity_reason": "max_estimated_bytes",
+        "request_body_complexity_trigger_phase": "structural_item_scan",
+        "request_body_complexity_raw_bytes": "2048",
+        "request_body_complexity_structural_item_count": "8192",
+        "request_body_complexity_depth": "7",
+        "request_body_complexity_peak_depth": "14",
+        "request_body_complexity_scalar_bytes": "0",
+        "request_body_complexity_estimated_bytes": "9000000",
+        "request_body_complexity_configured_limit": "8000000",
+        "request_body_complexity_max_depth": "128",
+        "request_body_complexity_max_scalar_bytes": "4096",
+        "request_body_complexity_max_estimated_bytes": "8000000",
+        "request_body_complexity_raw_memory_multiplier": "5",
+        "request_body_complexity_structural_item_memory_bytes": "1024",
+        "request_body_reserved_weighted_bytes_at_rejection": "7000000",
+        "json_memory_reserved_target_bytes_at_rejection": "6000000",
+    }
+    for key, value in expected.items():
+        assert summary_log["summary"][key] == value
+        assert summary_log["attributes"][key] == value
+
+    rejection_spans = [
+        event
+        for event in telemetry["traces"]
+        if event["attributes"].get("stage") == "request_body_rejected"
+    ]
+    assert len(rejection_spans) == 1
+    for key, value in expected.items():
+        assert rejection_spans[0]["attributes"][key] == value
+
+    serialized = json.dumps(telemetry, sort_keys=True)
+    assert sentinel not in serialized
+    assert "Bearer never-export" not in serialized
+    assert "request_body_json_tokens" not in serialized
+    for metric in telemetry["metrics"]:
+        assert not any(
+            key.startswith("request_body_complexity_")
+            for key in metric["attributes"]
+        )
+
+
+def test_normal_request_does_not_emit_body_complexity_diagnostics():
+    telemetry = build_uni_api_ember_request_telemetry(
+        service_name="uni-api-ember",
+        service_version="test",
+        identity_attrs={"tenant_id": "tenant_123", "app_id": "app_123"},
+        current_info={
+            "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+            "request_id": "normal_request_123",
+            "endpoint": "POST /v1/responses",
+            "status_code": 200,
+            "process_time": 0.004,
+            "timing_spans": {"request_received": 0, "stream_end": 4},
+        },
+        runtime_metrics={},
+    )
+
+    serialized = json.dumps(telemetry, sort_keys=True)
+    assert "request_body_complexity_" not in serialized
+    assert "request_body_rejected" not in serialized
+
+
 def test_uni_api_ember_telemetry_redacts_secrets_and_body():
     telemetry = build_uni_api_ember_request_telemetry(
         service_name="uni-api-ember",

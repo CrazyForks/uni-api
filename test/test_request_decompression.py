@@ -83,7 +83,7 @@ async def _run_asgi(
         "headers": headers or [],
         "client": ("127.0.0.1", 12345),
         "server": ("testserver", 80),
-        "state": state or {},
+        "state": state if state is not None else {},
     }
     await app(scope, receive, send)
     return sent
@@ -426,6 +426,141 @@ def test_body_cpu_cancellation_wins_over_late_worker_error():
             await task
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("payload", "limits", "expected_reason", "expected_limit"),
+    [
+        (b"[[[", {"max_depth": 2}, "max_depth", 2),
+        (
+            b"[12345",
+            {"max_scalar_bytes": 4},
+            "max_scalar_bytes",
+            4,
+        ),
+        (
+            b"[0",
+            {"max_estimated_bytes": 1500},
+            "max_estimated_bytes",
+            1500,
+        ),
+    ],
+)
+def test_identity_json_complexity_rejection_stashes_exact_safe_diagnostics(
+    monkeypatch,
+    payload,
+    limits,
+    expected_reason,
+    expected_limit,
+):
+    estimator = request_decompression.IncrementalJSONMemoryEstimator
+    monkeypatch.setattr(
+        request_decompression,
+        "IncrementalJSONMemoryEstimator",
+        lambda: estimator(**limits),
+    )
+    downstream_called = False
+    state = {"test_marker": True}
+
+    async def downstream(_scope, receive, _send):
+        nonlocal downstream_called
+        downstream_called = True
+        await receive()
+
+    middleware = RequestBodyDecompressionMiddleware(downstream)
+    messages = asyncio.run(
+        _run_asgi(
+            middleware,
+            [{"type": "http.request", "body": payload, "more_body": False}],
+            headers=[(b"content-type", b"application/json")],
+            state=state,
+            path="/v1/responses",
+        )
+    )
+
+    assert _asgi_response(messages) == (
+        413,
+        {"detail": "request body too complex"},
+    )
+    response_start = next(
+        message
+        for message in messages
+        if message["type"] == "http.response.start"
+    )
+    assert (
+        b"x-uni-api-admission-reason",
+        b"body_too_complex",
+    ) in response_start["headers"]
+    assert downstream_called is True
+    diagnostics = state[
+        request_decompression.BODY_COMPLEXITY_DIAGNOSTICS_SCOPE_KEY
+    ]
+    assert diagnostics["reason"] == expected_reason
+    assert diagnostics["configured_limit"] == expected_limit
+    assert diagnostics["raw_bytes"] == len(payload)
+    assert diagnostics["estimated_bytes"] > 0
+    assert diagnostics["json_memory_reserved_target_bytes_at_rejection"] == 0
+    assert "reserved_weighted_bytes_at_rejection" not in diagnostics
+    assert payload.decode("ascii") not in repr(diagnostics)
+
+
+def test_zstd_json_complexity_rejection_stashes_diagnostics_before_stats(
+    monkeypatch,
+):
+    estimator = request_decompression.IncrementalJSONMemoryEstimator
+    monkeypatch.setattr(
+        request_decompression,
+        "IncrementalJSONMemoryEstimator",
+        lambda: estimator(max_estimated_bytes=1500),
+    )
+    payload = b"[0"
+    compressed = _zstd_compress(payload)
+    state = {"test_marker": True}
+    downstream_called = False
+
+    async def downstream(_scope, _receive, _send):
+        nonlocal downstream_called
+        downstream_called = True
+
+    middleware = RequestBodyDecompressionMiddleware(downstream)
+    split_at = max(1, len(compressed) // 2)
+    messages = asyncio.run(
+        _run_asgi(
+            middleware,
+            [
+                {
+                    "type": "http.request",
+                    "body": compressed[:split_at],
+                    "more_body": True,
+                },
+                {
+                    "type": "http.request",
+                    "body": compressed[split_at:],
+                    "more_body": False,
+                },
+            ],
+            headers=[
+                (b"content-type", b"application/json"),
+                (b"content-encoding", b"zstd"),
+            ],
+            state=state,
+            path="/v1/responses",
+        )
+    )
+
+    assert _asgi_response(messages) == (
+        413,
+        {"detail": "request body too complex"},
+    )
+    assert downstream_called is False
+    diagnostics = state[
+        request_decompression.BODY_COMPLEXITY_DIAGNOSTICS_SCOPE_KEY
+    ]
+    assert diagnostics["reason"] == "max_estimated_bytes"
+    assert diagnostics["trigger_phase"] == "structural_item_scan"
+    assert diagnostics["raw_bytes"] == len(payload)
+    assert diagnostics["structural_item_count"] == 2
+    assert payload.decode("ascii") not in repr(diagnostics)
 
 
 def test_zstd_known_json_route_without_content_type_charges_decoded_structure():
@@ -1332,6 +1467,93 @@ def test_main_app_rejects_overly_nested_identity_json_as_413(monkeypatch):
     assert len(emitted) == 1
     assert emitted[0][0]["status_code"] == 413
     assert emitted[0][0]["admission_reason"] == "body_too_complex"
+    diagnostics = emitted[0][0]["request_body_complexity"]
+    assert diagnostics["schema_version"] == 1
+    assert diagnostics["reason"] == "max_depth"
+    assert diagnostics["trigger_phase"] == "depth_scan"
+    assert diagnostics["raw_bytes"] == len(body.encode("utf-8"))
+    assert diagnostics["peak_depth"] == 129
+    assert diagnostics["configured_limit"] == 128
+    assert "reserved_weighted_bytes_at_rejection" in diagnostics
+    assert body not in repr(diagnostics)
+    assert emitted[0][0]["timing_spans"]["request_body_rejected"] >= 1
+
+
+def test_main_app_zstd_complexity_rejection_emits_synthetic_diagnostics(
+    monkeypatch,
+):
+    monkeypatch.setattr(main, "DISABLE_DATABASE", True)
+    main.app.state.config = {
+        "api_keys": [{"api": "sk-test", "model": ["all"]}],
+        "preferences": {"rate_limit": "999999/min"},
+    }
+    main.app.state.api_list = ["sk-test"]
+    main.app.state.api_keys_db = [{"api": "sk-test"}]
+    main.app.state.user_api_keys_rate_limit = main._build_user_api_keys_rate_limit(
+        main.app.state.config,
+        main.app.state.api_list,
+    )
+    handler_called = False
+    emitted = []
+
+    def capture_observability(current_info, runtime_metrics):
+        emitted.append((dict(current_info), dict(runtime_metrics)))
+
+    monkeypatch.setattr(main, "emit_request_observability", capture_observability)
+
+    async def fake_request_model(*_args, **_kwargs):
+        nonlocal handler_called
+        handler_called = True
+        return JSONResponse({"unexpected": True})
+
+    monkeypatch.setattr(main.model_handler, "request_model", fake_request_model)
+    nested_value = "[" * 129 + "0" + "]" * 129
+    body = (
+        '{"model":"gpt-5.5","messages":'
+        + nested_value
+        + ',"stream":false}'
+    ).encode("utf-8")
+    compressed_body = _zstd_compress(body)
+
+    async def run_request():
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            return await client.post(
+                "/v1/chat/completions",
+                content=compressed_body,
+                headers={
+                    "Authorization": "Bearer sk-test",
+                    "Content-Type": "application/json",
+                    "Content-Encoding": "zstd",
+                },
+            )
+
+    response = asyncio.run(run_request())
+
+    assert response.status_code == 413
+    assert response.json() == {"detail": "request body too complex"}
+    assert response.headers["x-uni-api-admission-reason"] == "body_too_complex"
+    assert handler_called is False
+    assert len(emitted) == 1
+    current_info = emitted[0][0]
+    assert current_info["status_code"] == 413
+    assert current_info["endpoint"] == "POST /v1/chat/completions"
+    assert current_info["admission_reason"] == "body_too_complex"
+    diagnostics = current_info["request_body_complexity"]
+    assert diagnostics["reason"] == "max_depth"
+    assert diagnostics["trigger_phase"] == "depth_scan"
+    assert diagnostics["raw_bytes"] == len(body)
+    assert diagnostics["peak_depth"] == 129
+    assert diagnostics["configured_limit"] == 128
+    assert diagnostics["reserved_weighted_bytes_at_rejection"] == (
+        len(compressed_body)
+        + zstd.get_frame_parameters(compressed_body).window_size
+    )
+    assert body.decode("utf-8") not in repr(diagnostics)
+    assert current_info["timing_spans"]["request_body_rejected"] >= 1
 
 
 def test_main_app_accepts_zstd_responses_request(monkeypatch):

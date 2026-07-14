@@ -1133,25 +1133,6 @@ def _tcp_state_counts() -> dict[str, int]:
     return dict(counts)
 
 
-def _tcp_close_wait_socket_inodes() -> set[str]:
-    inodes: set[str] = set()
-    for path in ("/proc/self/net/tcp", "/proc/self/net/tcp6"):
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                rows = handle.read().splitlines()[1:]
-        except OSError:
-            continue
-        for row in rows:
-            parts = row.split()
-            if len(parts) <= 9:
-                continue
-            if parts[3].upper() == "08":
-                inode = parts[9].strip()
-                if inode and inode != "0":
-                    inodes.add(inode)
-    return inodes
-
-
 def _socket_inode_for_fd(fd: int) -> Optional[str]:
     try:
         target = os.readlink(f"/proc/self/fd/{int(fd)}")
@@ -1301,16 +1282,16 @@ async def _sweep_httpx_client_idle_connections(client: httpx.AsyncClient) -> int
     lock = getattr(pool, "_optional_thread_lock", None)
     closing: list[Any] = []
     sweeper_trackers: list[ResponsesStreamDiagnostics] = []
-    close_wait_inodes = _tcp_close_wait_socket_inodes()
-
     def collect_connection(connection: Any) -> None:
         if all(candidate is not connection for candidate in closing):
             closing.append(connection)
 
     def close_reason(connection: Any) -> tuple[str | None, Optional[str]]:
         inode = _httpcore_connection_socket_inode(connection)
-        if inode is not None and inode in close_wait_inodes:
-            return "kernel_close_wait", inode
+        # Do not treat kernel CLOSE_WAIT as a close reason.  A peer FIN may be
+        # visible while an active response still has unread bytes queued ahead
+        # of it.  Only httpcore's state machine can establish that the
+        # connection is closed or expired without truncating that response.
         is_closed = getattr(connection, "is_closed", None)
         has_expired = getattr(connection, "has_expired", None)
         if callable(is_closed) and is_closed():

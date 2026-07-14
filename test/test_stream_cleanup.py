@@ -5,6 +5,8 @@ import sys
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import httpx
+
 import main
 import uni_api.providers.responses as response_module
 from core.utils import collect_openai_chat_completion_from_streaming_sse
@@ -546,7 +548,7 @@ def test_sweep_httpx_client_idle_connections_closes_closed_connections():
     asyncio.run(_sweep_closes_connections_that_httpcore_assign_would_drop())
 
 
-async def _sweep_closes_kernel_close_wait_connections():
+async def _sweep_preserves_active_kernel_close_wait_connections():
     close_wait = _FakeSweepConnection(socket_fd=123)
     healthy = _FakeSweepConnection(socket_fd=456)
     pool = _FakeSweepPool([close_wait, healthy])
@@ -554,18 +556,115 @@ async def _sweep_closes_kernel_close_wait_connections():
 
     result = await main._sweep_httpx_client_idle_connections(client)
 
-    assert result == 1
-    assert close_wait.aclose_called
+    assert result == 0
+    assert not close_wait.aclose_called
     assert not healthy.aclose_called
-    assert pool._connections == [healthy]
+    assert pool._connections == [close_wait, healthy]
 
 
-def test_sweep_httpx_client_idle_connections_closes_kernel_close_wait_connections(monkeypatch):
-    monkeypatch.setattr(main, "_tcp_close_wait_socket_inodes", lambda: {"inode-close-wait"})
+def test_sweep_httpx_client_idle_connections_preserves_active_kernel_close_wait_connections(monkeypatch):
+    # Recreate the production condition that triggered the regression.  The
+    # removed helper is installed with raising=False so this test also fails
+    # against the old implementation, which consulted it and closed the active
+    # response solely because its socket had received FIN.
+    monkeypatch.setattr(
+        main,
+        "_tcp_close_wait_socket_inodes",
+        lambda: {"inode-close-wait"},
+        raising=False,
+    )
     monkeypatch.setattr(
         main,
         "_socket_inode_for_fd",
         lambda fd: "inode-close-wait" if fd == 123 else "inode-established",
     )
 
-    asyncio.run(_sweep_closes_kernel_close_wait_connections())
+    asyncio.run(_sweep_preserves_active_kernel_close_wait_connections())
+
+
+def test_sweep_preserves_active_http11_body_after_peer_fin(monkeypatch):
+    async def scenario():
+        body_allowed = asyncio.Event()
+        body_sent = asyncio.Event()
+        deltas = [
+            (
+                'event: response.output_text.delta\n'
+                f'data: {{"type":"response.output_text.delta","sequence_number":{index},'
+                '"delta":"x"}}\n\n'
+            ).encode()
+            for index in range(256)
+        ]
+        terminal = (
+            'event: response.completed\n'
+            'data: {"type":"response.completed","sequence_number":256,'
+            '"response":{"usage":{"input_tokens":1,"output_tokens":2,'
+            '"total_tokens":3}}}\n\n'
+        ).encode()
+        expected_body = b"".join((*deltas, terminal))
+
+        async def handle(reader, writer):
+            try:
+                await reader.readuntil(b"\r\n\r\n")
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: text/event-stream\r\n"
+                    b"Transfer-Encoding: chunked\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                await writer.drain()
+                await body_allowed.wait()
+                for chunk in (*deltas, terminal):
+                    writer.write(f"{len(chunk):X}\r\n".encode() + chunk + b"\r\n")
+                writer.write(b"0\r\n\r\n")
+                await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+                body_sent.set()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        async with server:
+            async with httpx.AsyncClient(trust_env=False, timeout=5.0) as client:
+                request = client.build_request("GET", f"http://127.0.0.1:{port}/stream")
+                response = await client.send(request, stream=True)
+                body_allowed.set()
+                await asyncio.wait_for(body_sent.wait(), timeout=1.0)
+
+                pool = client._transport._pool
+                assert len(pool._connections) == 1
+                connection = pool._connections[0]
+                assert connection.is_idle() is False
+                assert len(pool._requests) == 1
+
+                # Model the exact kernel signal from the incident.  Against the
+                # old implementation this closes the live transport and makes
+                # response.aread() fail before the terminal event is consumed.
+                monkeypatch.setattr(
+                    main,
+                    "_tcp_close_wait_socket_inodes",
+                    lambda: {"test-close-wait-inode"},
+                    raising=False,
+                )
+                monkeypatch.setattr(
+                    main,
+                    "_httpcore_connection_socket_inode",
+                    lambda candidate: (
+                        "test-close-wait-inode" if candidate is connection else None
+                    ),
+                )
+                assert (
+                    main._httpcore_connection_socket_inode(connection)
+                    == "test-close-wait-inode"
+                )
+
+                assert await main._sweep_httpx_client_idle_connections(client) == 0
+                received = await response.aread()
+                assert received == expected_body
+                assert terminal in received
+                await response.aclose()
+                assert len(pool._requests) == 0
+                assert connection not in pool._connections
+                assert connection.is_closed() is True
+
+    asyncio.run(scenario())

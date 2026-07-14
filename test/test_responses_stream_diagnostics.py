@@ -462,6 +462,22 @@ def test_no_data_terminal_frame_is_observed_without_becoming_a_terminal():
     assert tracker.facts["normalization_applied"] is True
 
 
+def test_provider_error_to_response_failed_normalization_is_explicit():
+    tracker, _current_info = _tracker()
+
+    tracker.observe_normalization(
+        "provider_error_to_response_failed",
+        "error",
+    )
+
+    assert tracker.facts["provider_error_to_response_failed_count"] == 1
+    assert tracker.facts["last_normalization_rule"] == (
+        "provider_error_to_response_failed"
+    )
+    assert tracker.facts["last_normalized_event_type"] == "error"
+    assert tracker.facts["normalization_applied"] is True
+
+
 def test_validated_terminal_is_not_completed_until_ember_queue_handoff():
     tracker, _current_info = _tracker()
     raw_event = _completed_event().decode("utf-8").rstrip("\n")

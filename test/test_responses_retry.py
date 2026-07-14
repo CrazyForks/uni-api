@@ -2156,6 +2156,78 @@ def test_oaix_keepalive_then_context_failure_preserves_response_failed_terminal(
     assert current_info["routing_attempts"][-1]["retry_decision"] is False
 
 
+@pytest.mark.parametrize("data_only_error", [False, True])
+def test_oaix_keepalive_then_provider_error_normalizes_response_failed_terminal(
+    monkeypatch,
+    data_only_error,
+):
+    client_manager = _configure_responses_test(monkeypatch, engine="codex")
+    main.app.state.config["api_keys"][0]["preferences"]["AUTO_RETRY"] = True
+    error_payload = {
+        "type": "error",
+        "sequence_number": 2,
+        "error": {
+            "code": "context_length_exceeded",
+            "type": "invalid_request_error",
+            "message": (
+                "Your input exceeds the context window of this model. "
+                "Please adjust your input and try again."
+            ),
+            "param": "input",
+        },
+    }
+    error_frame = (
+        f"data: {json.dumps(error_payload, separators=(',', ':'))}\n\n".encode()
+        if data_only_error
+        else _responses_sse("error", error_payload)
+    )
+    client_manager.response = DummyStreamingUpstreamResponse(
+        chunks=[
+            _responses_sse(
+                "keepalive",
+                {"type": "keepalive", "sequence_number": 0},
+            ),
+            error_frame,
+        ]
+    )
+    current_info = {
+        "request_id": f"oaix-provider-context-error-{data_only_error}",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info=current_info,
+    )
+
+    assert response.status_code == 200
+    assert body.count("event: response.failed") == 1
+    assert body.count('"type":"response.failed"') == 1
+    assert '"sequence_number":2' in body
+    assert '"code":"context_length_exceeded"' in body
+    assert '"type":"invalid_request_error"' in body
+    assert '"param":"input"' in body
+    assert "event: error" not in body
+    assert "data: [DONE]" not in body
+    assert len(client_manager.stream_calls) == 1
+    assert current_info["stream_error_status_code"] == 400
+    assert current_info["stream_error_event_type"] == "response.failed"
+    assert current_info["stream_outcome"] == "upstream_failure_terminal"
+    routing_attempt = current_info["routing_attempts"][-1]
+    assert routing_attempt["wire_status_code"] == 200
+    assert routing_attempt["semantic_status_code"] == 400
+    assert routing_attempt["terminal_event_type"] == "error"
+    assert routing_attempt["retry_decision"] is False
+    diagnostics = current_info["responses_stream_diagnostics"]
+    assert diagnostics["declared_terminal_type"] == "error"
+    assert diagnostics["provider_error_to_response_failed_count"] == 1
+    assert diagnostics["last_normalization_rule"] == (
+        "provider_error_to_response_failed"
+    )
+    assert diagnostics["last_normalized_event_type"] == "error"
+
+
 def test_context_failure_before_commit_remains_http_400(monkeypatch):
     client_manager = _configure_responses_test(monkeypatch, engine="codex")
     main.app.state.config["api_keys"][0]["preferences"]["AUTO_RETRY"] = True
@@ -2333,6 +2405,11 @@ def test_responses_request_scoped_failure_terminal_does_not_mark_channel_failure
     monkeypatch,
 ):
     _configure_responses_test(monkeypatch, engine="codex")
+    local_byte_budget = runtime.RetainedByteBudget(
+        capacity_bytes=1 << 20,
+        wait_timeout_seconds=0.25,
+    )
+    monkeypatch.setattr(runtime, "responses_stream_byte_budget", local_byte_budget)
     channel_results = []
 
     def record(*_args, success, **_kwargs):
@@ -2345,8 +2422,8 @@ def test_responses_request_scoped_failure_terminal_does_not_mark_channel_failure
                 _responses_sse(
                     "response.output_text.delta",
                     {"type": "response.output_text.delta", "delta": "partial"},
-                ),
-                _responses_sse(
+                )
+                + _responses_sse(
                     "error",
                     {
                         "type": "error",
@@ -2356,7 +2433,7 @@ def test_responses_request_scoped_failure_terminal_does_not_mark_channel_failure
                             "message": "context window exceeded",
                         },
                     },
-                ),
+                )
             ]
         )
     )
@@ -2373,17 +2450,24 @@ def test_responses_request_scoped_failure_terminal_does_not_mark_channel_failure
 
     assert response.status_code == 200
     assert "context_length_exceeded" in body
+    assert body.count("event: response.failed") == 1
+    assert "event: error" not in body
+    assert "data: [DONE]" not in body
     assert channel_results == []
     assert current_info["stream_error_status_code"] == 400
     assert current_info["stream_error_code"] == "context_length_exceeded"
     assert current_info["stream_error_type"] == "invalid_request_error"
-    assert current_info["stream_error_event_type"] == "error"
+    assert current_info["stream_error_event_type"] == "response.failed"
     routing_attempt = current_info["routing_attempts"][-1]
     assert routing_attempt["wire_status_code"] == 200
     assert routing_attempt["semantic_status_code"] == 400
     assert routing_attempt["terminal_event_type"] == "error"
     assert routing_attempt["error_code"] == "context_length_exceeded"
     assert routing_attempt["error_type"] == "invalid_request_error"
+    diagnostics = current_info["responses_stream_diagnostics"]
+    assert diagnostics["declared_terminal_type"] == "error"
+    assert diagnostics["provider_error_to_response_failed_count"] == 1
+    assert local_byte_budget.snapshot().used_bytes == 0
 
 
 def test_responses_malformed_terminal_payload_is_protocol_failure(monkeypatch):

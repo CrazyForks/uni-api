@@ -454,6 +454,7 @@ class ResponsesStreamDiagnostics:
             "complete_event_count": 0,
             "ignored_no_data_event_count": 0,
             "canonicalized_data_only_event_count": 0,
+            "provider_error_to_response_failed_count": 0,
             "upstream_eof_seen": False,
             "terminal_frame_seen": False,
             "upstream_terminal_seen": False,
@@ -650,6 +651,8 @@ class ResponsesStreamDiagnostics:
             key = "ignored_no_data_event_count"
         elif rule == "canonicalized_data_only_event":
             key = "canonicalized_data_only_event_count"
+        elif rule == "provider_error_to_response_failed":
+            key = "provider_error_to_response_failed_count"
         else:
             self._facts["normalization_observer_error"] = "unknown_rule"
             return

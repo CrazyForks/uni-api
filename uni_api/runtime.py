@@ -4731,12 +4731,14 @@ def _responses_failure_http_exception(
     *,
     event_type: Optional[str] = None,
     wire_status_code: Optional[int] = None,
+    validated_provider_sse: bool = False,
 ) -> Optional[ResponsesSemanticError]:
     normalized = responses_failure_error(
         payload,
         event_type=event_type,
         wire_status_code=wire_status_code,
         preserve_error_body=True,
+        validated_provider_sse=validated_provider_sse,
     )
     if normalized is not None:
         return normalized
@@ -4936,6 +4938,7 @@ async def _prime_responses_upstream_stream(
                         event_payload,
                         event_type=event_type,
                         wire_status_code=upstream_status_code,
+                        validated_provider_sse=True,
                     )
                     if semantic_failure is not None:
                         semantic_outcome = "failed"
@@ -4953,6 +4956,16 @@ async def _prime_responses_upstream_stream(
                             semantic_outcome=semantic_outcome,
                         )
                     if semantic_failure is not None:
+                        if (
+                            event_type == "error"
+                            and semantic_failure.responses_sse_event_type
+                            == "response.failed"
+                            and diagnostics is not None
+                        ):
+                            diagnostics.observe_normalization(
+                                "provider_error_to_response_failed",
+                                event_type,
+                            )
                         raise semantic_failure
 
                     event_bytes, _event_was_normalized = (
@@ -6409,6 +6422,7 @@ class ResponsesRequestExecution:
                             event_payload,
                             event_type=event_type,
                             wire_status_code=upstream_resp.status_code,
+                            validated_provider_sse=True,
                         )
                         if semantic_failure is not None:
                             semantic_outcome = "failed"
@@ -6425,6 +6439,30 @@ class ResponsesRequestExecution:
                             semantic_outcome=semantic_outcome,
                         )
                         if semantic_failure is not None:
+                            downstream_event_type = event_type
+                            if (
+                                event_type == "error"
+                                and semantic_failure.responses_sse_event_type
+                                == "response.failed"
+                            ):
+                                normalized_event_bytes = (
+                                    _encode_responses_sse_event(
+                                        "response.failed",
+                                        semantic_failure.responses_sse_payload,
+                                    )
+                                )
+                                event_bytes = normalized_event_bytes
+                                normalized_event_bytes = None
+                                if reservation is not None:
+                                    raw_reservation = reservation
+                                    reservation = None
+                                    await raw_reservation.release()
+                                    raw_reservation = None
+                                downstream_event_type = "response.failed"
+                                diagnostics.observe_normalization(
+                                    "provider_error_to_response_failed",
+                                    event_type,
+                                )
                             failure = SSEProtocolError(
                                 "Responses upstream emitted a failure terminal: "
                                 f"{semantic_failure.detail_json[:1000]}"
@@ -6443,7 +6481,7 @@ class ResponsesRequestExecution:
                                 semantic_failure.error_type
                             )
                             self.current_info["stream_error_event_type"] = (
-                                semantic_failure.event_type
+                                downstream_event_type
                             )
                             self.current_info["success"] = False
                             if semantic_failure.status_code in (400, 413):
@@ -6459,14 +6497,14 @@ class ResponsesRequestExecution:
                                 terminal_event_type=event_type,
                                 error_code=semantic_failure.error_code,
                             )
-                            # Preserve the provider's structured terminal.
+                            # Preserve the downstream-compatible structured terminal.
                             if reservation is not None:
                                 transferred = reservation
                                 reservation = None
                             yield _observed_responses_stream_chunk(
                                 event_bytes,
                                 transferred,
-                                event_type=event_type,
+                                event_type=downstream_event_type,
                                 semantic_outcome="failed",
                             )
                             terminal_queue_handoff_completed = True
@@ -6845,7 +6883,7 @@ class ResponsesRequestExecution:
         self.last_error_response.clear()
         # A previous retryable provider failure must never leak into the final
         # result of a later attempt.  Retain only one detached, bounded terminal
-        # from the current provider-declared response.failed event.
+        # from the current provider-declared or normalized failure terminal.
         self.last_response_failed_terminal = None
         if (
             isinstance(exc, ResponsesSemanticError)

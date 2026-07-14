@@ -78,9 +78,10 @@ def _canonical_response_failed_payload(
     """Build a small, SDK-compatible Responses failure terminal.
 
     Keep only bounded protocol fields instead of retaining the parsed upstream
-    object graph behind an exception.  This is used only when the provider
-    explicitly emitted ``response.failed``; transport failures and generic
-    ``error`` events must never be promoted to this terminal.
+    object graph behind an exception.  This is used when the provider emitted
+    ``response.failed``.  A separately guarded builder below handles only
+    validated provider-declared ``type:error`` SSE events; transport and local
+    failures never enter either builder.
     """
 
     response_obj = payload.get("response")
@@ -119,6 +120,56 @@ def _canonical_response_failed_payload(
     normalized_payload: dict[str, Any] = {
         "type": "response.failed",
         "response": normalized_response,
+    }
+    sequence_number = payload.get("sequence_number")
+    if (
+        isinstance(sequence_number, int)
+        and not isinstance(sequence_number, bool)
+        and 0 <= sequence_number <= _MAX_SEQUENCE_NUMBER
+    ):
+        normalized_payload["sequence_number"] = sequence_number
+    return normalized_payload
+
+
+def _canonical_provider_error_response_failed_payload(
+    payload: dict[str, Any],
+    *,
+    message: str,
+    error_code: str | None,
+    error_type: str | None,
+    param: str | None,
+) -> dict[str, Any] | None:
+    """Normalize one explicitly validated provider ``type:error`` terminal."""
+
+    if payload.get("type") != "error":
+        return None
+
+    error_obj = payload.get("error")
+    if not isinstance(error_obj, dict):
+        return None
+    raw_message = error_obj.get("message")
+    if not isinstance(raw_message, str) or not _bounded_optional_text(
+        raw_message,
+        limit_bytes=4096,
+    ):
+        return None
+
+    normalized_error: dict[str, Any] = {"message": message}
+    normalized_error_type = _bounded_identifier(error_type)
+    normalized_error_code = _bounded_identifier(error_code)
+    if normalized_error_type:
+        normalized_error["type"] = normalized_error_type
+    if normalized_error_code:
+        normalized_error["code"] = normalized_error_code
+    if param:
+        normalized_error["param"] = param
+
+    normalized_payload: dict[str, Any] = {
+        "type": "response.failed",
+        "response": {
+            "status": "failed",
+            "error": normalized_error,
+        },
     }
     sequence_number = payload.get("sequence_number")
     if (
@@ -250,9 +301,10 @@ class ResponsesSemanticError(Exception):
         self.sse_payload = {"type": "error", **self.error_body}
         self.responses_sse_event_type = "error"
         self.responses_sse_payload = self.sse_payload
-        if event_type == "response.failed" and isinstance(
-            responses_sse_payload,
-            dict,
+        if (
+            isinstance(responses_sse_payload, dict)
+            and responses_sse_payload.get("type") == "response.failed"
+            and isinstance(responses_sse_payload.get("response"), dict)
         ):
             self.responses_sse_event_type = "response.failed"
             self.responses_sse_payload = responses_sse_payload
@@ -270,6 +322,7 @@ def responses_failure_error(
     event_type: str | None = None,
     wire_status_code: int | None = None,
     preserve_error_body: bool = False,
+    validated_provider_sse: bool = False,
 ) -> ResponsesSemanticError | None:
     if not isinstance(payload, dict):
         return None
@@ -382,6 +435,16 @@ def responses_failure_error(
             error_code=error_code,
             error_type=error_type,
             param=param,
+        )
+    elif normalized_event_type == "error" and validated_provider_sse:
+        responses_sse_payload = (
+            _canonical_provider_error_response_failed_payload(
+                payload,
+                message=message,
+                error_code=error_code,
+                error_type=error_type,
+                param=param,
+            )
         )
 
     return ResponsesSemanticError(

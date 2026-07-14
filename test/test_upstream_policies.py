@@ -1,4 +1,5 @@
 import httpx
+import pytest
 from fastapi import HTTPException
 
 from uni_api.upstream.policies import CooldownPolicy, ProviderErrorClassifier, RetryPolicy
@@ -178,6 +179,92 @@ def test_generic_error_event_is_not_promoted_to_response_failed():
     )
 
     assert error is not None
+    assert error.responses_sse_event_type == "error"
+    assert error.responses_sse_payload is error.sse_payload
+
+
+def test_validated_provider_error_event_has_detached_response_failed_terminal():
+    ignored = "y" * (7 * 1024 * 1024)
+    error = responses_failure_error(
+        {
+            "type": "error",
+            "sequence_number": 2,
+            "error": {
+                "code": " Context_Length_Exceeded ",
+                "type": " Invalid_Request_Error ",
+                "message": "input is too long",
+                "param": "input",
+                "ignored": {"attacker_owned": ignored},
+            },
+            "ignored": [ignored],
+        },
+        event_type="error",
+        wire_status_code=200,
+        validated_provider_sse=True,
+    )
+
+    assert error is not None
+    assert error.event_type == "error"
+    assert error.status_code == 400
+    assert error.responses_sse_event_type == "response.failed"
+    assert error.responses_sse_payload == {
+        "type": "response.failed",
+        "sequence_number": 2,
+        "response": {
+            "status": "failed",
+            "error": {
+                "code": "context_length_exceeded",
+                "type": "invalid_request_error",
+                "message": "input is too long",
+                "param": "input",
+            },
+        },
+    }
+    assert ignored not in str(error.responses_sse_payload)
+    assert len(str(error.responses_sse_payload).encode("utf-8")) < 8192
+
+
+def test_validated_provider_error_without_message_is_not_promoted():
+    error = responses_failure_error(
+        {
+            "type": "error",
+            "error": {"code": "context_length_exceeded"},
+        },
+        event_type="error",
+        validated_provider_sse=True,
+    )
+
+    assert error is not None
+    assert error.responses_sse_event_type == "error"
+    assert error.responses_sse_payload is error.sse_payload
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"error": {"message": "missing top-level type"}},
+        {
+            "type": "response.failed",
+            "error": {"message": "conflicting top-level type"},
+        },
+        {"type": 1, "error": {"message": "non-string top-level type"}},
+        {"type": "error", "error": "scalar error"},
+        {
+            "type": "error",
+            "error": {"message": " ", "code": "", "type": "\t"},
+        },
+        {"type": "error", "error": {"message": 1, "code": True}},
+    ],
+)
+def test_validated_provider_error_rejects_ambiguous_canonicalization(payload):
+    error = responses_failure_error(
+        payload,
+        event_type="error",
+        validated_provider_sse=True,
+    )
+
+    assert error is not None
+    assert error.event_type == "error"
     assert error.responses_sse_event_type == "error"
     assert error.responses_sse_payload is error.sse_payload
 

@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from uni_api.admission import RequestAdmissionController
+from uni_api.admission import AdmissionRejected, RequestAdmissionController
 from uni_api.disconnect import DOWNSTREAM_DISCONNECT_EVENT_SCOPE_KEY
 from uni_api.middleware.admission import (
     ADMISSION_WAIT_MS_STATE_KEY,
@@ -186,6 +186,59 @@ def test_body_reservation_rejection_is_mapped_before_response_start(
         assert headers[b"x-uni-api-admission-reason"] == expected_reason.encode()
         assert controller.snapshot()["active"] == 0
         assert controller.snapshot()["reserved_body_bytes"] == 0
+
+    asyncio.run(run())
+
+
+def test_large_body_slot_is_bounded_and_released_with_request():
+    async def run():
+        controller = _controller(
+            capacity=3,
+            max_body_bytes=64,
+            body_budget_bytes=192,
+            large_body_threshold_weighted_bytes=16,
+            large_body_limit=1,
+        )
+        first = await controller.acquire(initial_body_bytes=17)
+        second = await controller.acquire()
+        with pytest.raises(AdmissionRejected) as exc_info:
+            await second.reserve_body_bytes(17)
+        assert exc_info.value.reason == "large_body_capacity_exhausted"
+        assert controller.snapshot()["large_body_active"] == 1
+
+        await first.release()
+        await second.reserve_body_bytes(17)
+        assert controller.snapshot()["large_body_active"] == 1
+        await second.release()
+        assert controller.snapshot()["large_body_active"] == 0
+
+    asyncio.run(run())
+
+
+def test_pending_body_owns_and_transfers_large_body_slot():
+    async def run():
+        controller = _controller(
+            capacity=2,
+            max_body_bytes=64,
+            body_budget_bytes=192,
+            large_body_threshold_weighted_bytes=16,
+            large_body_limit=1,
+        )
+        pending = controller.pending_body_reservation()
+        await pending.reserve(17)
+        assert controller.snapshot()["large_body_active"] == 1
+
+        blocked = controller.pending_body_reservation()
+        with pytest.raises(AdmissionRejected) as exc_info:
+            await blocked.reserve(17)
+        assert exc_info.value.reason == "large_body_capacity_exhausted"
+
+        lease = await controller.acquire()
+        await pending.transfer_to(lease)
+        assert controller.snapshot()["large_body_active"] == 1
+        await lease.release()
+        assert controller.snapshot()["large_body_active"] == 0
+        await blocked.release()
 
     asyncio.run(run())
 

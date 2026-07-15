@@ -14,6 +14,7 @@ from uni_api.admission.resources import (
     startup_active_limit,
     startup_concurrency_from_environment,
     startup_cpu_worker_count,
+    startup_large_request_memory_limit,
     startup_per_request_memory_limit,
     tcp_socket_port_occupancy,
 )
@@ -136,6 +137,48 @@ def test_per_request_memory_limit_uses_process_fraction_and_fair_share():
             active_limit=11292,
         )
         == 292_112_547
+    )
+
+
+def test_large_request_memory_limit_honors_product_target_on_sized_runtime():
+    mib = 1024**2
+    assert (
+        startup_large_request_memory_limit(
+            process_memory_capacity_bytes=3432 * mib,
+            normal_request_limit_bytes=429 * mib,
+            product_wire_limit_bytes=128 * mib,
+            raw_memory_multiplier=5,
+        )
+        == 768 * mib
+    )
+
+
+def test_live_envelope_admits_the_rejected_request_with_one_large_slot():
+    mib = 1024**2
+    body_limit = startup_large_request_memory_limit(
+        process_memory_capacity_bytes=3432 * mib,
+        normal_request_limit_bytes=429 * mib,
+        product_wire_limit_bytes=128 * mib,
+        raw_memory_multiplier=5,
+    )
+    weighted_large_threshold = 128 * mib * 2
+    incident_estimate = 269_605_381
+
+    assert body_limit == 768 * mib
+    assert body_limit // 6 == 128 * mib
+    assert weighted_large_threshold < incident_estimate < body_limit
+
+
+def test_large_request_memory_limit_contracts_to_cgroup_fraction():
+    mib = 1024**2
+    assert (
+        startup_large_request_memory_limit(
+            process_memory_capacity_bytes=2 * 1024 * mib,
+            normal_request_limit_bytes=256 * mib,
+            product_wire_limit_bytes=128 * mib,
+            raw_memory_multiplier=5,
+        )
+        == 512 * mib
     )
 
 

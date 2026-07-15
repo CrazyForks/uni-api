@@ -428,12 +428,25 @@ active、有限 waiter、request body、buffered response、SSE parser 和 strea
 queue 分别记账。`GET /v1/observability/runtime` 会暴露探测输入、最终边界、
 reservation、rejection 与连接协议计数。
 
+JSON 请求大小使用同一套 cgroup 内存包络，不再采用固定的 256 MiB
+物化估算上限。在资源足够的 runtime 上，默认产品 wire 契约为 128 MiB。启动时
+按“原始 JSON 的五倍物化估算 + 一份 wire 大小余量”计算预算，单个大请求最多使用
+有效进程内存的 25%，并默认只启用 1 个独立的大请求槽位；只有探测到的内存包络能
+同时容纳两个大请求时，运维人员才可显式提高到 2。小请求继续使用原有的高并发通道。
+运行时观测端点会暴露实际 wire 上限、JSON 估算上限、加权
+reservation、大请求阈值、槽位数和当前占用。
+`REQUEST_LARGE_BODY_THRESHOLD_WEIGHTED_BYTES` 的单位是加权保留内存字节，
+不是原始 wire body 字节。
+
 主要覆盖项包括：`REQUEST_ADMISSION_CPU_MILLICORES`（适合 CPU weight
 没有平台含义的独立服务器）、`REQUEST_ADMISSION_ACTIVE_LIMIT`、
 `REQUEST_ADMISSION_WAITER_LIMIT`、`REQUEST_ADMISSION_TOTAL_LIMIT`、
 `REQUEST_ADMISSION_MAX_ACTIVE_LIMIT`、`MEMORY_SOFT_LIMIT_BYTES`、
 `REQUEST_ADMISSION_WAIT_TIMEOUT_SECONDS`、
 `MEMORY_GUARD_BYTES`、`MEMORY_GUARD_RATIO`、`UPSTREAM_POOL_SIZE`、
+`PRODUCT_REQUEST_MAX_BODY_BYTES`、`REQUEST_MAX_BODY_BYTES`、
+`REQUEST_JSON_COMPLEXITY_MAX_BYTES`、`REQUEST_BODY_RESERVATION_MAX_BYTES`、
+`REQUEST_LARGE_BODY_THRESHOLD_WEIGHTED_BYTES`、`REQUEST_LARGE_BODY_LIMIT`、
 `UVICORN_CONNECTION_LIMIT` 和 `UVICORN_HEADER_TIMEOUT_SECONDS`。显式配置若超过
 启动时安全包络会直接阻止启动，不会静默超配。该公式是资源安全上界，不是吞吐量承诺；
 大 CPU 规格仍必须使用真实业务负载压测。

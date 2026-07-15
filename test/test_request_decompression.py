@@ -457,7 +457,9 @@ def test_identity_json_complexity_rejection_stashes_exact_safe_diagnostics(
     monkeypatch.setattr(
         request_decompression,
         "IncrementalJSONMemoryEstimator",
-        lambda: estimator(**limits),
+        lambda **runtime_limits: estimator(
+            **{**runtime_limits, **limits},
+        ),
     )
     downstream_called = False
     state = {"test_marker": True}
@@ -511,7 +513,9 @@ def test_zstd_json_complexity_rejection_stashes_diagnostics_before_stats(
     monkeypatch.setattr(
         request_decompression,
         "IncrementalJSONMemoryEstimator",
-        lambda: estimator(max_estimated_bytes=1500),
+        lambda **runtime_limits: estimator(
+            **{**runtime_limits, "max_estimated_bytes": 1500},
+        ),
     )
     payload = b"[0"
     compressed = _zstd_compress(payload)

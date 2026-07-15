@@ -429,12 +429,27 @@ buffered responses, SSE parsers, and stream queues are separately accounted.
 `GET /v1/observability/runtime` exposes the detected inputs, selected bounds,
 reservations, rejections, and connection-protocol counters.
 
+JSON request sizing uses the same cgroup memory envelope instead of a fixed
+256 MiB materialization estimate. The default product wire contract is 128
+MiB on a sufficiently sized runtime. Startup budgets for the five-times raw
+JSON materialization estimate plus one wire-size unit of headroom, caps one
+large request at 25% of effective process memory, and starts with one separate
+large-body slot. Operators may raise it to two only when the detected memory
+envelope can contain both. Smaller requests keep the normal high-concurrency
+lane. The runtime observability endpoint exposes the effective
+wire, JSON estimate, weighted reservation, large-body threshold, limit, and
+active count. `REQUEST_LARGE_BODY_THRESHOLD_WEIGHTED_BYTES` is measured in
+weighted retained-memory bytes, not raw wire bytes.
+
 Primary overrides are `REQUEST_ADMISSION_CPU_MILLICORES` (useful when a
 standalone host's default CPU weight is not meaningful),
 `REQUEST_ADMISSION_ACTIVE_LIMIT`, `REQUEST_ADMISSION_WAITER_LIMIT`,
 `REQUEST_ADMISSION_TOTAL_LIMIT`, `REQUEST_ADMISSION_MAX_ACTIVE_LIMIT`,
 `REQUEST_ADMISSION_WAIT_TIMEOUT_SECONDS`,
 `MEMORY_SOFT_LIMIT_BYTES`, `MEMORY_GUARD_BYTES`, `MEMORY_GUARD_RATIO`,
+`PRODUCT_REQUEST_MAX_BODY_BYTES`, `REQUEST_MAX_BODY_BYTES`,
+`REQUEST_JSON_COMPLEXITY_MAX_BYTES`, `REQUEST_BODY_RESERVATION_MAX_BYTES`,
+`REQUEST_LARGE_BODY_THRESHOLD_WEIGHTED_BYTES`, `REQUEST_LARGE_BODY_LIMIT`,
 `UPSTREAM_POOL_SIZE`, `UVICORN_CONNECTION_LIMIT`, and
 `UVICORN_HEADER_TIMEOUT_SECONDS`. Explicit limits that exceed the detected
 startup safety envelope fail startup instead of silently overcommitting. The

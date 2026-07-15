@@ -13,6 +13,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from core.log_config import logger
 from uni_api.admission import get_request_admission_lease
 from uni_api.admission.json_memory import (
+    DEFAULT_JSON_MAX_ESTIMATED_BYTES,
     IncrementalJSONMemoryEstimator,
     JSONMemoryComplexityError,
     JSONMemoryComplexityObservation,
@@ -176,9 +177,18 @@ def request_body_complexity_diagnostics_from_scope(
 class _RequestBodyMemoryBudget:
     """Translate observed body bytes into a conservative live-memory charge."""
 
-    def __init__(self, *, json_body: bool) -> None:
+    def __init__(
+        self,
+        *,
+        json_body: bool,
+        json_max_estimated_bytes: int,
+    ) -> None:
         self._json_estimator = (
-            IncrementalJSONMemoryEstimator() if json_body else None
+            IncrementalJSONMemoryEstimator(
+                max_estimated_bytes=json_max_estimated_bytes,
+            )
+            if json_body
+            else None
         )
         self._observed_bytes = 0
         self._reserved_target = 0
@@ -236,6 +246,7 @@ class RequestBodyDecompressionMiddleware:
         max_identity_body_bytes: int | None = None,
         max_zstd_compressed_body_bytes: int | None = None,
         max_zstd_decompressed_body_bytes: int | None = None,
+        json_max_estimated_bytes: int = DEFAULT_JSON_MAX_ESTIMATED_BYTES,
         body_idle_timeout_seconds: float | None = None,
         body_total_timeout_seconds: float | None = None,
     ) -> None:
@@ -286,6 +297,9 @@ class RequestBodyDecompressionMiddleware:
         self.max_zstd_decompressed_body_bytes = _bounded_limit(
             max_zstd_decompressed_body_bytes
         )
+        self.json_max_estimated_bytes = _bounded_limit(
+            json_max_estimated_bytes
+        )
         self.body_idle_timeout_seconds = _positive_float(
             body_idle_timeout_seconds
             if body_idle_timeout_seconds is not None
@@ -327,6 +341,7 @@ class RequestBodyDecompressionMiddleware:
         body_memory_budget = _request_body_memory_budget(
             scope,
             headers,
+            json_max_estimated_bytes=self.json_max_estimated_bytes,
         )
         encodings = _content_encodings(headers)
         if not encodings or _is_identity(encodings):
@@ -501,6 +516,7 @@ class RequestBodyDecompressionMiddleware:
         body_memory_budget = _request_body_memory_budget(
             scope,
             scope.get("headers") or [],
+            json_max_estimated_bytes=self.json_max_estimated_bytes,
         )
 
         async def limited_receive() -> Message:
@@ -896,6 +912,8 @@ def _ensure_content_length_within(
 def _request_body_memory_budget(
     scope: Scope,
     headers: Iterable[tuple[bytes, bytes]],
+    *,
+    json_max_estimated_bytes: int,
 ) -> _RequestBodyMemoryBudget:
     content_types = [
         value.decode("latin-1", errors="replace").strip().lower()
@@ -909,7 +927,10 @@ def _request_body_memory_budget(
         json_body = str(scope.get("path") or "") in JSON_BODY_PATHS
     else:
         json_body = is_json_media_type(content_types[0])
-    return _RequestBodyMemoryBudget(json_body=json_body)
+    return _RequestBodyMemoryBudget(
+        json_body=json_body,
+        json_max_estimated_bytes=json_max_estimated_bytes,
+    )
 
 
 def _body_bytes_reservation_callback(

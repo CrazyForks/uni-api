@@ -31,6 +31,11 @@ class RequestBodyBudgetExhausted(AdmissionRejected):
         super().__init__("body_budget_exhausted", status_code=503)
 
 
+class LargeBodyCapacityExhausted(AdmissionRejected):
+    def __init__(self) -> None:
+        super().__init__("large_body_capacity_exhausted", status_code=503)
+
+
 class UpstreamResponseBudgetExhausted(AdmissionRejected):
     local_admission_rejection = True
 
@@ -348,6 +353,7 @@ class PendingBodyReservation:
         self._reserved_bytes = 0
         self._transferred = False
         self._released = False
+        self._large_body_slot = False
 
     @property
     def reserved_bytes(self) -> int:
@@ -404,6 +410,7 @@ class RequestAdmissionLease:
         self._released = False
         self._memory_owner_count = 0
         self._memory_finalized = False
+        self._large_body_slot = False
         self._release_task: asyncio.Task[None] | None = None
 
     @property
@@ -635,6 +642,8 @@ class RequestAdmissionController:
         body_budget_bytes: int,
         max_response_bytes: int | None = None,
         max_retained_bytes_per_request: int | None = None,
+        large_body_threshold_weighted_bytes: int = 0,
+        large_body_limit: int = 0,
         memory_governor: AdaptiveMemoryGovernor | None = None,
         clock: Callable[[], float] = monotonic,
     ) -> None:
@@ -644,6 +653,12 @@ class RequestAdmissionController:
             raise ValueError("body_budget_bytes cannot be negative")
         if max_response_bytes is not None and max_response_bytes < 0:
             raise ValueError("max_response_bytes cannot be negative")
+        if large_body_threshold_weighted_bytes < 0 or large_body_limit < 0:
+            raise ValueError("large body admission settings cannot be negative")
+        if bool(large_body_threshold_weighted_bytes) != bool(large_body_limit):
+            raise ValueError(
+                "large body threshold and limit must both be enabled or disabled"
+            )
 
         self.max_body_bytes = max_body_bytes
         self.body_budget_bytes = body_budget_bytes
@@ -655,6 +670,11 @@ class RequestAdmissionController:
             if max_retained_bytes_per_request is None
             else int(max_retained_bytes_per_request)
         )
+        self.large_body_threshold_weighted_bytes = int(
+            large_body_threshold_weighted_bytes
+        )
+        self.large_body_limit = int(large_body_limit)
+        self._large_body_active = 0
         if self.max_retained_bytes_per_request < 0:
             raise ValueError("max_retained_bytes_per_request cannot be negative")
         self._memory_governor = memory_governor
@@ -773,9 +793,17 @@ class RequestAdmissionController:
             ):
                 self._body_rejected["body_budget_exhausted"] += 1
                 raise RequestBodyBudgetExhausted()
+            self._ensure_large_body_slot_available_locked(
+                reservation,
+                next_request_bytes,
+            )
             if not self._reserve_parent_memory("request_body", additional_bytes):
                 self._body_rejected["body_budget_exhausted"] += 1
                 raise RequestBodyBudgetExhausted()
+            self._claim_large_body_slot_locked(
+                reservation,
+                next_request_bytes,
+            )
             reservation._reserved_bytes = next_request_bytes
             self._reserved_body_bytes += additional_bytes
             self._pending_body_reserved_bytes += additional_bytes
@@ -794,6 +822,13 @@ class RequestAdmissionController:
                 raise RuntimeError("pending body transfer exceeds request limit")
             if transferred > self._pending_body_reserved_bytes:
                 raise RuntimeError("pending body reservation underflow")
+            if reservation._large_body_slot:
+                if lease._large_body_slot:
+                    raise RuntimeError("large request admission double transfer")
+                lease._large_body_slot = True
+                reservation._large_body_slot = False
+            else:
+                self._claim_large_body_slot_locked(lease, next_request_bytes)
             lease._reserved_body_bytes = next_request_bytes
             reservation._reserved_bytes = 0
             self._pending_body_reserved_bytes -= transferred
@@ -813,6 +848,11 @@ class RequestAdmissionController:
             self._pending_body_reserved_bytes -= released
             self._reserved_body_bytes -= released
             self._release_parent_memory("request_body", released)
+            if reservation._large_body_slot:
+                if self._large_body_active <= 0:
+                    raise RuntimeError("large request admission underflow")
+                self._large_body_active -= 1
+                reservation._large_body_slot = False
 
     async def _reserve_additional(
         self,
@@ -840,9 +880,14 @@ class RequestAdmissionController:
             ):
                 self._body_rejected["body_budget_exhausted"] += 1
                 raise RequestBodyBudgetExhausted()
+            self._ensure_large_body_slot_available_locked(
+                lease,
+                next_request_bytes,
+            )
             if not self._reserve_parent_memory("request_body", additional_bytes):
                 self._body_rejected["body_budget_exhausted"] += 1
                 raise RequestBodyBudgetExhausted()
+            self._claim_large_body_slot_locked(lease, next_request_bytes)
             lease._reserved_body_bytes = next_request_bytes
             self._reserved_body_bytes += additional_bytes
 
@@ -1045,10 +1090,48 @@ class RequestAdmissionController:
         self._reserved_response_bytes -= reserved_response_bytes
         self._release_parent_memory("request_body", reserved_body_bytes)
         self._release_parent_memory("buffered_response", reserved_response_bytes)
+        if lease._large_body_slot:
+            if self._large_body_active <= 0:
+                raise RuntimeError("large request admission underflow")
+            self._large_body_active -= 1
+            lease._large_body_slot = False
         lease._reserved_body_bytes = 0
         lease._reserved_response_bytes = 0
         lease._memory_finalized = True
         self._deferred_memory_leases.discard(lease)
+
+    def _claim_large_body_slot_locked(
+        self,
+        lease: RequestAdmissionLease | PendingBodyReservation,
+        next_request_bytes: int,
+    ) -> None:
+        if (
+            not self.large_body_limit
+            or lease._large_body_slot
+            or next_request_bytes <= self.large_body_threshold_weighted_bytes
+        ):
+            return
+        self._ensure_large_body_slot_available_locked(
+            lease,
+            next_request_bytes,
+        )
+        self._large_body_active += 1
+        lease._large_body_slot = True
+
+    def _ensure_large_body_slot_available_locked(
+        self,
+        lease: RequestAdmissionLease | PendingBodyReservation,
+        next_request_bytes: int,
+    ) -> None:
+        if (
+            not self.large_body_limit
+            or lease._large_body_slot
+            or next_request_bytes <= self.large_body_threshold_weighted_bytes
+        ):
+            return
+        if self._large_body_active >= self.large_body_limit:
+            self._body_rejected["large_body_capacity_exhausted"] += 1
+            raise LargeBodyCapacityExhausted()
 
     def record_rejection(self, reason: str) -> None:
         normalized = str(reason or "").strip()
@@ -1098,6 +1181,11 @@ class RequestAdmissionController:
             "max_body_bytes": self.max_body_bytes,
             "max_response_bytes": self.max_response_bytes,
             "max_retained_bytes_per_request": self.max_retained_bytes_per_request,
+            "large_body_threshold_weighted_bytes": (
+                self.large_body_threshold_weighted_bytes
+            ),
+            "large_body_limit": self.large_body_limit,
+            "large_body_active": self._large_body_active,
             "memory_parent": parent_snapshot,
             "rejected": dict(rejected),
         }

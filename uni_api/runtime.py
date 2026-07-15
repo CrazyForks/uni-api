@@ -150,9 +150,11 @@ from uni_api.admission import (
     get_request_admission_lease,
 )
 from uni_api.admission.json_parsing import JSON_PARSE_CPU_WORKERS, run_json_cpu
+from uni_api.admission.json_memory import DEFAULT_JSON_RAW_MEMORY_MULTIPLIER
 from uni_api.admission.memory import process_memory_governor
 from uni_api.admission.resources import (
     startup_concurrency_from_environment,
+    startup_large_request_memory_limit,
     startup_per_request_memory_limit,
 )
 from uni_api.middleware.admission import RequestAdmissionMiddleware
@@ -268,6 +270,38 @@ def _env_int(name: str, default: int) -> int:
         return int(str(os.getenv(name, "")).strip() or default)
     except (TypeError, ValueError):
         return default
+
+
+def _bounded_env_int(name: str, default: int, maximum: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        value = int(default)
+    else:
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be an integer") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+    if value > maximum:
+        raise ValueError(
+            f"{name}={value} exceeds the startup safety limit {maximum}"
+        )
+    return value
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        value = int(default)
+    else:
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be an integer") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+    return value
 
 
 def _should_log_stdout_request_summary() -> bool:
@@ -791,6 +825,17 @@ class RuntimeGauges:
                 "max_retained_bytes_per_request"
             ),
             "request_wire_body_max_bytes": REQUEST_WIRE_BODY_MAX_BYTES,
+            "request_product_wire_body_max_bytes": (
+                _product_request_wire_body_max_bytes
+            ),
+            "request_json_complexity_max_bytes": (
+                REQUEST_JSON_COMPLEXITY_MAX_BYTES
+            ),
+            "request_large_body_threshold_weighted_bytes": admission.get(
+                "large_body_threshold_weighted_bytes"
+            ),
+            "request_large_body_limit": admission.get("large_body_limit"),
+            "request_large_body_active": admission.get("large_body_active"),
             "json_parse_cpu_workers": JSON_PARSE_CPU_WORKERS,
             "request_body_cpu_workers": REQUEST_BODY_CPU_WORKERS,
             "upstream_response_cpu_workers": UPSTREAM_RESPONSE_CPU_WORKERS,
@@ -1009,38 +1054,62 @@ _startup_per_request_memory_limit = startup_per_request_memory_limit(
     process_memory_capacity_bytes=_startup_process_memory_capacity,
     active_limit=REQUEST_ADMISSION_ACTIVE_LIMIT,
 )
-REQUEST_BODY_RESERVATION_MAX_BYTES = max(
+_product_request_wire_body_max_bytes = _positive_env_int(
+    "PRODUCT_REQUEST_MAX_BODY_BYTES",
+    128 * 1024 * 1024,
+)
+_startup_large_request_memory_limit = startup_large_request_memory_limit(
+    process_memory_capacity_bytes=_startup_process_memory_capacity,
+    normal_request_limit_bytes=_startup_per_request_memory_limit,
+    product_wire_limit_bytes=_product_request_wire_body_max_bytes,
+    raw_memory_multiplier=DEFAULT_JSON_RAW_MEMORY_MULTIPLIER,
+)
+_large_request_process_ceiling = max(
+    _startup_per_request_memory_limit,
+    _startup_process_memory_capacity // 4,
+)
+REQUEST_BODY_RESERVATION_MAX_BYTES = _bounded_env_int(
+    "REQUEST_BODY_RESERVATION_MAX_BYTES",
+    _startup_large_request_memory_limit,
+    _large_request_process_ceiling,
+)
+REQUEST_JSON_COMPLEXITY_MAX_BYTES = _bounded_env_int(
+    "REQUEST_JSON_COMPLEXITY_MAX_BYTES",
+    min(
+        _startup_large_request_memory_limit,
+        REQUEST_BODY_RESERVATION_MAX_BYTES,
+    ),
+    REQUEST_BODY_RESERVATION_MAX_BYTES,
+)
+_json_request_budget_multiplier = DEFAULT_JSON_RAW_MEMORY_MULTIPLIER + 1
+_resource_safe_wire_body_max_bytes = max(
     1,
-    _env_int(
-        "REQUEST_BODY_RESERVATION_MAX_BYTES",
-        _startup_per_request_memory_limit,
+    min(
+        _product_request_wire_body_max_bytes,
+        REQUEST_JSON_COMPLEXITY_MAX_BYTES // _json_request_budget_multiplier,
+        REQUEST_BODY_RESERVATION_MAX_BYTES // _json_request_budget_multiplier,
     ),
 )
-_request_wire_body_default = max(1, REQUEST_BODY_RESERVATION_MAX_BYTES // 4)
-REQUEST_WIRE_BODY_MAX_BYTES = max(
-    1,
-    _env_int(
-        "REQUEST_MAX_BODY_BYTES",
-        _request_wire_body_default,
-    ),
+REQUEST_WIRE_BODY_MAX_BYTES = _bounded_env_int(
+    "REQUEST_MAX_BODY_BYTES",
+    _resource_safe_wire_body_max_bytes,
+    _resource_safe_wire_body_max_bytes,
 )
-_legacy_zstd_wire_body_max_bytes = max(
-    1,
-    _env_int("ZSTD_REQUEST_MAX_BODY_BYTES", _request_wire_body_default),
+_request_wire_body_default = REQUEST_WIRE_BODY_MAX_BYTES
+_legacy_zstd_wire_body_max_bytes = _bounded_env_int(
+    "ZSTD_REQUEST_MAX_BODY_BYTES",
+    _request_wire_body_default,
+    _resource_safe_wire_body_max_bytes,
 )
-ZSTD_REQUEST_COMPRESSED_MAX_BYTES = max(
-    1,
-    _env_int(
-        "ZSTD_REQUEST_MAX_COMPRESSED_BODY_BYTES",
-        _legacy_zstd_wire_body_max_bytes,
-    ),
+ZSTD_REQUEST_COMPRESSED_MAX_BYTES = _bounded_env_int(
+    "ZSTD_REQUEST_MAX_COMPRESSED_BODY_BYTES",
+    _legacy_zstd_wire_body_max_bytes,
+    _resource_safe_wire_body_max_bytes,
 )
-ZSTD_REQUEST_DECOMPRESSED_MAX_BYTES = max(
-    1,
-    _env_int(
-        "ZSTD_REQUEST_MAX_DECOMPRESSED_BODY_BYTES",
-        _legacy_zstd_wire_body_max_bytes,
-    ),
+ZSTD_REQUEST_DECOMPRESSED_MAX_BYTES = _bounded_env_int(
+    "ZSTD_REQUEST_MAX_DECOMPRESSED_BODY_BYTES",
+    _legacy_zstd_wire_body_max_bytes,
+    _resource_safe_wire_body_max_bytes,
 )
 REQUEST_BODY_BUDGET_BYTES = max(
     1,
@@ -1055,6 +1124,27 @@ REQUEST_RESPONSE_RESERVATION_MAX_BYTES = max(
         "REQUEST_RESPONSE_RESERVATION_MAX_BYTES",
         _startup_per_request_memory_limit,
     ),
+)
+REQUEST_LARGE_BODY_THRESHOLD_WEIGHTED_BYTES = _bounded_env_int(
+    "REQUEST_LARGE_BODY_THRESHOLD_WEIGHTED_BYTES",
+    min(
+        _startup_per_request_memory_limit,
+        _product_request_wire_body_max_bytes * 2,
+    ),
+    REQUEST_BODY_RESERVATION_MAX_BYTES,
+)
+_startup_large_body_limit_max = max(
+    1,
+    min(
+        2,
+        _startup_process_memory_capacity
+        // max(1, REQUEST_BODY_RESERVATION_MAX_BYTES),
+    ),
+)
+REQUEST_LARGE_BODY_LIMIT = _bounded_env_int(
+    "REQUEST_LARGE_BODY_LIMIT",
+    1,
+    _startup_large_body_limit_max,
 )
 UPSTREAM_POOL_SIZE = max(
     1,
@@ -1080,6 +1170,10 @@ request_admission_controller = RequestAdmissionController(
     max_body_bytes=REQUEST_BODY_RESERVATION_MAX_BYTES,
     body_budget_bytes=REQUEST_BODY_BUDGET_BYTES,
     max_response_bytes=REQUEST_RESPONSE_RESERVATION_MAX_BYTES,
+    large_body_threshold_weighted_bytes=(
+        REQUEST_LARGE_BODY_THRESHOLD_WEIGHTED_BYTES
+    ),
+    large_body_limit=REQUEST_LARGE_BODY_LIMIT,
     memory_governor=process_memory_governor,
 )
 runtime_gauges.attach_request_admission(request_admission_controller.snapshot)
@@ -2323,6 +2417,7 @@ app.add_middleware(
     max_identity_body_bytes=REQUEST_WIRE_BODY_MAX_BYTES,
     max_zstd_compressed_body_bytes=ZSTD_REQUEST_COMPRESSED_MAX_BYTES,
     max_zstd_decompressed_body_bytes=ZSTD_REQUEST_DECOMPRESSED_MAX_BYTES,
+    json_max_estimated_bytes=REQUEST_JSON_COMPLEXITY_MAX_BYTES,
 )
 
 @app.middleware("http")

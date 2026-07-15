@@ -1,5 +1,7 @@
 import asyncio
 
+import pytest
+
 import uni_api.runtime as runtime
 from uni_api.runtime import RuntimeGauges
 from uni_api.streaming.bounded_queue import ByteBoundedQueue
@@ -20,6 +22,9 @@ def test_runtime_snapshot_uses_authoritative_admission_and_cached_network_state(
             "deferred_memory_requests": 2,
             "deferred_memory_bytes": 3333,
             "body_budget": 5678,
+            "large_body_threshold_weighted_bytes": 1024,
+            "large_body_limit": 2,
+            "large_body_active": 1,
             "rejected": {"queue_full": 3},
         }
     )
@@ -48,6 +53,9 @@ def test_runtime_snapshot_uses_authoritative_admission_and_cached_network_state(
     assert snapshot["request_body_reserved_weighted_bytes"] == 1234
     assert snapshot["upstream_response_reserved_weighted_bytes"] == 4321
     assert snapshot["request_retained_reserved_weighted_bytes"] == 5555
+    assert snapshot["request_large_body_threshold_weighted_bytes"] == 1024
+    assert snapshot["request_large_body_limit"] == 2
+    assert snapshot["request_large_body_active"] == 1
     assert snapshot["request_deferred_memory_requests"] == 2
     assert snapshot["request_deferred_memory_weighted_bytes"] == 3333
     assert snapshot["stream_parser_reserved_bytes"] == 777
@@ -58,6 +66,24 @@ def test_runtime_snapshot_uses_authoritative_admission_and_cached_network_state(
     assert snapshot["request_admission_rejected_total"] == 3
     assert snapshot["open_sockets"] == 4
     assert snapshot["tcp_close_wait"] == 1
+
+
+def test_bounded_env_int_rejects_unsafe_override(monkeypatch):
+    monkeypatch.setenv("TEST_BOUNDED_LIMIT", "101")
+    with pytest.raises(ValueError, match="startup safety limit 100"):
+        runtime._bounded_env_int("TEST_BOUNDED_LIMIT", 50, 100)
+
+
+def test_bounded_env_int_rejects_invalid_override(monkeypatch):
+    monkeypatch.setenv("TEST_BOUNDED_LIMIT", "not-an-int")
+    with pytest.raises(ValueError, match="must be an integer"):
+        runtime._bounded_env_int("TEST_BOUNDED_LIMIT", 50, 100)
+
+
+def test_positive_env_int_rejects_nonpositive_override(monkeypatch):
+    monkeypatch.setenv("TEST_POSITIVE_LIMIT", "0")
+    with pytest.raises(ValueError, match="must be positive"):
+        runtime._positive_env_int("TEST_POSITIVE_LIMIT", 50)
 
 
 def test_runtime_observability_endpoint_bypasses_request_admission():

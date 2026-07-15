@@ -25,6 +25,8 @@ _DEFAULT_EPHEMERAL_PORT_UTILIZATION = 0.80
 _DEFAULT_PER_REQUEST_MEMORY_MIN = 8 * 1024 * 1024
 _DEFAULT_PER_REQUEST_PROCESS_RATIO = 0.125
 _DEFAULT_PER_REQUEST_FAIR_SHARE_MULTIPLIER = 32
+_DEFAULT_LARGE_REQUEST_PROCESS_RATIO = 0.25
+_DEFAULT_JSON_REQUEST_HEADROOM_MULTIPLIER = 1
 
 
 def _read_text(path: Path) -> str | None:
@@ -314,6 +316,46 @@ def startup_per_request_memory_limit(
         // active_limit,
     )
     return min(process_ceiling, max(minimum_bytes, fair_burst))
+
+
+def startup_large_request_memory_limit(
+    *,
+    process_memory_capacity_bytes: int,
+    normal_request_limit_bytes: int,
+    product_wire_limit_bytes: int,
+    raw_memory_multiplier: int,
+    maximum_process_ratio: float = _DEFAULT_LARGE_REQUEST_PROCESS_RATIO,
+    headroom_multiplier: int = _DEFAULT_JSON_REQUEST_HEADROOM_MULTIPLIER,
+) -> int:
+    """Derive a bounded large-JSON allowance from the effective cgroup.
+
+    The product wire limit remains stable on sufficiently sized runtimes. A
+    smaller runtime degrades to its safe per-request ceiling instead of
+    allowing one request to consume an unbounded share of process memory.
+    """
+
+    values = (
+        process_memory_capacity_bytes,
+        normal_request_limit_bytes,
+        product_wire_limit_bytes,
+        raw_memory_multiplier,
+        headroom_multiplier,
+    )
+    if any(value <= 0 for value in values):
+        raise ValueError("large request memory sizing inputs must be positive")
+    if not 0 < maximum_process_ratio < 1:
+        raise ValueError("maximum_process_ratio must be between zero and one")
+    process_ceiling = max(
+        1,
+        math.floor(process_memory_capacity_bytes * maximum_process_ratio),
+    )
+    product_target = product_wire_limit_bytes * (
+        raw_memory_multiplier + headroom_multiplier
+    )
+    return max(
+        normal_request_limit_bytes,
+        min(product_target, process_ceiling),
+    )
 
 
 def process_nofile_soft_limit() -> int | None:

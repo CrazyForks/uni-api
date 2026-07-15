@@ -69,6 +69,111 @@ async def test_openai_gpt_adapter_builds_request_from_golden_fixture():
     assert upstream_request.headers["Authorization"] == "Bearer upstream-key"
     assert upstream_request.payload["model"] == "gpt-4.1"
     assert upstream_request.payload["messages"][0]["content"] == "hello"
+    assert "service_tier" not in upstream_request.payload
+
+
+@pytest.mark.parametrize(
+    "service_tier",
+    ["fast", "priority", " PRIORITY ", "default"],
+)
+async def test_openai_gpt_chat_adapter_preserves_service_tier(service_tier):
+    request = RequestModel(
+        model="gpt-5.6-sol",
+        messages=[{"role": "user", "content": "hello"}],
+        service_tier=service_tier,
+    )
+    provider = {
+        "provider": "openai-a",
+        "base_url": "https://api.example.com/v1",
+        "api": "upstream-key",
+        "model": ["gpt-5.6-sol"],
+    }
+
+    upstream_request = await openai_gpt_adapter.build_request(
+        ProviderRequestContext(
+            request=request,
+            provider=provider,
+            engine="gpt",
+            original_model="gpt-5.6-sol",
+            api_key="upstream-key",
+            endpoint="/v1/chat/completions",
+        )
+    )
+
+    assert upstream_request.payload["service_tier"] == service_tier
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {
+            "service_tier": "priority",
+            "gpt-5.6-sol": {"__remove__": ["service_tier"]},
+        },
+        {
+            "__remove__": ["service_tier"],
+            "gpt-5.6-sol": {"service_tier": "priority"},
+        },
+    ],
+)
+async def test_openai_gpt_chat_service_tier_ignores_provider_overrides(overrides):
+    request = RequestModel(
+        model="gpt-5.6-sol",
+        messages=[{"role": "user", "content": "hello"}],
+        service_tier="fast",
+    )
+    provider = {
+        "provider": "openai-a",
+        "base_url": "https://api.example.com/v1",
+        "api": "upstream-key",
+        "model": ["gpt-5.6-sol"],
+        "preferences": {"post_body_parameter_overrides": overrides},
+    }
+
+    upstream_request = await openai_gpt_adapter.build_request(
+        ProviderRequestContext(
+            request=request,
+            provider=provider,
+            engine="gpt",
+            original_model="gpt-5.6-sol",
+            api_key="upstream-key",
+            endpoint="/v1/chat/completions",
+        )
+    )
+
+    assert upstream_request.payload["service_tier"] == "fast"
+
+
+async def test_openai_gpt_chat_provider_override_cannot_inject_service_tier():
+    request = RequestModel(
+        model="gpt-5.6-sol",
+        messages=[{"role": "user", "content": "hello"}],
+    )
+    provider = {
+        "provider": "openai-a",
+        "base_url": "https://api.example.com/v1",
+        "api": "upstream-key",
+        "model": ["gpt-5.6-sol"],
+        "preferences": {
+            "post_body_parameter_overrides": {
+                "service_tier": "default",
+                "gpt-5.6-sol": {"service_tier": "priority"},
+            }
+        },
+    }
+
+    upstream_request = await openai_gpt_adapter.build_request(
+        ProviderRequestContext(
+            request=request,
+            provider=provider,
+            engine="gpt",
+            original_model="gpt-5.6-sol",
+            api_key="upstream-key",
+            endpoint="/v1/chat/completions",
+        )
+    )
+
+    assert "service_tier" not in upstream_request.payload
 
 
 def test_default_provider_registry_allows_engine_lookup_without_runner_changes():
@@ -117,6 +222,121 @@ async def test_codex_adapter_builds_responses_request_from_chat_shape():
     assert upstream_request.payload["model"] == "gpt-5.4"
     assert upstream_request.payload["input"][0]["type"] == "message"
     assert upstream_request.payload["input"][0]["content"][0]["type"] == "input_text"
+
+
+@pytest.mark.parametrize(
+    ("requested_tier", "expected_tier"),
+    [
+        ("priority", "priority"),
+        ("fast", "fast"),
+        (" PRIORITY ", " PRIORITY "),
+        ("default", "default"),
+    ],
+)
+async def test_codex_chat_adapter_preserves_service_tier(
+    requested_tier,
+    expected_tier,
+):
+    request = RequestModel(
+        model="gpt-5.6-sol",
+        messages=[{"role": "user", "content": "hello"}],
+        service_tier=requested_tier,
+    )
+    provider = {
+        "provider": "codex-a",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api": "upstream-key",
+        "engine": "codex",
+        "model": ["gpt-5.6-sol"],
+    }
+
+    upstream_request = await codex_adapter.build_request(
+        ProviderRequestContext(
+            request=request,
+            provider=provider,
+            engine="codex",
+            original_model="gpt-5.6-sol",
+            api_key="upstream-key",
+            endpoint="/v1/chat/completions",
+        )
+    )
+
+    assert upstream_request.payload["service_tier"] == expected_tier
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {
+            "service_tier": "default",
+            "gpt-5.6-sol": {"__remove__": ["service_tier"]},
+        },
+        {
+            "__remove__": ["service_tier"],
+            "gpt-5.6-sol": {"service_tier": "default"},
+        },
+    ],
+)
+async def test_codex_chat_service_tier_ignores_provider_overrides(overrides):
+    request = RequestModel(
+        model="gpt-5.6-sol",
+        messages=[{"role": "user", "content": "hello"}],
+        service_tier="priority",
+    )
+    provider = {
+        "provider": "codex-a",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api": "upstream-key",
+        "engine": "codex",
+        "model": ["gpt-5.6-sol"],
+        "preferences": {"post_body_parameter_overrides": overrides},
+    }
+
+    upstream_request = await codex_adapter.build_request(
+        ProviderRequestContext(
+            request=request,
+            provider=provider,
+            engine="codex",
+            original_model="gpt-5.6-sol",
+            api_key="upstream-key",
+            endpoint="/v1/chat/completions",
+        )
+    )
+
+    assert upstream_request.payload["service_tier"] == "priority"
+
+
+async def test_codex_chat_provider_override_cannot_inject_service_tier():
+    request = RequestModel(
+        model="gpt-5.6-sol",
+        messages=[{"role": "user", "content": "hello"}],
+    )
+    provider = {
+        "provider": "codex-a",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api": "upstream-key",
+        "engine": "codex",
+        "model": ["gpt-5.6-sol"],
+        "preferences": {
+            "post_body_parameter_overrides": {
+                "service_tier": "default",
+                "gpt-5.6-sol": {"service_tier": "priority"},
+            }
+        },
+    }
+
+    upstream_request = await codex_adapter.build_request(
+        ProviderRequestContext(
+            request=request,
+            provider=provider,
+            engine="codex",
+            original_model="gpt-5.6-sol",
+            api_key="upstream-key",
+            endpoint="/v1/chat/completions",
+        )
+    )
+
+    assert "service_tier" not in upstream_request.payload
 
 
 async def test_codex_adapter_infers_empty_tool_call_name_from_unique_tool_schema():

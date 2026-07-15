@@ -5943,7 +5943,7 @@ class ResponsesRequestExecution:
             payload,
             attempt.provider,
             self.request_model_name,
-            skip_keys={"translation_options"},
+            skip_keys={"service_tier", "translation_options"},
         )
         if engine == "codex":
             strip_unsupported_codex_payload_fields(payload, strip_store=attempt.state["wants_compact"])

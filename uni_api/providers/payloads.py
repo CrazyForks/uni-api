@@ -51,12 +51,23 @@ CODEX_CLI_VERSION = "0.144.0"
 CODEX_USER_AGENT = f"codex_cli_rs/{CODEX_CLI_VERSION} (Debian 13.0.0; x86_64) WindowsTerminal"
 _FORCED_CODEX_CLIENT_HEADER_KEYS = {"version", "user-agent"}
 
+
 def force_codex_client_headers(headers: dict) -> dict:
     for key in list(headers.keys()):
         if str(key).lower() in _FORCED_CODEX_CLIENT_HEADER_KEYS:
             headers.pop(key, None)
     headers["User-Agent"] = CODEX_USER_AGENT
     return headers
+
+
+def _apply_explicit_service_tier(payload: dict, request: RequestModel) -> dict:
+    # RequestModel excludes this provider control from generic model_dump calls
+    # so it cannot leak to unsupported providers. Supporting adapters opt in.
+    service_tier = getattr(request, "service_tier", None)
+    if service_tier is not None:
+        payload["service_tier"] = service_tier
+    return payload
+
 
 def _decode_gemini_thought_signature_from_tool_call_id(tool_call_id: str | None) -> str | None:
     if not tool_call_id or not tool_call_id.startswith("call_"):
@@ -1629,6 +1640,9 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
             "messages": messages,
         }
 
+    # OpenAI-compatible providers receive the wire value exactly as supplied.
+    _apply_explicit_service_tier(payload, request)
+
     miss_fields = [
         'model',
         'messages',
@@ -1723,7 +1737,12 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
                     }
                 })
 
-    apply_post_body_parameter_overrides(payload, provider, request.model)
+    apply_post_body_parameter_overrides(
+        payload,
+        provider,
+        request.model,
+        skip_keys={"service_tier"},
+    )
 
     return url, headers, payload
 
@@ -2055,6 +2074,8 @@ async def get_codex_payload(request, engine, provider, api_key=None):
         "store": False,
     }
 
+    _apply_explicit_service_tier(payload, request)
+
     if request.stream is not None:
         payload["stream"] = bool(request.stream)
 
@@ -2116,7 +2137,12 @@ async def get_codex_payload(request, engine, provider, api_key=None):
     headers.setdefault("Accept", "text/event-stream" if request.stream else "application/json")
     force_codex_client_headers(headers)
 
-    apply_post_body_parameter_overrides(payload, provider, request.model)
+    apply_post_body_parameter_overrides(
+        payload,
+        provider,
+        request.model,
+        skip_keys={"service_tier"},
+    )
 
     strip_codex_image_generation_defaults(payload, original_model)
     strip_unsupported_codex_payload_fields(payload)

@@ -785,6 +785,137 @@ def test_responses_codex_strips_max_output_tokens(monkeypatch):
     assert "max_output_tokens" not in sent_payload
 
 
+@pytest.mark.parametrize(
+    ("requested_tier", "expected_tier"),
+    [
+        ("priority", "priority"),
+        ("fast", "fast"),
+        (" PRIORITY ", " PRIORITY "),
+        ("default", "default"),
+    ],
+)
+def test_responses_codex_preserves_service_tier(
+    monkeypatch,
+    requested_tier,
+    expected_tier,
+):
+    client_manager = _configure_responses_test(monkeypatch, engine="codex")
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+            service_tier=requested_tier,
+        )
+    )
+
+    assert response.status_code == 200
+    sent_payload = json.loads(client_manager.post_calls[0]["content"])
+    assert sent_payload["service_tier"] == expected_tier
+
+
+def test_responses_gpt_preserves_service_tier(monkeypatch):
+    client_manager = _configure_responses_test(monkeypatch, engine="gpt")
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+            service_tier="fast",
+        )
+    )
+
+    assert response.status_code == 200
+    sent_payload = json.loads(client_manager.post_calls[0]["content"])
+    assert sent_payload["service_tier"] == "fast"
+
+
+@pytest.mark.parametrize(
+    ("engine", "endpoint"),
+    [
+        ("gpt", "/v1/responses"),
+        ("codex", "/v1/responses"),
+        ("gpt", "/v1/responses/compact"),
+        ("codex", "/v1/responses/compact"),
+    ],
+)
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {
+            "service_tier": "default",
+            "gpt-5.4": {"__remove__": ["service_tier"]},
+        },
+        {
+            "__remove__": ["service_tier"],
+            "gpt-5.4": {"service_tier": "default"},
+        },
+    ],
+)
+def test_responses_service_tier_ignores_provider_overrides(
+    monkeypatch,
+    engine,
+    endpoint,
+    overrides,
+):
+    client_manager = _configure_responses_test(
+        monkeypatch,
+        engine=engine,
+        provider_preferences={"post_body_parameter_overrides": overrides},
+    )
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+            service_tier="priority",
+        ),
+        endpoint=endpoint,
+    )
+
+    assert response.status_code == 200
+    sent_payload = json.loads(client_manager.post_calls[0]["content"])
+    assert sent_payload["service_tier"] == "priority"
+
+
+@pytest.mark.parametrize(
+    ("engine", "endpoint"),
+    [
+        ("gpt", "/v1/responses"),
+        ("codex", "/v1/responses"),
+        ("gpt", "/v1/responses/compact"),
+        ("codex", "/v1/responses/compact"),
+    ],
+)
+def test_responses_provider_override_cannot_inject_service_tier(
+    monkeypatch,
+    engine,
+    endpoint,
+):
+    client_manager = _configure_responses_test(
+        monkeypatch,
+        engine=engine,
+        provider_preferences={
+            "post_body_parameter_overrides": {
+                "service_tier": "default",
+                "gpt-5.4": {"service_tier": "priority"},
+            }
+        },
+    )
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+        ),
+        endpoint=endpoint,
+    )
+
+    assert response.status_code == 200
+    sent_payload = json.loads(client_manager.post_calls[0]["content"])
+    assert "service_tier" not in sent_payload
+
+
 def test_responses_codex_strips_response_format(monkeypatch):
     client_manager = _configure_responses_test(monkeypatch, engine="codex")
 

@@ -218,6 +218,21 @@ class RequestAdmissionMiddleware:
         available_replayed_credit = 0
         admission_started_at = monotonic()
         release_reason = "request_completed"
+
+        def no_response_expected_disconnect() -> bool:
+            state = scope.get("state")
+            disconnect_event = (
+                state.get(DOWNSTREAM_DISCONNECT_EVENT_SCOPE_KEY)
+                if isinstance(state, dict)
+                else None
+            )
+            return (
+                release_reason == "request_body_disconnected"
+                and not response_started
+                and isinstance(disconnect_event, asyncio.Event)
+                and disconnect_event.is_set()
+            )
+
         try:
             lease = await self.controller.try_acquire()
             if lease is None:
@@ -335,18 +350,16 @@ class RequestAdmissionMiddleware:
                 else f"{rejection_reason}_response_incomplete"
             )
         except asyncio.CancelledError:
-            release_reason = (
-                "request_cancelled"
-                if release_reason == "request_completed"
-                else f"{release_reason}_response_write_cancelled"
-            )
+            if release_reason == "request_completed":
+                release_reason = "request_cancelled"
+            elif not no_response_expected_disconnect():
+                release_reason = f"{release_reason}_response_write_cancelled"
             raise
         except BaseException:
-            release_reason = (
-                "request_error"
-                if release_reason == "request_completed"
-                else f"{release_reason}_response_write_failed"
-            )
+            if release_reason == "request_completed":
+                release_reason = "request_error"
+            elif not no_response_expected_disconnect():
+                release_reason = f"{release_reason}_response_write_failed"
             raise
         finally:
             state = scope.get("state")

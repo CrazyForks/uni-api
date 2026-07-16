@@ -548,6 +548,7 @@ class RequestBodyDecompressionMiddleware:
             )
             return
         except RequestBodyDisconnected:
+            disconnect_event.set()
             await _observe_body_early_response(
                 scope,
                 499,

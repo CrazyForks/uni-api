@@ -1320,6 +1320,7 @@ def test_zstd_disconnect_does_not_decode_partial_body_or_call_app():
     async def reserve_body_bytes(size: int) -> None:
         reserved.append(size)
 
+    state = {"uni_api_reserve_body_bytes": reserve_body_bytes}
     compressed = _zstd_compress(b"body")
     middleware = RequestBodyDecompressionMiddleware(
         downstream,
@@ -1339,13 +1340,16 @@ def test_zstd_disconnect_does_not_decode_partial_body_or_call_app():
                 {"type": "http.disconnect"},
             ],
             headers=[(b"content-encoding", b"zstd")],
-            state={"uni_api_reserve_body_bytes": reserve_body_bytes},
+            state=state,
         )
     )
 
     assert messages == []
     assert app_called is False
     assert reserved == [2]
+    disconnect_event = state[DOWNSTREAM_DISCONNECT_EVENT_SCOPE_KEY]
+    assert isinstance(disconnect_event, asyncio.Event)
+    assert disconnect_event.is_set()
 
 
 def test_zstd_limit_environment_is_backwards_compatible(monkeypatch):

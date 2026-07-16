@@ -2,6 +2,7 @@ import asyncio
 import json
 
 import pytest
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from uni_api.admission import (
     AdmissionRejected,
@@ -19,6 +20,7 @@ from uni_api.middleware.admission import (
 )
 from uni_api.middleware.request_decompression import (
     BODY_EARLY_RESPONSE_OBSERVER_SCOPE_KEY,
+    RequestBodyDecompressionMiddleware,
 )
 
 
@@ -529,6 +531,211 @@ def test_early_body_response_write_failure_is_preserved_as_release_reason():
         assert decisions[-1].decision == "release"
         assert decisions[-1].release_reason == (
             "body_too_large_response_write_failed"
+        )
+        assert controller.snapshot()["active"] == 0
+
+    asyncio.run(run())
+
+
+def test_upload_disconnect_preserves_no_response_expected_release_reason():
+    async def run():
+        decisions = []
+        controller = _controller(
+            capacity=1,
+            max_body_bytes=4096,
+            body_budget_bytes=4096,
+            large_body_threshold_weighted_bytes=1,
+            large_body_limit=1,
+            decision_observer=decisions.append,
+        )
+
+        async def consume_body(_scope, receive, send):
+            while True:
+                message = await receive()
+                if not message.get("more_body", False):
+                    break
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        body_middleware = RequestBodyDecompressionMiddleware(
+            consume_body,
+            max_identity_body_bytes=64,
+        )
+
+        async def passthrough(request, call_next):
+            return await call_next(request)
+
+        app = RequestAdmissionMiddleware(
+            BaseHTTPMiddleware(body_middleware, dispatch=passthrough),
+            controller=controller,
+        )
+        messages = asyncio.Queue()
+        await messages.put(
+            {"type": "http.request", "body": b"ab", "more_body": True}
+        )
+        await messages.put({"type": "http.disconnect"})
+
+        async def receive():
+            return await messages.get()
+
+        scope = _scope()
+        scope["headers"] = [
+            (b"content-length", b"4"),
+            (b"content-type", b"application/json"),
+        ]
+        with pytest.raises(RuntimeError, match="No response returned"):
+            await app(scope, receive, lambda _message: asyncio.sleep(0))
+
+        assert [event.decision for event in decisions] == ["claim", "release"]
+        assert decisions[-1].release_reason == "request_body_disconnected"
+        snapshot = controller.snapshot()
+        assert snapshot["active"] == 0
+        assert snapshot["reserved_body_bytes"] == 0
+        assert snapshot["large_body_active"] == 0
+
+    asyncio.run(run())
+
+
+def test_real_upload_disconnect_cancellation_preserves_release_reason():
+    async def run():
+        decisions = []
+        controller = _controller(
+            capacity=1,
+            max_body_bytes=4096,
+            body_budget_bytes=4096,
+            large_body_threshold_weighted_bytes=1,
+            large_body_limit=1,
+            decision_observer=decisions.append,
+        )
+
+        async def consume_body(_scope, receive, _send):
+            while True:
+                message = await receive()
+                if not message.get("more_body", False):
+                    break
+
+        body_middleware = RequestBodyDecompressionMiddleware(
+            consume_body,
+            max_identity_body_bytes=64,
+        )
+
+        async def cancel_after_disconnect(scope, receive, send):
+            await body_middleware(scope, receive, send)
+            raise asyncio.CancelledError
+
+        app = RequestAdmissionMiddleware(
+            cancel_after_disconnect,
+            controller=controller,
+        )
+        messages = asyncio.Queue()
+        await messages.put(
+            {"type": "http.request", "body": b"ab", "more_body": True}
+        )
+        await messages.put({"type": "http.disconnect"})
+
+        async def receive():
+            return await messages.get()
+
+        scope = _scope()
+        scope["headers"] = [
+            (b"content-length", b"4"),
+            (b"content-type", b"application/json"),
+        ]
+        with pytest.raises(asyncio.CancelledError):
+            await app(scope, receive, lambda _message: asyncio.sleep(0))
+
+        assert [event.decision for event in decisions] == ["claim", "release"]
+        assert decisions[-1].release_reason == "request_body_disconnected"
+        snapshot = controller.snapshot()
+        assert snapshot["active"] == 0
+        assert snapshot["reserved_body_bytes"] == 0
+        assert snapshot["large_body_active"] == 0
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("status_code", "reason", "expected_release_reason"),
+    [
+        (
+            499,
+            "request_body_disconnected",
+            "request_body_disconnected_response_write_cancelled",
+        ),
+        (413, "body_too_large", "body_too_large_response_write_cancelled"),
+    ],
+)
+def test_early_body_response_cancellation_requires_real_unstarted_disconnect(
+    status_code,
+    reason,
+    expected_release_reason,
+):
+    async def run():
+        decisions = []
+        controller = _controller(
+            capacity=1,
+            max_body_bytes=64,
+            body_budget_bytes=64,
+            large_body_threshold_weighted_bytes=1,
+            large_body_limit=1,
+            decision_observer=decisions.append,
+        )
+
+        async def app(scope, _receive, _send):
+            await scope["state"][RESERVE_BODY_BYTES_STATE_KEY](2)
+            await scope["state"][BODY_EARLY_RESPONSE_OBSERVER_SCOPE_KEY](
+                status_code,
+                reason,
+            )
+            raise asyncio.CancelledError
+
+        middleware = RequestAdmissionMiddleware(app, controller=controller)
+        with pytest.raises(asyncio.CancelledError):
+            await middleware(_scope(), _receive, lambda _message: asyncio.sleep(0))
+
+        assert decisions[-1].decision == "release"
+        assert decisions[-1].release_reason == expected_release_reason
+        assert controller.snapshot()["active"] == 0
+
+    asyncio.run(run())
+
+
+def test_disconnect_reason_after_response_start_preserves_write_failure():
+    async def run():
+        decisions = []
+        controller = _controller(
+            capacity=1,
+            max_body_bytes=64,
+            body_budget_bytes=64,
+            large_body_threshold_weighted_bytes=1,
+            large_body_limit=1,
+            decision_observer=decisions.append,
+        )
+        scope = _scope()
+        disconnect_event = asyncio.Event()
+        disconnect_event.set()
+        scope["state"][DOWNSTREAM_DISCONNECT_EVENT_SCOPE_KEY] = disconnect_event
+
+        async def app(inner_scope, _receive, send):
+            await inner_scope["state"][RESERVE_BODY_BYTES_STATE_KEY](2)
+            await inner_scope["state"][BODY_EARLY_RESPONSE_OBSERVER_SCOPE_KEY](
+                499,
+                "request_body_disconnected",
+            )
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"partial"})
+
+        async def failing_send(message):
+            if message["type"] == "http.response.body":
+                raise ConnectionError("peer closed after response start")
+
+        middleware = RequestAdmissionMiddleware(app, controller=controller)
+        with pytest.raises(ConnectionError, match="peer closed"):
+            await middleware(scope, _receive, failing_send)
+
+        assert decisions[-1].decision == "release"
+        assert decisions[-1].release_reason == (
+            "request_body_disconnected_response_write_failed"
         )
         assert controller.snapshot()["active"] == 0
 

@@ -14,7 +14,7 @@ from asyncio import Semaphore
 from time import time
 from pathlib import Path
 from urllib.parse import urlparse
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import aclosing, asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from typing import AsyncIterator, Dict, Union, Optional, List, Any, Awaitable, Callable
@@ -134,7 +134,12 @@ from uni_api.observability.request_context import (
     request_info,
 )
 from uni_api.observability.spans import merge_timing_spans
-from uni_api.observability.telemetry import emit_request_observability
+from uni_api.observability.telemetry import (
+    emit_admission_503_response_write_outcome,
+    emit_large_body_admission_decision,
+    emit_request_observability,
+    observability_exporter_snapshot,
+)
 from uni_api.observability.responses_stream import (
     ObservedResponseByteIterator,
     ResponsesStreamDiagnostics,
@@ -145,6 +150,7 @@ from uni_api.observability.middleware import (
     StatsMiddlewareDependencies,
 )
 from uni_api.admission import (
+    Admission503ResponseWriteOutcome,
     AdmissionRejected,
     RequestAdmissionController,
     get_request_admission_lease,
@@ -157,7 +163,12 @@ from uni_api.admission.resources import (
     startup_large_request_memory_limit,
     startup_per_request_memory_limit,
 )
-from uni_api.middleware.admission import RequestAdmissionMiddleware
+from uni_api.middleware.admission import (
+    ADMISSION_LEASE_STATE_KEY,
+    ADMISSION_REQUEST_ID_STATE_KEY,
+    ADMISSION_TRACE_ID_STATE_KEY,
+    RequestAdmissionMiddleware,
+)
 from uni_api.middleware.request_decompression import (
     REQUEST_BODY_CPU_WORKERS,
     REQUEST_BODY_COMPLEXITY_INFO_KEY,
@@ -571,11 +582,16 @@ class RuntimeGauges:
         ] = None
         self._stream_stats_snapshot: Optional[Callable[[], dict[str, Any]]] = None
         self._memory_parent_snapshot: Optional[Callable[[], Any]] = None
+        self._observability_exporter_snapshot: Optional[
+            Callable[[], dict[str, int]]
+        ] = None
         self._network_sampler_task: Optional[asyncio.Task[None]] = None
         self._stream_queues: dict[int, ByteBoundedQueue] = {}
         self._retired_stream_queue_blocked_puts = 0
         self._retired_stream_queue_put_wait_ms = 0.0
         self._retired_stream_queue_put_timeouts = 0
+        self._admission_503_response_write_completed: Counter[str] = Counter()
+        self._admission_503_response_write_failed: Counter[str] = Counter()
 
     def attach_request_admission(
         self,
@@ -604,6 +620,12 @@ class RuntimeGauges:
     def attach_memory_parent(self, snapshot: Callable[[], Any]) -> None:
         self._memory_parent_snapshot = snapshot
 
+    def attach_observability_exporter(
+        self,
+        snapshot: Callable[[], dict[str, int]],
+    ) -> None:
+        self._observability_exporter_snapshot = snapshot
+
 
     def register_stream_queue(self, queue: ByteBoundedQueue) -> None:
         self._stream_queues[id(queue)] = queue
@@ -622,6 +644,24 @@ class RuntimeGauges:
 
     def end_inflight(self) -> None:
         self.inflight_requests = max(0, self.inflight_requests - 1)
+
+    def record_admission_503_response_write(
+        self,
+        reason: str,
+        *,
+        completed: bool,
+    ) -> tuple[int, int]:
+        normalized = str(reason or "unknown").strip() or "unknown"
+        target = (
+            self._admission_503_response_write_completed
+            if completed
+            else self._admission_503_response_write_failed
+        )
+        target[normalized] += 1
+        return (
+            sum(self._admission_503_response_write_completed.values()),
+            sum(self._admission_503_response_write_failed.values()),
+        )
 
     def _request_info(self, current_info: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
         if isinstance(current_info, dict):
@@ -741,6 +781,9 @@ class RuntimeGauges:
         memory_parent: Any = None
         if self._memory_parent_snapshot is not None:
             memory_parent = self._memory_parent_snapshot()
+        observability_exporter: dict[str, int] = {}
+        if self._observability_exporter_snapshot is not None:
+            observability_exporter = self._observability_exporter_snapshot()
         stream_queue_blocked_puts = self._retired_stream_queue_blocked_puts + sum(
             snapshot.blocked_puts for snapshot in queue_snapshots
         )
@@ -807,14 +850,27 @@ class RuntimeGauges:
             "request_body_reserved_weighted_bytes": admission.get(
                 "reserved_body_bytes"
             ),
+            "runtime_global_request_body_reserved_weighted_bytes": admission.get(
+                "reserved_body_bytes"
+            ),
             "upstream_response_reserved_weighted_bytes": admission.get(
+                "reserved_response_bytes"
+            ),
+            "runtime_global_upstream_response_reserved_weighted_bytes": admission.get(
                 "reserved_response_bytes"
             ),
             "request_retained_reserved_weighted_bytes": admission.get(
                 "reserved_retained_bytes"
             ),
+            "runtime_global_retained_reserved_weighted_bytes": admission.get(
+                "reserved_retained_bytes"
+            ),
             "request_body_budget_bytes": admission.get("body_budget"),
+            "runtime_global_request_body_budget_weighted_bytes": admission.get("body_budget"),
             "request_body_budget_hard_bytes": admission.get("body_budget_hard"),
+            "runtime_global_request_body_budget_hard_weighted_bytes": admission.get(
+                "body_budget_hard"
+            ),
             "request_max_body_reserved_weighted_bytes": admission.get(
                 "max_body_bytes"
             ),
@@ -834,8 +890,16 @@ class RuntimeGauges:
             "request_large_body_threshold_weighted_bytes": admission.get(
                 "large_body_threshold_weighted_bytes"
             ),
+            "runtime_global_large_body_threshold_weighted_bytes": admission.get(
+                "large_body_threshold_weighted_bytes"
+            ),
             "request_large_body_limit": admission.get("large_body_limit"),
+            "runtime_global_large_body_limit": admission.get("large_body_limit"),
             "request_large_body_active": admission.get("large_body_active"),
+            "runtime_global_large_body_active": admission.get("large_body_active"),
+            "runtime_global_large_body_oldest_holder_age_ms": admission.get(
+                "large_body_oldest_holder_age_ms"
+            ),
             "json_parse_cpu_workers": JSON_PARSE_CPU_WORKERS,
             "request_body_cpu_workers": REQUEST_BODY_CPU_WORKERS,
             "upstream_response_cpu_workers": UPSTREAM_RESPONSE_CPU_WORKERS,
@@ -843,12 +907,74 @@ class RuntimeGauges:
             "request_deferred_memory_requests": admission.get(
                 "deferred_memory_requests"
             ),
+            "runtime_global_deferred_memory_requests": admission.get(
+                "deferred_memory_requests"
+            ),
             "request_deferred_memory_weighted_bytes": admission.get(
+                "deferred_memory_bytes"
+            ),
+            "runtime_global_deferred_memory_weighted_bytes": admission.get(
                 "deferred_memory_bytes"
             ),
             "request_admission_rejected": dict(rejected),
             "request_admission_rejected_total": sum(
                 int(value or 0) for value in rejected.values()
+            ),
+            "runtime_global_admission_rejection_decisions": dict(rejected),
+            "runtime_global_admission_rejection_decision_total": int(
+                admission.get("rejection_decision_total")
+                or sum(int(value or 0) for value in rejected.values())
+            ),
+            "runtime_global_admission_503_response_write_completed": dict(
+                self._admission_503_response_write_completed
+            ),
+            "runtime_global_admission_503_response_write_completed_total": sum(
+                self._admission_503_response_write_completed.values()
+            ),
+            "runtime_global_admission_503_response_write_failed": dict(
+                self._admission_503_response_write_failed
+            ),
+            "runtime_global_admission_503_response_write_failed_total": sum(
+                self._admission_503_response_write_failed.values()
+            ),
+            "runtime_global_large_body_decision_events_recorded_total": admission.get(
+                "large_body_decision_events_recorded_total"
+            ),
+            "runtime_global_large_body_decision_history_overwritten_total": admission.get(
+                "large_body_decision_history_overwritten_total"
+            ),
+            "runtime_global_large_body_decision_record_failures_total": admission.get(
+                "large_body_decision_record_failures_total"
+            ),
+            "runtime_global_large_body_decision_observer_errors_total": admission.get(
+                "large_body_decision_observer_errors_total"
+            ),
+            "runtime_global_large_body_decision_observer_enqueue_failures_total": admission.get(
+                "large_body_decision_observer_enqueue_failures_total"
+            ),
+            "runtime_global_large_body_decision_export_enqueued_total": observability_exporter.get(
+                "large_body_decision_enqueued_total"
+            ),
+            "runtime_global_large_body_decision_export_enqueue_dropped_total": observability_exporter.get(
+                "large_body_decision_enqueue_dropped_total"
+            ),
+            "runtime_global_large_body_decision_export_build_errors_total": observability_exporter.get(
+                "large_body_decision_build_errors_total"
+            ),
+            "runtime_global_large_body_decision_export_errors_total": observability_exporter.get(
+                "large_body_decision_export_errors_total"
+            ),
+            "runtime_global_admission_503_outcome_export_enqueued_total": observability_exporter.get(
+                "admission_503_outcome_enqueued_total"
+            ),
+            "runtime_global_admission_503_outcome_export_enqueue_dropped_total": observability_exporter.get(
+                "admission_503_outcome_enqueue_dropped_total"
+            ),
+            "runtime_global_admission_503_outcome_export_build_errors_total": observability_exporter.get(
+                "admission_503_outcome_build_errors_total"
+            ),
+            "runtime_global_admission_503_outcome_export_errors_total": observability_exporter.get(
+                "admission_503_outcome_export_errors_total"
             ),
             "middleware_inflight_requests": self.inflight_requests,
             "waiting_first_byte": len(self.waiting_first_byte_requests) + self.waiting_first_byte_untracked,
@@ -964,6 +1090,7 @@ class RuntimeGauges:
 
 runtime_gauges = RuntimeGauges()
 runtime_gauges.attach_memory_parent(process_memory_governor.snapshot)
+runtime_gauges.attach_observability_exporter(observability_exporter_snapshot)
 
 _startup_memory_snapshot = process_memory_governor.snapshot(force=True)
 _startup_memory_available = (
@@ -1175,6 +1302,7 @@ request_admission_controller = RequestAdmissionController(
     ),
     large_body_limit=REQUEST_LARGE_BODY_LIMIT,
     memory_governor=process_memory_governor,
+    decision_observer=emit_large_body_admission_decision,
 )
 runtime_gauges.attach_request_admission(request_admission_controller.snapshot)
 runtime_gauges.attach_stream_parser_budget(stream_parser_retained_budget_snapshot)
@@ -2462,6 +2590,50 @@ def _observe_request_admission_rejection(
     )
 
 
+def _observe_request_admission_response_write(
+    scope: dict[str, Any],
+    rejection: Any,
+    completed: bool,
+) -> None:
+    if int(getattr(rejection, "status_code", 0) or 0) != 503:
+        return
+    completed_total, failed_total = runtime_gauges.record_admission_503_response_write(
+        str(getattr(rejection, "reason", "unknown") or "unknown"),
+        completed=bool(completed),
+    )
+    state = scope.get("state")
+    request_id = "untracked"
+    trace_id = "untracked"
+    lease_id = None
+    if isinstance(state, dict):
+        request_id = str(
+            state.get(ADMISSION_REQUEST_ID_STATE_KEY) or request_id
+        )
+        trace_id = str(state.get(ADMISSION_TRACE_ID_STATE_KEY) or trace_id)
+        lease = state.get(ADMISSION_LEASE_STATE_KEY)
+        lease_id = str(getattr(lease, "lease_id", "") or "") or None
+    emit_admission_503_response_write_outcome(
+        Admission503ResponseWriteOutcome(
+            schema_version=1,
+            occurred_at_unix_ms=int(time() * 1000.0),
+            reason=str(getattr(rejection, "reason", "unknown") or "unknown"),
+            intended_status_code=503,
+            asgi_response_write_completed=bool(completed),
+            request_self_lease_id=lease_id,
+            request_self_request_id=request_id,
+            request_self_trace_id=trace_id,
+            request_self_method=str(scope.get("method") or "")[:16] or None,
+            request_self_path=str(scope.get("path") or "")[:160] or None,
+            runtime_global_admission_503_response_write_completed_total_after=(
+                completed_total
+            ),
+            runtime_global_admission_503_response_write_failed_total_after=(
+                failed_total
+            ),
+        )
+    )
+
+
 def _observe_early_body_response(
     scope: dict[str, Any],
     status_code: int,
@@ -2528,6 +2700,17 @@ def _observe_early_request_outcome(
         for name, value in (scope.get("headers") or [])
     }
     incoming = _incoming_trace_context(headers)
+    admission_request_id = ""
+    admission_trace_id = ""
+    if isinstance(state, dict):
+        admission_request_id = str(
+            state.get(ADMISSION_REQUEST_ID_STATE_KEY) or ""
+        ).strip()
+        admission_trace_id = str(
+            state.get(ADMISSION_TRACE_ID_STATE_KEY) or ""
+        ).strip().lower()
+    if _is_valid_w3c_trace_id(admission_trace_id):
+        incoming["trace_id"] = admission_trace_id
     trace = RequestTrace(
         trace_id=incoming["trace_id"],
         parent_span_id=incoming.get("parent_span_id"),
@@ -2544,7 +2727,11 @@ def _observe_early_request_outcome(
     current_info = {
         "trace_id": trace.trace_id,
         "parent_span_id": trace.parent_span_id,
-        "request_id": incoming.get("x_request_id") or trace.trace_id,
+        "request_id": (
+            _normalize_request_id(admission_request_id)
+            if admission_request_id
+            else incoming.get("x_request_id") or trace.trace_id
+        ),
         "endpoint": f"{method} {path}".strip(),
         "request_kind": path,
         "stream": False,
@@ -2577,6 +2764,7 @@ app.add_middleware(
     bypass=_bypass_request_admission,
     on_rejection=_observe_request_admission_rejection,
     on_early_response=_observe_early_body_response,
+    on_rejection_response_write=_observe_request_admission_response_write,
 )
 
 

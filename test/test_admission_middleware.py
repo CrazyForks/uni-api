@@ -3,12 +3,22 @@ import json
 
 import pytest
 
-from uni_api.admission import AdmissionRejected, RequestAdmissionController
+from uni_api.admission import (
+    AdmissionRejected,
+    RequestAdmissionController,
+    RequestBodyObservation,
+)
+from uni_api.admission.memory import AdaptiveMemoryGovernor, ProcessMemorySample
 from uni_api.disconnect import DOWNSTREAM_DISCONNECT_EVENT_SCOPE_KEY
 from uni_api.middleware.admission import (
+    ADMISSION_REQUEST_ID_STATE_KEY,
+    ADMISSION_TRACE_ID_STATE_KEY,
     ADMISSION_WAIT_MS_STATE_KEY,
     RESERVE_BODY_BYTES_STATE_KEY,
     RequestAdmissionMiddleware,
+)
+from uni_api.middleware.request_decompression import (
+    BODY_EARLY_RESPONSE_OBSERVER_SCOPE_KEY,
 )
 
 
@@ -153,6 +163,125 @@ def test_admission_rejection_callback_observes_pre_app_overload():
     asyncio.run(run())
 
 
+def test_admission_generates_safe_joinable_ids_without_mutating_headers():
+    async def run():
+        decisions = []
+        controller = _controller(
+            max_body_bytes=8,
+            body_budget_bytes=8,
+            large_body_threshold_weighted_bytes=1,
+            large_body_limit=1,
+            decision_observer=decisions.append,
+        )
+        scope = _scope()
+        scope["headers"] = [
+            (b"x-request-id", b"person@example.com"),
+            (b"traceparent", b"00-invalid-invalid-01"),
+        ]
+        original_headers = list(scope["headers"])
+
+        async def app(inner_scope, _receive, send):
+            reserve = inner_scope["state"][RESERVE_BODY_BYTES_STATE_KEY]
+            await reserve(2)
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        async def send(_message):
+            return None
+
+        await RequestAdmissionMiddleware(app, controller=controller)(
+            scope,
+            _receive,
+            send,
+        )
+
+        assert scope["headers"] == original_headers
+        request_id = scope["state"][ADMISSION_REQUEST_ID_STATE_KEY]
+        trace_id = scope["state"][ADMISSION_TRACE_ID_STATE_KEY]
+        assert request_id == trace_id
+        assert "@" not in request_id
+        assert [event.decision for event in decisions] == ["claim", "release"]
+        assert {event.request_self_request_id for event in decisions} == {request_id}
+        assert {event.request_self_trace_id for event in decisions} == {trace_id}
+
+    asyncio.run(run())
+
+
+def test_legacy_request_id_does_not_replace_w3c_trace_identity():
+    async def run():
+        decisions = []
+        controller = _controller(
+            max_body_bytes=8,
+            body_budget_bytes=8,
+            large_body_threshold_weighted_bytes=1,
+            large_body_limit=1,
+            decision_observer=decisions.append,
+        )
+        scope = _scope()
+        scope["headers"] = [(b"x-request-id", b"req-123")]
+
+        async def app(inner_scope, _receive, send):
+            await inner_scope["state"][RESERVE_BODY_BYTES_STATE_KEY](2)
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        await RequestAdmissionMiddleware(app, controller=controller)(
+            scope,
+            _receive,
+            lambda _message: asyncio.sleep(0),
+        )
+
+        request_id = scope["state"][ADMISSION_REQUEST_ID_STATE_KEY]
+        trace_id = scope["state"][ADMISSION_TRACE_ID_STATE_KEY]
+        assert request_id == "req-123"
+        assert trace_id != request_id
+        assert len(trace_id) == 32
+        assert all(character in "0123456789abcdef" for character in trace_id)
+        assert {event.request_self_request_id for event in decisions} == {request_id}
+        assert {event.request_self_trace_id for event in decisions} == {trace_id}
+
+    asyncio.run(run())
+
+
+def test_admission_503_response_write_outcome_is_separate_from_decision():
+    async def run():
+        controller = _controller(waiter_limit=0)
+        holder = await controller.acquire()
+        outcomes: list[tuple[str, bool]] = []
+
+        middleware = RequestAdmissionMiddleware(
+            lambda scope, receive, send: None,
+            controller=controller,
+            on_rejection_response_write=(
+                lambda _scope, rejection, completed: outcomes.append(
+                    (rejection.reason, completed)
+                )
+            ),
+        )
+
+        async def successful_send(_message):
+            return None
+
+        await middleware(_scope(), _receive, successful_send)
+        assert outcomes == [("queue_full", True)]
+        assert controller.snapshot()["rejection_decision_total"] == 1
+
+        async def failing_send(message):
+            if message["type"] == "http.response.body":
+                raise ConnectionError("bounded test disconnect")
+
+        with pytest.raises(ConnectionError, match="bounded test disconnect"):
+            await middleware(_scope(), _receive, failing_send)
+        assert outcomes == [
+            ("queue_full", True),
+            ("queue_full", False),
+        ]
+        assert controller.snapshot()["rejection_decision_total"] == 2
+        await holder.release()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize(
     ("reserve_bytes", "expected_status", "expected_reason"),
     [(9, 413, "body_too_large"), (5, 503, "body_budget_exhausted")],
@@ -215,6 +344,229 @@ def test_large_body_slot_is_bounded_and_released_with_request():
     asyncio.run(run())
 
 
+def test_large_body_decisions_capture_atomic_self_global_holder_and_memory():
+    async def run():
+        monotonic_now = [10.0]
+        wall_now = [1_000.0]
+        emitted = []
+        memory = AdaptiveMemoryGovernor(
+            source=lambda: ProcessMemorySample(
+                current_bytes=100,
+                limit_bytes=1_000,
+                high_bytes=900,
+                events={"oom": 0},
+                source="test-cgroup",
+            ),
+            guard_bytes=100,
+            guard_ratio=0.10,
+            fallback_budget_bytes=100,
+            sample_cache_seconds=60,
+            clock=lambda: monotonic_now[0],
+        )
+        controller = _controller(
+            capacity=3,
+            max_body_bytes=64,
+            body_budget_bytes=192,
+            large_body_threshold_weighted_bytes=16,
+            large_body_limit=1,
+            memory_governor=memory,
+            clock=lambda: monotonic_now[0],
+            wall_clock=lambda: wall_now[0],
+            decision_observer=lambda event: emitted.append(
+                (controller._body_lock.locked(), event)
+            ),
+        )
+        first = await controller.acquire()
+        first_observation = RequestBodyObservation(
+            request_id="request-holder",
+            trace_id="trace-holder",
+            method="POST",
+            path="/v1/responses",
+            declared_content_length_bytes=11,
+            wire_bytes=11,
+            decoded_bytes=11,
+            json_raw_bytes=11,
+            json_structural_item_count=3,
+            json_depth=0,
+            json_peak_depth=2,
+            json_scalar_bytes=0,
+            json_estimated_bytes=17,
+            json_raw_memory_multiplier=5,
+            json_structural_item_memory_bytes=1024,
+        )
+        await first.reserve_body_bytes(17, observation=first_observation)
+
+        second = await controller.acquire()
+        rejected_observation = RequestBodyObservation(
+            request_id="request-rejected",
+            trace_id="trace-rejected",
+            method="POST",
+            path="/v1/responses",
+            wire_bytes=12,
+            decoded_bytes=12,
+            json_raw_bytes=12,
+            json_structural_item_count=4,
+            json_depth=1,
+            json_peak_depth=2,
+            json_scalar_bytes=1,
+            json_estimated_bytes=18,
+            json_raw_memory_multiplier=5,
+            json_structural_item_memory_bytes=1024,
+        )
+        with pytest.raises(AdmissionRejected, match="large_body_capacity_exhausted"):
+            await second.reserve_body_bytes(18, observation=rejected_observation)
+
+        monotonic_now[0] = 12.5
+        wall_now[0] = 1_002.5
+        await first.release(reason="request_completed")
+        await second.release()
+
+        assert [locked for locked, _event in emitted] == [False, False, False]
+        claim, reject, release = [event for _locked, event in emitted]
+        assert [claim.decision, reject.decision, release.decision] == [
+            "claim",
+            "reject",
+            "release",
+        ]
+        assert [claim.sequence, reject.sequence, release.sequence] == [1, 2, 3]
+        assert claim.request_self_request_id == "request-holder"
+        assert claim.request_self_wire_bytes == 11
+        assert claim.request_self_decoded_bytes == 11
+        assert claim.request_self_json_structural_item_count == 3
+        assert claim.request_self_body_reserved_weighted_before_bytes == 0
+        assert claim.request_self_body_reserved_weighted_attempted_after_bytes == 17
+        assert claim.runtime_global_request_body_reserved_weighted_after_bytes == 17
+        assert claim.runtime_global_large_body_active_before == 0
+        assert claim.runtime_global_large_body_active_after == 1
+        assert claim.runtime_global_cgroup_memory_source == "test-cgroup"
+        assert claim.runtime_global_cgroup_memory_current_bytes_sampled == 100
+        assert claim.runtime_global_cgroup_memory_sample_sequence == 1
+
+        assert reject.request_self_request_id == "request-rejected"
+        assert reject.request_self_body_reserved_weighted_committed_after_bytes == 0
+        assert reject.runtime_global_request_body_reserved_weighted_before_bytes == 17
+        assert reject.runtime_global_request_body_reserved_weighted_after_bytes == 17
+        assert len(reject.blocking_holders) == 1
+        assert reject.blocking_holders[0].request_id == "request-holder"
+        assert reject.blocking_holders[0].lease_id == first.lease_id
+
+        assert release.release_reason == "request_completed"
+        assert release.release_finalizer == "request_release"
+        assert release.holder is not None
+        assert release.holder.claim_id == claim.holder.claim_id
+        assert release.holder.held_ms == 2500
+        assert release.runtime_global_large_body_active_after == 0
+        assert release.runtime_global_request_body_reserved_weighted_after_bytes == 0
+        assert controller.recent_large_body_decisions() == (
+            claim,
+            reject,
+            release,
+        )
+
+    asyncio.run(run())
+
+
+def test_decision_observability_failure_cannot_leak_admission_ownership():
+    async def run():
+        def broken_wall_clock():
+            raise OSError("telemetry clock unavailable")
+
+        def broken_observer(_event):
+            raise RuntimeError("telemetry observer unavailable")
+
+        controller = _controller(
+            capacity=1,
+            max_body_bytes=64,
+            body_budget_bytes=64,
+            large_body_threshold_weighted_bytes=16,
+            large_body_limit=1,
+            wall_clock=broken_wall_clock,
+            decision_observer=broken_observer,
+        )
+        lease = await controller.acquire()
+        await lease.reserve_body_bytes(17)
+        await lease.release()
+
+        snapshot = controller.snapshot()
+        assert snapshot["active"] == 0
+        assert snapshot["reserved_body_bytes"] == 0
+        assert snapshot["large_body_active"] == 0
+        assert snapshot["large_body_decision_record_failures_total"] >= 2
+        assert snapshot["large_body_decision_observer_errors_total"] == 2
+
+    asyncio.run(run())
+
+
+def test_early_body_response_write_failure_is_preserved_as_release_reason():
+    async def run():
+        decisions = []
+        controller = _controller(
+            capacity=1,
+            max_body_bytes=64,
+            body_budget_bytes=64,
+            large_body_threshold_weighted_bytes=1,
+            large_body_limit=1,
+            decision_observer=decisions.append,
+        )
+
+        async def app(scope, _receive, send):
+            await scope["state"][RESERVE_BODY_BYTES_STATE_KEY](2)
+            await scope["state"][BODY_EARLY_RESPONSE_OBSERVER_SCOPE_KEY](
+                413,
+                "body_too_large",
+            )
+            await send({"type": "http.response.start", "status": 413, "headers": []})
+            await send({"type": "http.response.body", "body": b"{}"})
+
+        async def failing_send(message):
+            if message["type"] == "http.response.body":
+                raise ConnectionError("peer closed during early response")
+
+        middleware = RequestAdmissionMiddleware(app, controller=controller)
+        with pytest.raises(ConnectionError, match="peer closed"):
+            await middleware(_scope(), _receive, failing_send)
+
+        assert decisions[-1].decision == "release"
+        assert decisions[-1].release_reason == (
+            "body_too_large_response_write_failed"
+        )
+        assert controller.snapshot()["active"] == 0
+
+    asyncio.run(run())
+
+
+def test_claimed_request_rejection_preserves_reason_through_response_write():
+    async def run():
+        decisions = []
+        controller = _controller(
+            capacity=1,
+            max_body_bytes=3,
+            body_budget_bytes=8,
+            large_body_threshold_weighted_bytes=1,
+            large_body_limit=1,
+            decision_observer=decisions.append,
+        )
+
+        async def app(scope, _receive, _send):
+            reserve = scope["state"][RESERVE_BODY_BYTES_STATE_KEY]
+            await reserve(2)
+            await reserve(2)
+
+        async def send(_message):
+            return None
+
+        await RequestAdmissionMiddleware(app, controller=controller)(
+            _scope(),
+            _receive,
+            send,
+        )
+
+        assert [event.decision for event in decisions] == ["claim", "release"]
+        assert decisions[-1].release_reason == "body_too_large_response_written"
+
+    asyncio.run(run())
+
+
 def test_pending_body_owns_and_transfers_large_body_slot():
     async def run():
         controller = _controller(
@@ -239,6 +591,43 @@ def test_pending_body_owns_and_transfers_large_body_slot():
         await lease.release()
         assert controller.snapshot()["large_body_active"] == 0
         await blocked.release()
+
+    asyncio.run(run())
+
+
+def test_pending_large_body_claim_id_survives_transfer_until_release():
+    async def run():
+        controller = _controller(
+            capacity=2,
+            max_body_bytes=64,
+            body_budget_bytes=192,
+            large_body_threshold_weighted_bytes=16,
+            large_body_limit=1,
+        )
+        pending = controller.pending_body_reservation()
+        await pending.reserve(
+            17,
+            observation=RequestBodyObservation(request_id="queued-request"),
+        )
+        lease = await controller.acquire()
+        await pending.transfer_to(lease)
+        await lease.reserve_body_bytes(
+            0,
+            observation=RequestBodyObservation(
+                request_id="active-request",
+                trace_id="active-trace",
+            ),
+        )
+        await lease.release()
+
+        claim, release = controller.recent_large_body_decisions()
+        assert claim.decision == "claim"
+        assert release.decision == "release"
+        assert claim.holder is not None and release.holder is not None
+        assert release.holder.claim_id == claim.holder.claim_id
+        assert release.holder.lease_id == lease.lease_id
+        assert release.holder.request_id == "active-request"
+        assert release.holder.trace_id == "active-trace"
 
     asyncio.run(run())
 
@@ -1026,10 +1415,10 @@ def test_repeated_cancel_cannot_interrupt_queued_ownership_transaction(
             granted = done.result()
             original_release = granted.release
 
-            async def delayed_release():
+            async def delayed_release(*, reason="request_completed"):
                 release_started.set()
                 await allow_release.wait()
-                await original_release()
+                await original_release(reason=reason)
 
             granted.release = delayed_release
             queued.cancel()

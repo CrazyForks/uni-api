@@ -852,6 +852,7 @@ class ClientPool:
 
         callback_started = self._safe_begin_upstream_pool(trace)
         self._safe_trace_mark(trace, "client_pool_acquire_end")
+        self._safe_trace_mark(trace, "client_pool_acquired")
         self._record_trace_wait(trace, wait_ms)
         self._safe_record_upstream_wait(wait_ms)
         return _UpstreamLease(

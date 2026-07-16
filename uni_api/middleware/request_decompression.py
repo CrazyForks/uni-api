@@ -17,6 +17,7 @@ from uni_api.admission.json_memory import (
     IncrementalJSONMemoryEstimator,
     JSONMemoryComplexityError,
     JSONMemoryComplexityObservation,
+    JSONMemorySnapshot,
 )
 from uni_api.admission.resources import startup_cpu_worker_count
 from uni_api.disconnect import DOWNSTREAM_DISCONNECT_EVENT_SCOPE_KEY
@@ -80,7 +81,116 @@ BODY_BYTES_RESERVATION_SCOPE_KEY = "uni_api_reserve_body_bytes"
 BODY_REJECTION_RECORDER_SCOPE_KEY = "uni_api_record_body_rejection"
 BODY_EARLY_RESPONSE_OBSERVER_SCOPE_KEY = "uni_api_observe_body_early_response"
 BODY_COMPLEXITY_DIAGNOSTICS_SCOPE_KEY = "uni_api_request_body_complexity"
+BODY_OBSERVATION_SCOPE_KEY = "uni_api_request_body_observation"
 REQUEST_BODY_COMPLEXITY_INFO_KEY = "request_body_complexity"
+
+
+def initialize_request_body_observation(scope: Scope) -> dict[str, int]:
+    state = scope.setdefault("state", {})
+    if not isinstance(state, dict):
+        return {}
+    existing = state.get(BODY_OBSERVATION_SCOPE_KEY)
+    if isinstance(existing, dict):
+        return existing
+    observation: dict[str, int] = {
+        "wire_bytes": 0,
+        "decoded_bytes": 0,
+        "decoder_workspace_bytes": 0,
+    }
+    try:
+        declared = _content_length(scope.get("headers") or [])
+    except InvalidContentLength:
+        declared = None
+    if declared is not None:
+        observation["declared_content_length_bytes"] = declared
+    state[BODY_OBSERVATION_SCOPE_KEY] = observation
+    return observation
+
+
+def observe_request_wire_bytes(scope: Scope, additional_bytes: int) -> None:
+    observation = initialize_request_body_observation(scope)
+    if observation:
+        observation["wire_bytes"] = max(
+            0,
+            int(observation.get("wire_bytes", 0)) + max(0, int(additional_bytes)),
+        )
+
+
+def observe_request_decoder_workspace_bytes(
+    scope: Scope,
+    additional_bytes: int,
+) -> None:
+    observation = initialize_request_body_observation(scope)
+    if observation:
+        observation["decoder_workspace_bytes"] = max(
+            0,
+            int(observation.get("decoder_workspace_bytes", 0))
+            + max(0, int(additional_bytes)),
+        )
+
+
+def _observe_request_decoded_bytes(
+    scope: Scope,
+    additional_bytes: int,
+    *,
+    json_snapshot: JSONMemorySnapshot | None = None,
+    complexity_observation: JSONMemoryComplexityObservation | None = None,
+) -> None:
+    observation = initialize_request_body_observation(scope)
+    if not observation:
+        return
+    observation["decoded_bytes"] = max(
+        0,
+        int(observation.get("decoded_bytes", 0)) + max(0, int(additional_bytes)),
+    )
+    if complexity_observation is not None:
+        observation.update(
+            {
+                "json_raw_bytes": complexity_observation.raw_bytes,
+                "json_structural_item_count": (
+                    complexity_observation.structural_item_count
+                ),
+                "json_depth": complexity_observation.depth,
+                "json_peak_depth": complexity_observation.peak_depth,
+                "json_scalar_bytes": complexity_observation.scalar_bytes,
+                "json_estimated_bytes": complexity_observation.estimated_bytes,
+                "json_raw_memory_multiplier": (
+                    complexity_observation.raw_memory_multiplier
+                ),
+                "json_structural_item_memory_bytes": (
+                    complexity_observation.structural_item_memory_bytes
+                ),
+            }
+        )
+    elif json_snapshot is not None:
+        observation.update(
+            {
+                "json_raw_bytes": json_snapshot.raw_bytes,
+                "json_structural_item_count": json_snapshot.tokens,
+                "json_depth": json_snapshot.depth,
+                "json_peak_depth": json_snapshot.peak_depth,
+                "json_scalar_bytes": json_snapshot.scalar_bytes,
+                "json_estimated_bytes": json_snapshot.estimated_bytes,
+                "json_raw_memory_multiplier": json_snapshot.raw_memory_multiplier,
+                "json_structural_item_memory_bytes": (
+                    json_snapshot.structural_item_memory_bytes
+                ),
+            }
+        )
+
+
+def request_body_observation_from_scope(scope: Scope) -> dict[str, int]:
+    state = scope.get("state")
+    if not isinstance(state, dict):
+        return {}
+    raw = state.get(BODY_OBSERVATION_SCOPE_KEY)
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(key): int(value)
+        for key, value in raw.items()
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+    }
 
 
 class RequestBodyTooComplex(JSONMemoryComplexityError):
@@ -180,9 +290,11 @@ class _RequestBodyMemoryBudget:
     def __init__(
         self,
         *,
+        scope: Scope,
         json_body: bool,
         json_max_estimated_bytes: int,
     ) -> None:
+        self._scope = scope
         self._json_estimator = (
             IncrementalJSONMemoryEstimator(
                 max_estimated_bytes=json_max_estimated_bytes,
@@ -202,6 +314,16 @@ class _RequestBodyMemoryBudget:
             try:
                 target = await _run_body_cpu(self._json_estimator.feed, chunk)
             except JSONMemoryComplexityError as exc:
+                _observe_request_decoded_bytes(
+                    self._scope,
+                    len(chunk),
+                    complexity_observation=exc.observation,
+                )
+                if callback is not None:
+                    # No additional weighted reservation is committed, but the
+                    # holder/release event must retain the estimator state that
+                    # caused this terminal 413.
+                    await _reserve_body_bytes(callback, 0)
                 # Give request-body control flow a distinct type.  The generic
                 # JSON complexity error is also used for upstream/SSE payloads
                 # and those must never be mislabeled as a client-body 413.
@@ -209,12 +331,19 @@ class _RequestBodyMemoryBudget:
                     exc,
                     json_memory_reserved_target_bytes=self._reserved_target,
                 ) from exc
+            json_snapshot = self._json_estimator.snapshot()
         else:
             self._observed_bytes += len(chunk)
             target = (
                 self._observed_bytes
                 * DEFAULT_NON_JSON_MEMORY_RESERVATION_MULTIPLIER
             )
+            json_snapshot = None
+        _observe_request_decoded_bytes(
+            self._scope,
+            len(chunk),
+            json_snapshot=json_snapshot,
+        )
         additional = target - self._reserved_target
         if additional < 0:
             raise RuntimeError("request body memory reservation regressed")
@@ -546,6 +675,9 @@ class RequestBodyDecompressionMiddleware:
             if chunk:
                 total += len(chunk)
                 if total > self.max_identity_body_bytes:
+                    _observe_request_decoded_bytes(scope, len(chunk))
+                    if reserve_body_bytes is not None:
+                        await _reserve_body_bytes(reserve_body_bytes, 0)
                     raise _RequestBodyHardLimitExceeded()
                 await body_memory_budget.reserve_chunk(
                     chunk,
@@ -767,6 +899,10 @@ async def _decompress_zstd(
         # The decoder retains its history window independently of compressed
         # input and emitted output.  Account it before constructing/reading the
         # decoder so advertised-window memory cannot bypass body admission.
+        observe_request_decoder_workspace_bytes(
+            memory_budget._scope,
+            max_window_size,
+        )
         await _reserve_body_bytes(reserve_body_bytes, max_window_size)
 
     # A tiny unknown-size frame can advertise a huge decode window.  Bound the
@@ -791,6 +927,15 @@ async def _decompress_zstd(
             if not chunk:
                 break
             if len(chunk) > remaining:
+                # Record the attempted decoded output even though this byte
+                # cannot be retained. The early-response callback will sync the
+                # observation to the admission lease before release.
+                _observe_request_decoded_bytes(
+                    memory_budget._scope,
+                    len(chunk),
+                )
+                if reserve_body_bytes is not None:
+                    await _reserve_body_bytes(reserve_body_bytes, 0)
                 raise _RequestBodyHardLimitExceeded()
             # Reserve each bounded output chunk before retaining it.  JSON is
             # charged by raw bytes plus structural tokens; non-JSON bodies use
@@ -928,6 +1073,7 @@ def _request_body_memory_budget(
     else:
         json_body = is_json_media_type(content_types[0])
     return _RequestBodyMemoryBudget(
+        scope=scope,
         json_body=json_body,
         json_max_estimated_bytes=json_max_estimated_bytes,
     )

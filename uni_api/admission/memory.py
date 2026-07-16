@@ -168,6 +168,9 @@ class AdaptiveMemorySnapshot:
     wait_timeouts: int
     events: dict[str, int]
     sample_error: str | None
+    sample_sequence: int
+    sampled_at_monotonic: float | None
+    sample_age_ms: int | None
 
 
 class AdaptiveMemoryGovernor:
@@ -212,6 +215,8 @@ class AdaptiveMemoryGovernor:
         self._lock = threading.RLock()
         self._sample: ProcessMemorySample | None = None
         self._sampled_at = float("-inf")
+        self._sample_attempted_at = float("-inf")
+        self._sample_sequence = 0
         self._sample_error: str | None = None
         self._reserved: Counter[str] = Counter()
         self._rejected: Counter[str] = Counter()
@@ -254,20 +259,22 @@ class AdaptiveMemoryGovernor:
         if (
             not force
             and self._sample is not None
-            and now - self._sampled_at < self.sample_cache_seconds
+            and now - self._sample_attempted_at < self.sample_cache_seconds
         ):
             return self._sample
+        self._sample_attempted_at = now
         try:
             sample = self._source()
             if not isinstance(sample, ProcessMemorySample):
                 raise TypeError("memory source returned an invalid sample")
             self._sample = sample
             self._sample_error = None
+            self._sampled_at = now
+            self._sample_sequence += 1
         except Exception as exc:
             self._sample_error = f"{type(exc).__name__}: {exc}"[:512]
             if self._sample is None:
                 self._sample = ProcessMemorySample(None, None, source="unavailable")
-        self._sampled_at = now
         return self._sample
 
     def _limits_locked(
@@ -424,29 +431,64 @@ class AdaptiveMemoryGovernor:
             except RuntimeError:
                 continue
 
+    def _snapshot_locked(
+        self,
+        sample: ProcessMemorySample,
+    ) -> AdaptiveMemorySnapshot:
+        soft_limit, guard, capacity, available = self._limits_locked(sample)
+        sampled_at = (
+            self._sampled_at
+            if self._sample_sequence > 0 and self._sampled_at != float("-inf")
+            else None
+        )
+        sample_age_ms = (
+            max(0, int(round((self._clock() - sampled_at) * 1000.0)))
+            if sampled_at is not None
+            else None
+        )
+        return AdaptiveMemorySnapshot(
+            source=sample.source,
+            current_bytes=sample.current_bytes,
+            limit_bytes=sample.limit_bytes,
+            high_bytes=sample.high_bytes,
+            soft_limit_bytes=soft_limit,
+            guard_bytes=guard,
+            capacity_bytes=capacity,
+            available_bytes=available,
+            reserved_bytes=sum(self._reserved.values()),
+            peak_reserved_bytes=self._peak_reserved_bytes,
+            reservations=dict(self._reserved),
+            rejected=dict(self._rejected),
+            blocked_reservations=self._blocked_reservations,
+            waiting_reservations=self._waiting_reservations,
+            wait_timeouts=self._wait_timeouts,
+            events=dict(sample.events or {}),
+            sample_error=self._sample_error,
+            sample_sequence=self._sample_sequence,
+            sampled_at_monotonic=sampled_at,
+            sample_age_ms=sample_age_ms,
+        )
+
+    def snapshot_cached(self) -> AdaptiveMemorySnapshot:
+        """Return the latest sample without filesystem I/O.
+
+        Admission decision recording calls this while its asyncio lock is held.
+        The sample sequence and age make the cache boundary explicit instead of
+        presenting a cached cgroup value as an atomic kernel measurement.
+        """
+
+        with self._lock:
+            sample = self._sample or ProcessMemorySample(
+                None,
+                None,
+                source="unavailable",
+            )
+            return self._snapshot_locked(sample)
+
     def snapshot(self, *, force: bool = False) -> AdaptiveMemorySnapshot:
         with self._lock:
             sample = self._refresh_sample_locked(force=force)
-            soft_limit, guard, capacity, available = self._limits_locked(sample)
-            return AdaptiveMemorySnapshot(
-                source=sample.source,
-                current_bytes=sample.current_bytes,
-                limit_bytes=sample.limit_bytes,
-                high_bytes=sample.high_bytes,
-                soft_limit_bytes=soft_limit,
-                guard_bytes=guard,
-                capacity_bytes=capacity,
-                available_bytes=available,
-                reserved_bytes=sum(self._reserved.values()),
-                peak_reserved_bytes=self._peak_reserved_bytes,
-                reservations=dict(self._reserved),
-                rejected=dict(self._rejected),
-                blocked_reservations=self._blocked_reservations,
-                waiting_reservations=self._waiting_reservations,
-                wait_timeouts=self._wait_timeouts,
-                events=dict(sample.events or {}),
-                sample_error=self._sample_error,
-            )
+            return self._snapshot_locked(sample)
 
 
 process_memory_governor = AdaptiveMemoryGovernor.from_environment()

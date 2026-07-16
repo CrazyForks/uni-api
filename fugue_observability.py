@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import random
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from time import time
 from typing import Any
@@ -70,14 +70,36 @@ class FugueObservabilityConfig:
         return bool((self.endpoint or "").strip())
 
 
+@dataclass(frozen=True)
+class _DeferredLargeBodyAdmissionDecision:
+    decision: Any
+
+
+@dataclass(frozen=True)
+class _DeferredAdmission503ResponseWriteOutcome:
+    outcome: Any
+
+
 class FugueObservabilityClient:
     def __init__(self, config: FugueObservabilityConfig) -> None:
         self.config = config
-        self._queue: asyncio.Queue[tuple[str, dict[str, Any]]] | None = None
+        self._queue: asyncio.Queue[
+            tuple[str, dict[str, Any]]
+            | _DeferredLargeBodyAdmissionDecision
+            | _DeferredAdmission503ResponseWriteOutcome
+        ] | None = None
         self._tasks: list[asyncio.Task[None]] = []
         self._client: httpx.AsyncClient | None = None
         self._dropped = 0
         self._export_errors = 0
+        self._large_body_decision_enqueued = 0
+        self._large_body_decision_enqueue_dropped = 0
+        self._large_body_decision_build_errors = 0
+        self._large_body_decision_export_errors = 0
+        self._admission_503_outcome_enqueued = 0
+        self._admission_503_outcome_enqueue_dropped = 0
+        self._admission_503_outcome_build_errors = 0
+        self._admission_503_outcome_export_errors = 0
 
     async def start(self) -> None:
         if not self.config.enabled or self._tasks:
@@ -150,29 +172,111 @@ class FugueObservabilityClient:
         if self.config.emit_metrics and not sampled_out:
             self._emit_events(_METRIC_ENDPOINT, telemetry["metrics"])
 
-    def _emit_events(self, path: str, events: list[dict[str, Any]]) -> None:
+    def emit_large_body_admission_decision(self, decision: Any) -> bool | None:
+        if not self.config.enabled:
+            return None
+        accepted = self._enqueue(
+            _DeferredLargeBodyAdmissionDecision(decision),
+            event_count=1,
+        )
+        if accepted:
+            self._large_body_decision_enqueued += 1
+        else:
+            self._large_body_decision_enqueue_dropped += 1
+        return accepted
+
+    def emit_admission_503_response_write_outcome(
+        self,
+        outcome: Any,
+    ) -> bool | None:
+        if not self.config.enabled:
+            return None
+        accepted = self._enqueue(
+            _DeferredAdmission503ResponseWriteOutcome(outcome),
+            event_count=1,
+        )
+        if accepted:
+            self._admission_503_outcome_enqueued += 1
+        else:
+            self._admission_503_outcome_enqueue_dropped += 1
+        return accepted
+
+    def _emit_events(
+        self,
+        path: str,
+        events: list[dict[str, Any]],
+    ) -> bool | None:
         if not events:
-            return
+            return None
+        return self._enqueue((path, {"events": events}), event_count=len(events))
+
+    def _enqueue(self, item: Any, *, event_count: int) -> bool:
         queue = self._queue
         if queue is None:
-            return
+            return False
         try:
-            queue.put_nowait((path, {"events": events}))
+            queue.put_nowait(item)
+            return True
         except asyncio.QueueFull:
-            self._dropped += len(events)
-            if self._dropped == len(events) or self._dropped % 100 == 0:
+            self._dropped += event_count
+            if self._dropped == event_count or self._dropped % 100 == 0:
                 logger.warning("Fugue observability queue full; dropped %s event(s)", self._dropped)
+            return False
 
     async def _worker(self) -> None:
         assert self._queue is not None
         while True:
-            path, payload = await self._queue.get()
+            item = await self._queue.get()
+            large_body_decision = isinstance(
+                item,
+                _DeferredLargeBodyAdmissionDecision,
+            )
+            write_outcome = isinstance(
+                item,
+                _DeferredAdmission503ResponseWriteOutcome,
+            )
+            build_failed = False
             try:
+                if large_body_decision:
+                    try:
+                        event = build_uni_api_ember_large_body_admission_event(
+                            service_name=self.config.service_name,
+                            service_version=self.config.service_version,
+                            identity_attrs=self.config.identity_attrs,
+                            decision=item.decision,
+                        )
+                    except Exception:
+                        build_failed = True
+                        self._export_errors += 1
+                        self._large_body_decision_build_errors += 1
+                        raise
+                    path, payload = _LOG_ENDPOINT, {"events": [event]}
+                elif write_outcome:
+                    try:
+                        event = build_uni_api_ember_admission_503_response_write_event(
+                            service_name=self.config.service_name,
+                            service_version=self.config.service_version,
+                            identity_attrs=self.config.identity_attrs,
+                            outcome=item.outcome,
+                        )
+                    except Exception:
+                        build_failed = True
+                        self._export_errors += 1
+                        self._admission_503_outcome_build_errors += 1
+                        raise
+                    path, payload = _LOG_ENDPOINT, {"events": [event]}
+                else:
+                    path, payload = item
                 await self._post_json(path, payload)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self._export_errors += 1
+                if not build_failed:
+                    self._export_errors += 1
+                if large_body_decision and not build_failed:
+                    self._large_body_decision_export_errors += 1
+                if write_outcome and not build_failed:
+                    self._admission_503_outcome_export_errors += 1
                 if self._export_errors == 1 or self._export_errors % 100 == 0:
                     logger.warning("Fugue observability export failed: %s", type(exc).__name__)
             finally:
@@ -185,6 +289,38 @@ class FugueObservabilityClient:
         response = await client.post(_endpoint_url(self.config.endpoint or "", path), json=payload)
         if response.status_code >= 400:
             raise RuntimeError(f"observability endpoint returned HTTP {response.status_code}")
+
+    def delivery_snapshot(self) -> dict[str, int]:
+        queue = self._queue
+        return {
+            "queue_depth": queue.qsize() if queue is not None else 0,
+            "events_dropped_total": self._dropped,
+            "export_errors_total": self._export_errors,
+            "large_body_decision_enqueued_total": (
+                self._large_body_decision_enqueued
+            ),
+            "large_body_decision_enqueue_dropped_total": (
+                self._large_body_decision_enqueue_dropped
+            ),
+            "large_body_decision_build_errors_total": (
+                self._large_body_decision_build_errors
+            ),
+            "large_body_decision_export_errors_total": (
+                self._large_body_decision_export_errors
+            ),
+            "admission_503_outcome_enqueued_total": (
+                self._admission_503_outcome_enqueued
+            ),
+            "admission_503_outcome_enqueue_dropped_total": (
+                self._admission_503_outcome_enqueue_dropped
+            ),
+            "admission_503_outcome_build_errors_total": (
+                self._admission_503_outcome_build_errors
+            ),
+            "admission_503_outcome_export_errors_total": (
+                self._admission_503_outcome_export_errors
+            ),
+        }
 
 
 _client: FugueObservabilityClient | None = None
@@ -237,6 +373,149 @@ def emit_uni_api_ember_request_observability(**kwargs: Any) -> None:
         client.emit_request(**kwargs)
     except Exception:
         logger.exception("Failed to enqueue Fugue request observability event")
+
+
+def emit_uni_api_ember_large_body_admission_decision(
+    decision: Any,
+) -> bool | None:
+    client = _client
+    if client is None:
+        return None
+    try:
+        return client.emit_large_body_admission_decision(decision)
+    except Exception:
+        logger.exception("Failed to enqueue Fugue admission decision event")
+        return False
+
+
+def emit_uni_api_ember_admission_503_response_write_outcome(
+    outcome: Any,
+) -> bool | None:
+    client = _client
+    if client is None:
+        return None
+    try:
+        return client.emit_admission_503_response_write_outcome(outcome)
+    except Exception:
+        logger.exception("Failed to enqueue Fugue admission 503 write outcome")
+        return False
+
+
+def fugue_observability_delivery_snapshot() -> dict[str, int]:
+    client = _client
+    return client.delivery_snapshot() if client is not None else {}
+
+
+def build_uni_api_ember_admission_503_response_write_event(
+    *,
+    service_name: str,
+    service_version: str | None,
+    identity_attrs: dict[str, str] | None,
+    outcome: Any,
+) -> dict[str, Any]:
+    raw = asdict(outcome)
+    occurred_at_ms = _safe_int(raw.get("occurred_at_unix_ms"), 0)
+    observed_at = datetime.fromtimestamp(
+        max(0, occurred_at_ms) / 1000.0,
+        tz=timezone.utc,
+    )
+    completed = _safe_bool(raw.get("asgi_response_write_completed"))
+    attributes = _drop_empty(
+        {
+            **(identity_attrs or {}),
+            **raw,
+            "component": service_name,
+            "service_version": service_version,
+            "event_type": "admission_503_response_write_outcome",
+            "fugue_table": "app_events",
+            "severity": "info" if completed else "warning",
+        }
+    )
+    return {
+        "timestamp": _iso_timestamp(observed_at),
+        "kind": "log",
+        "level": attributes["severity"],
+        "service": service_name,
+        "source": service_name,
+        "event": "admission_503_response_write_outcome",
+        "event_type": "admission_503_response_write_outcome",
+        "message": (
+            "admission 503 ASGI response write completed"
+            if completed
+            else "admission 503 ASGI response write failed"
+        ),
+        "app_id": _safe_text((identity_attrs or {}).get("app_id")),
+        "trace_id": _safe_text(raw.get("request_self_trace_id")),
+        "request_id": _safe_text(raw.get("request_self_request_id")),
+        "path": _safe_text(raw.get("request_self_path")),
+        "status_code": 503,
+        "attributes": attributes,
+        "summary": raw,
+        "summary_json": json.dumps(raw, separators=(",", ":"), sort_keys=True),
+    }
+
+
+def build_uni_api_ember_large_body_admission_event(
+    *,
+    service_name: str,
+    service_version: str | None,
+    identity_attrs: dict[str, str] | None,
+    decision: Any,
+) -> dict[str, Any]:
+    raw = asdict(decision)
+    occurred_at_ms = _safe_int(raw.get("occurred_at_unix_ms"), 0)
+    observed_at = datetime.fromtimestamp(
+        max(0, occurred_at_ms) / 1000.0,
+        tz=timezone.utc,
+    )
+    holder = raw.get("holder") if isinstance(raw.get("holder"), dict) else {}
+    blocking_holders = raw.get("blocking_holders")
+    blocking_holder_count = (
+        len(blocking_holders) if isinstance(blocking_holders, (list, tuple)) else 0
+    )
+    scalar_summary = {
+        key: value
+        for key, value in raw.items()
+        if not isinstance(value, (dict, list, tuple))
+    }
+    attributes = _drop_empty(
+        {
+            **(identity_attrs or {}),
+            **scalar_summary,
+            "component": service_name,
+            "service_version": service_version,
+            "event_type": "large_body_admission_decision",
+            "fugue_table": "app_events",
+            "severity": (
+                "warning" if raw.get("decision") == "reject" else "info"
+            ),
+            "blocking_holder_count": blocking_holder_count,
+            "holder_claim_id": holder.get("claim_id"),
+            "holder_lease_id": holder.get("lease_id"),
+            "holder_request_id": holder.get("request_id"),
+            "holder_trace_id": holder.get("trace_id"),
+            "holder_claimed_at_unix_ms": holder.get("claimed_at_unix_ms"),
+            "holder_held_ms": holder.get("held_ms"),
+        }
+    )
+    summary_json = json.dumps(raw, separators=(",", ":"), sort_keys=True)
+    return {
+        "timestamp": _iso_timestamp(observed_at),
+        "kind": "log",
+        "level": attributes.get("severity", "info"),
+        "service": service_name,
+        "source": service_name,
+        "event": "large_body_admission_decision",
+        "event_type": "large_body_admission_decision",
+        "message": f"large body admission {raw.get('decision', 'decision')}",
+        "app_id": _safe_text((identity_attrs or {}).get("app_id")),
+        "trace_id": _safe_text(raw.get("request_self_trace_id")),
+        "request_id": _safe_text(raw.get("request_self_request_id")),
+        "path": _safe_text(raw.get("request_self_path")),
+        "attributes": attributes,
+        "summary": raw,
+        "summary_json": summary_json,
+    }
 
 
 def build_uni_api_ember_request_telemetry(
@@ -398,28 +677,124 @@ def build_uni_api_ember_request_telemetry(
                     "event_loop_lag_ms": _int_text(_runtime_int(runtime_metrics, "event_loop_lag_ms")),
                     "inflight_requests": _int_text(_runtime_int(runtime_metrics, "inflight_requests")),
                     "request_waiters": _int_text(_runtime_int(runtime_metrics, "request_waiters")),
-                    "request_large_body_active": _int_text(
-                        _runtime_int(runtime_metrics, "request_large_body_active")
-                    ),
-                    "request_large_body_limit": _int_text(
-                        _runtime_int(runtime_metrics, "request_large_body_limit")
-                    ),
-                    "request_body_reserved_weighted_bytes": _int_text(
+                    "runtime_global_large_body_active": _int_text(
                         _runtime_int(
                             runtime_metrics,
-                            "request_body_reserved_weighted_bytes",
+                            "runtime_global_large_body_active",
                         )
                     ),
-                    "upstream_response_reserved_weighted_bytes": _int_text(
+                    "runtime_global_large_body_limit": _int_text(
                         _runtime_int(
                             runtime_metrics,
-                            "upstream_response_reserved_weighted_bytes",
+                            "runtime_global_large_body_limit",
                         )
                     ),
-                    "request_retained_reserved_weighted_bytes": _int_text(
+                    "runtime_global_large_body_threshold_weighted_bytes": _int_text(
                         _runtime_int(
                             runtime_metrics,
-                            "request_retained_reserved_weighted_bytes",
+                            "runtime_global_large_body_threshold_weighted_bytes",
+                        )
+                    ),
+                    "runtime_global_large_body_decision_record_failures_total": _int_text(
+                        _runtime_int(
+                            runtime_metrics,
+                            "runtime_global_large_body_decision_record_failures_total",
+                        )
+                    ),
+                    "runtime_global_large_body_decision_observer_errors_total": _int_text(
+                        _runtime_int(
+                            runtime_metrics,
+                            "runtime_global_large_body_decision_observer_errors_total",
+                        )
+                    ),
+                    "runtime_global_large_body_decision_observer_enqueue_failures_total": _int_text(
+                        _runtime_int(
+                            runtime_metrics,
+                            "runtime_global_large_body_decision_observer_enqueue_failures_total",
+                        )
+                    ),
+                    "runtime_global_large_body_decision_export_enqueued_total": _int_text(
+                        _runtime_int(
+                            runtime_metrics,
+                            "runtime_global_large_body_decision_export_enqueued_total",
+                        )
+                    ),
+                    "runtime_global_large_body_decision_export_enqueue_dropped_total": _int_text(
+                        _runtime_int(
+                            runtime_metrics,
+                            "runtime_global_large_body_decision_export_enqueue_dropped_total",
+                        )
+                    ),
+                    "runtime_global_large_body_decision_export_build_errors_total": _int_text(
+                        _runtime_int(
+                            runtime_metrics,
+                            "runtime_global_large_body_decision_export_build_errors_total",
+                        )
+                    ),
+                    "runtime_global_large_body_decision_export_errors_total": _int_text(
+                        _runtime_int(
+                            runtime_metrics,
+                            "runtime_global_large_body_decision_export_errors_total",
+                        )
+                    ),
+                    "runtime_global_admission_503_outcome_export_enqueued_total": _int_text(
+                        _runtime_int(
+                            runtime_metrics,
+                            "runtime_global_admission_503_outcome_export_enqueued_total",
+                        )
+                    ),
+                    "runtime_global_admission_503_outcome_export_enqueue_dropped_total": _int_text(
+                        _runtime_int(
+                            runtime_metrics,
+                            "runtime_global_admission_503_outcome_export_enqueue_dropped_total",
+                        )
+                    ),
+                    "runtime_global_admission_503_outcome_export_build_errors_total": _int_text(
+                        _runtime_int(
+                            runtime_metrics,
+                            "runtime_global_admission_503_outcome_export_build_errors_total",
+                        )
+                    ),
+                    "runtime_global_admission_503_outcome_export_errors_total": _int_text(
+                        _runtime_int(
+                            runtime_metrics,
+                            "runtime_global_admission_503_outcome_export_errors_total",
+                        )
+                    ),
+                    "runtime_global_admission_rejection_decision_total": _int_text(
+                        _runtime_int(
+                            runtime_metrics,
+                            "runtime_global_admission_rejection_decision_total",
+                        )
+                    ),
+                    "runtime_global_admission_503_response_write_completed_total": _int_text(
+                        _runtime_int(
+                            runtime_metrics,
+                            "runtime_global_admission_503_response_write_completed_total",
+                        )
+                    ),
+                    "runtime_global_admission_503_response_write_failed_total": _int_text(
+                        _runtime_int(
+                            runtime_metrics,
+                            "runtime_global_admission_503_response_write_failed_total",
+                        )
+                    ),
+                    "runtime_global_request_body_reserved_weighted_bytes": _int_text(
+                        _runtime_int(
+                            runtime_metrics,
+                            "runtime_global_request_body_reserved_weighted_bytes",
+                        )
+                    ),
+                    "runtime_global_upstream_response_reserved_weighted_bytes": _int_text(
+                        _runtime_int(
+                            runtime_metrics,
+                            "runtime_global_upstream_response_reserved_weighted_bytes",
+                        )
+                    ),
+                    "runtime_global_retained_reserved_weighted_bytes": _int_text(
+                        _runtime_int(
+                            runtime_metrics,
+                            "runtime_global_retained_reserved_weighted_bytes",
                         )
                     ),
                     "waiting_first_byte": _int_text(_runtime_int(runtime_metrics, "waiting_first_byte")),
@@ -659,20 +1034,41 @@ def build_uni_api_ember_request_telemetry(
             "uniapi_ember_request_large_body_active": _runtime_int(
                 runtime_metrics, "request_large_body_active"
             ),
+            "uniapi_ember_runtime_global_large_body_active": _runtime_int(
+                runtime_metrics, "runtime_global_large_body_active"
+            ),
             "uniapi_ember_request_body_reserved_weighted_bytes": _runtime_int(
                 runtime_metrics, "request_body_reserved_weighted_bytes"
+            ),
+            "uniapi_ember_runtime_global_request_body_reserved_weighted_bytes": _runtime_int(
+                runtime_metrics,
+                "runtime_global_request_body_reserved_weighted_bytes",
             ),
             "uniapi_ember_upstream_response_reserved_weighted_bytes": _runtime_int(
                 runtime_metrics, "upstream_response_reserved_weighted_bytes"
             ),
+            "uniapi_ember_runtime_global_upstream_response_reserved_weighted_bytes": _runtime_int(
+                runtime_metrics,
+                "runtime_global_upstream_response_reserved_weighted_bytes",
+            ),
             "uniapi_ember_request_retained_reserved_weighted_bytes": _runtime_int(
                 runtime_metrics, "request_retained_reserved_weighted_bytes"
+            ),
+            "uniapi_ember_runtime_global_retained_reserved_weighted_bytes": _runtime_int(
+                runtime_metrics,
+                "runtime_global_retained_reserved_weighted_bytes",
             ),
             "uniapi_ember_request_deferred_memory_requests": _runtime_int(
                 runtime_metrics, "request_deferred_memory_requests"
             ),
             "uniapi_ember_request_deferred_memory_weighted_bytes": _runtime_int(
                 runtime_metrics, "request_deferred_memory_weighted_bytes"
+            ),
+            "uniapi_ember_runtime_global_deferred_memory_requests": _runtime_int(
+                runtime_metrics, "runtime_global_deferred_memory_requests"
+            ),
+            "uniapi_ember_runtime_global_deferred_memory_weighted_bytes": _runtime_int(
+                runtime_metrics, "runtime_global_deferred_memory_weighted_bytes"
             ),
             "uniapi_ember_waiting_first_byte": _runtime_int(runtime_metrics, "waiting_first_byte"),
             "uniapi_ember_event_loop_lag_ms": _runtime_int(runtime_metrics, "event_loop_lag_ms"),
@@ -714,6 +1110,62 @@ def build_uni_api_ember_request_telemetry(
             "uniapi_ember_request_admission_rejected_total": 1
             if _safe_bool(current_info.get("admission_rejected"))
             else 0,
+            "uniapi_ember_runtime_global_admission_rejection_decision_total": _runtime_int(
+                runtime_metrics,
+                "runtime_global_admission_rejection_decision_total",
+            ),
+            "uniapi_ember_runtime_global_admission_503_response_write_completed_total": _runtime_int(
+                runtime_metrics,
+                "runtime_global_admission_503_response_write_completed_total",
+            ),
+            "uniapi_ember_runtime_global_admission_503_response_write_failed_total": _runtime_int(
+                runtime_metrics,
+                "runtime_global_admission_503_response_write_failed_total",
+            ),
+            "uniapi_ember_runtime_global_large_body_decision_record_failures_total": _runtime_int(
+                runtime_metrics,
+                "runtime_global_large_body_decision_record_failures_total",
+            ),
+            "uniapi_ember_runtime_global_large_body_decision_observer_errors_total": _runtime_int(
+                runtime_metrics,
+                "runtime_global_large_body_decision_observer_errors_total",
+            ),
+            "uniapi_ember_runtime_global_large_body_decision_observer_enqueue_failures_total": _runtime_int(
+                runtime_metrics,
+                "runtime_global_large_body_decision_observer_enqueue_failures_total",
+            ),
+            "uniapi_ember_runtime_global_large_body_decision_export_enqueued_total": _runtime_int(
+                runtime_metrics,
+                "runtime_global_large_body_decision_export_enqueued_total",
+            ),
+            "uniapi_ember_runtime_global_large_body_decision_export_enqueue_dropped_total": _runtime_int(
+                runtime_metrics,
+                "runtime_global_large_body_decision_export_enqueue_dropped_total",
+            ),
+            "uniapi_ember_runtime_global_large_body_decision_export_build_errors_total": _runtime_int(
+                runtime_metrics,
+                "runtime_global_large_body_decision_export_build_errors_total",
+            ),
+            "uniapi_ember_runtime_global_large_body_decision_export_errors_total": _runtime_int(
+                runtime_metrics,
+                "runtime_global_large_body_decision_export_errors_total",
+            ),
+            "uniapi_ember_runtime_global_admission_503_outcome_export_enqueued_total": _runtime_int(
+                runtime_metrics,
+                "runtime_global_admission_503_outcome_export_enqueued_total",
+            ),
+            "uniapi_ember_runtime_global_admission_503_outcome_export_enqueue_dropped_total": _runtime_int(
+                runtime_metrics,
+                "runtime_global_admission_503_outcome_export_enqueue_dropped_total",
+            ),
+            "uniapi_ember_runtime_global_admission_503_outcome_export_build_errors_total": _runtime_int(
+                runtime_metrics,
+                "runtime_global_admission_503_outcome_export_build_errors_total",
+            ),
+            "uniapi_ember_runtime_global_admission_503_outcome_export_errors_total": _runtime_int(
+                runtime_metrics,
+                "runtime_global_admission_503_outcome_export_errors_total",
+            ),
             "uniapi_ember_stream_failures_total": 1
             if _is_stream_failure(current_info)
             else 0,
@@ -1219,6 +1671,9 @@ def _stage_rows(spans: dict[str, Any], duration_ms: int | None) -> list[tuple[st
     rows: list[tuple[str, int, dict[str, str]]] = []
     previous_stage = ""
     for stage in _STAGE_ORDER:
+        observed = stage in spans
+        if not observed:
+            continue
         if stage == "client_pool_acquired":
             stage_ms = _span_ms(spans, "upstream_pool_wait_ms")
             attrs = {
@@ -1261,6 +1716,7 @@ def _request_metric_events(
         {
             **(identity_attrs or {}),
             "component": service_name,
+            "metric_scope": "request_self",
             "route_id": route_id,
             "method": method,
             "status_class": _status_class(status_code),
@@ -1270,16 +1726,44 @@ def _request_metric_events(
         {
             **(identity_attrs or {}),
             "component": service_name,
+            "metric_scope": "runtime_global",
         }
     )
+    legacy_global_aliases = {
+        "uniapi_ember_request_large_body_active": (
+            "uniapi_ember_runtime_global_large_body_active"
+        ),
+        "uniapi_ember_request_body_reserved_weighted_bytes": (
+            "uniapi_ember_runtime_global_request_body_reserved_weighted_bytes"
+        ),
+        "uniapi_ember_upstream_response_reserved_weighted_bytes": (
+            "uniapi_ember_runtime_global_upstream_response_reserved_weighted_bytes"
+        ),
+        "uniapi_ember_request_retained_reserved_weighted_bytes": (
+            "uniapi_ember_runtime_global_retained_reserved_weighted_bytes"
+        ),
+        "uniapi_ember_request_deferred_memory_requests": (
+            "uniapi_ember_runtime_global_deferred_memory_requests"
+        ),
+        "uniapi_ember_request_deferred_memory_weighted_bytes": (
+            "uniapi_ember_runtime_global_deferred_memory_weighted_bytes"
+        ),
+    }
     global_metrics = {
         "uniapi_ember_inflight_requests",
         "uniapi_ember_request_waiters",
+        "uniapi_ember_request_large_body_active",
+        "uniapi_ember_runtime_global_large_body_active",
         "uniapi_ember_request_body_reserved_weighted_bytes",
+        "uniapi_ember_runtime_global_request_body_reserved_weighted_bytes",
         "uniapi_ember_upstream_response_reserved_weighted_bytes",
+        "uniapi_ember_runtime_global_upstream_response_reserved_weighted_bytes",
         "uniapi_ember_request_retained_reserved_weighted_bytes",
+        "uniapi_ember_runtime_global_retained_reserved_weighted_bytes",
         "uniapi_ember_request_deferred_memory_requests",
         "uniapi_ember_request_deferred_memory_weighted_bytes",
+        "uniapi_ember_runtime_global_deferred_memory_requests",
+        "uniapi_ember_runtime_global_deferred_memory_weighted_bytes",
         "uniapi_ember_waiting_first_byte",
         "uniapi_ember_event_loop_lag_ms",
         "uniapi_ember_client_pool_in_use",
@@ -1289,11 +1773,29 @@ def _request_metric_events(
         "uniapi_ember_stream_buffer_reserved_bytes",
         "uniapi_ember_stream_buffer_budget_waiters",
         "uniapi_ember_stream_parser_reserved_bytes",
+        "uniapi_ember_runtime_global_admission_rejection_decision_total",
+        "uniapi_ember_runtime_global_admission_503_response_write_completed_total",
+        "uniapi_ember_runtime_global_admission_503_response_write_failed_total",
+        "uniapi_ember_runtime_global_large_body_decision_record_failures_total",
+        "uniapi_ember_runtime_global_large_body_decision_observer_errors_total",
+        "uniapi_ember_runtime_global_large_body_decision_observer_enqueue_failures_total",
+        "uniapi_ember_runtime_global_large_body_decision_export_enqueued_total",
+        "uniapi_ember_runtime_global_large_body_decision_export_enqueue_dropped_total",
+        "uniapi_ember_runtime_global_large_body_decision_export_build_errors_total",
+        "uniapi_ember_runtime_global_large_body_decision_export_errors_total",
+        "uniapi_ember_runtime_global_admission_503_outcome_export_enqueued_total",
+        "uniapi_ember_runtime_global_admission_503_outcome_export_enqueue_dropped_total",
+        "uniapi_ember_runtime_global_admission_503_outcome_export_build_errors_total",
+        "uniapi_ember_runtime_global_admission_503_outcome_export_errors_total",
     }
     events = []
     for metric, value in values.items():
         if value is None:
             continue
+        attributes = dict(global_attrs if metric in global_metrics else request_attrs)
+        legacy_alias_of = legacy_global_aliases.get(metric)
+        if legacy_alias_of is not None:
+            attributes["legacy_alias_of"] = legacy_alias_of
         events.append(
             {
                 "timestamp": _iso_timestamp(timestamp),
@@ -1302,7 +1804,7 @@ def _request_metric_events(
                 "message": metric,
                 "metric": metric,
                 "value": max(0, int(value)),
-                "attributes": global_attrs if metric in global_metrics else request_attrs,
+                "attributes": attributes,
             }
         )
     return events

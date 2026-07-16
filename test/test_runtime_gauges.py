@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,10 +26,19 @@ def test_runtime_snapshot_uses_authoritative_admission_and_cached_network_state(
             "large_body_threshold_weighted_bytes": 1024,
             "large_body_limit": 2,
             "large_body_active": 1,
+            "large_body_oldest_holder_age_ms": 2500,
+            "large_body_decision_events_recorded_total": 3,
+            "large_body_decision_history_overwritten_total": 0,
+            "large_body_decision_record_failures_total": 0,
+            "large_body_decision_observer_errors_total": 0,
+            "large_body_decision_observer_enqueue_failures_total": 0,
+            "rejection_decision_total": 3,
             "rejected": {"queue_full": 3},
         }
     )
     gauges.open_sockets = 4
+    gauges.record_admission_503_response_write("queue_full", completed=True)
+    gauges.record_admission_503_response_write("queue_full", completed=False)
     gauges.tcp_states = {"ESTABLISHED": 2, "CLOSE_WAIT": 1}
     gauges.attach_stream_parser_budget(
         lambda: {
@@ -36,6 +46,18 @@ def test_runtime_snapshot_uses_authoritative_admission_and_cached_network_state(
             "peak_bytes": 999,
             "capacity_bytes": 4096,
             "rejected": 3,
+        }
+    )
+    gauges.attach_observability_exporter(
+        lambda: {
+            "large_body_decision_enqueued_total": 3,
+            "large_body_decision_enqueue_dropped_total": 1,
+            "large_body_decision_build_errors_total": 0,
+            "large_body_decision_export_errors_total": 2,
+            "admission_503_outcome_enqueued_total": 2,
+            "admission_503_outcome_enqueue_dropped_total": 1,
+            "admission_503_outcome_build_errors_total": 0,
+            "admission_503_outcome_export_errors_total": 1,
         }
     )
     monkeypatch.setattr(
@@ -51,19 +73,40 @@ def test_runtime_snapshot_uses_authoritative_admission_and_cached_network_state(
     assert snapshot["request_waiters"] == 11
     assert snapshot["middleware_inflight_requests"] == 99
     assert snapshot["request_body_reserved_weighted_bytes"] == 1234
+    assert snapshot["runtime_global_request_body_reserved_weighted_bytes"] == 1234
     assert snapshot["upstream_response_reserved_weighted_bytes"] == 4321
+    assert snapshot["runtime_global_upstream_response_reserved_weighted_bytes"] == 4321
     assert snapshot["request_retained_reserved_weighted_bytes"] == 5555
+    assert snapshot["runtime_global_retained_reserved_weighted_bytes"] == 5555
     assert snapshot["request_large_body_threshold_weighted_bytes"] == 1024
     assert snapshot["request_large_body_limit"] == 2
     assert snapshot["request_large_body_active"] == 1
+    assert snapshot["runtime_global_large_body_active"] == 1
+    assert snapshot["runtime_global_large_body_oldest_holder_age_ms"] == 2500
     assert snapshot["request_deferred_memory_requests"] == 2
     assert snapshot["request_deferred_memory_weighted_bytes"] == 3333
+    assert snapshot["runtime_global_deferred_memory_requests"] == 2
+    assert snapshot["runtime_global_deferred_memory_weighted_bytes"] == 3333
     assert snapshot["stream_parser_reserved_bytes"] == 777
     assert snapshot["stream_parser_budget_bytes"] == 4096
     assert snapshot["stream_parser_peak_bytes"] == 999
     assert snapshot["stream_parser_rejected_total"] == 3
     assert "request_body_reserved_bytes" not in snapshot
     assert snapshot["request_admission_rejected_total"] == 3
+    assert snapshot["runtime_global_admission_rejection_decision_total"] == 3
+    assert snapshot["runtime_global_admission_503_response_write_completed_total"] == 1
+    assert snapshot["runtime_global_admission_503_response_write_failed_total"] == 1
+    assert snapshot["runtime_global_admission_503_response_write_completed"] == {
+        "queue_full": 1
+    }
+    assert snapshot["runtime_global_large_body_decision_export_enqueued_total"] == 3
+    assert snapshot[
+        "runtime_global_large_body_decision_export_enqueue_dropped_total"
+    ] == 1
+    assert snapshot[
+        "runtime_global_admission_503_outcome_export_enqueue_dropped_total"
+    ] == 1
+    assert "large_body_holders" not in snapshot
     assert snapshot["open_sockets"] == 4
     assert snapshot["tcp_close_wait"] == 1
 
@@ -72,6 +115,63 @@ def test_bounded_env_int_rejects_unsafe_override(monkeypatch):
     monkeypatch.setenv("TEST_BOUNDED_LIMIT", "101")
     with pytest.raises(ValueError, match="startup safety limit 100"):
         runtime._bounded_env_int("TEST_BOUNDED_LIMIT", 50, 100)
+
+
+def test_admission_503_write_callback_emits_joinable_post_write_outcome(monkeypatch):
+    captured = []
+    request_facts = []
+    monkeypatch.setattr(runtime, "runtime_gauges", RuntimeGauges())
+    monkeypatch.setattr(runtime, "_emit_request_observability", request_facts.append)
+    monkeypatch.setattr(
+        runtime,
+        "emit_admission_503_response_write_outcome",
+        captured.append,
+    )
+    scope = {
+        "method": "POST",
+        "path": "/v1/responses",
+        "headers": [(b"x-request-id", b"req-123")],
+        "state": {
+            "uni_api_admission_request_id": "req-123",
+            "uni_api_admission_trace_id": "0123456789abcdef0123456789abcdef",
+            "uni_api_admission_lease": SimpleNamespace(lease_id="lease-safe-1"),
+        },
+    }
+
+    rejection = SimpleNamespace(
+        status_code=503,
+        reason="large_body_capacity_exhausted",
+    )
+    runtime._observe_request_admission_rejection(scope, rejection, 3.0)
+    runtime._observe_request_admission_response_write(
+        scope,
+        rejection,
+        True,
+    )
+    runtime._observe_request_admission_response_write(
+        scope,
+        rejection,
+        False,
+    )
+
+    assert len(request_facts) == 1
+    assert request_facts[0]["request_id"] == "req-123"
+    assert request_facts[0]["trace_id"] == "0123456789abcdef0123456789abcdef"
+    assert len(captured) == 2
+    outcome = captured[0]
+    assert outcome.request_self_request_id == "req-123"
+    assert outcome.request_self_trace_id == "0123456789abcdef0123456789abcdef"
+    assert outcome.request_self_lease_id == "lease-safe-1"
+    assert outcome.asgi_response_write_completed is True
+    assert outcome.runtime_global_admission_503_response_write_completed_total_after == 1
+    assert outcome.runtime_global_admission_503_response_write_failed_total_after == 0
+    failed = captured[1]
+    assert failed.request_self_request_id == outcome.request_self_request_id
+    assert failed.request_self_trace_id == outcome.request_self_trace_id
+    assert failed.request_self_lease_id == outcome.request_self_lease_id
+    assert failed.asgi_response_write_completed is False
+    assert failed.runtime_global_admission_503_response_write_completed_total_after == 1
+    assert failed.runtime_global_admission_503_response_write_failed_total_after == 1
 
 
 def test_bounded_env_int_rejects_invalid_override(monkeypatch):

@@ -12,6 +12,8 @@ from starlette.types import Message, Scope
 
 import main
 import uni_api.middleware.request_decompression as request_decompression
+from uni_api.admission import RequestAdmissionController
+from uni_api.middleware.admission import RequestAdmissionMiddleware
 from uni_api.middleware.request_decompression import (
     DOWNSTREAM_DISCONNECT_EVENT_SCOPE_KEY,
     RequestBodyDecompressionMiddleware,
@@ -993,6 +995,201 @@ def test_zstd_reserves_wire_chunks_and_decoded_bytes():
         zstd.get_frame_parameters(compressed).window_size,
         len(body) * 4,
     ]
+
+
+def test_zstd_large_body_decision_captures_wire_decoded_and_json_self_facts():
+    payload = json.dumps(
+        {
+            "model": "gpt-test",
+            "input": "x" * 2048,
+            "stream": True,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    compressed = _zstd_compress(payload)
+    workspace = zstd.get_frame_parameters(compressed).window_size
+    decisions = []
+    controller = RequestAdmissionController(
+        capacity=2,
+        waiter_limit=2,
+        wait_timeout_seconds=1,
+        max_body_bytes=128 * 1024,
+        body_budget_bytes=256 * 1024,
+        max_response_bytes=128 * 1024,
+        large_body_threshold_weighted_bytes=len(compressed) + workspace + 1,
+        large_body_limit=1,
+        decision_observer=decisions.append,
+    )
+    decompression = RequestBodyDecompressionMiddleware(
+        _echo_asgi,
+        max_zstd_compressed_body_bytes=len(compressed),
+        max_zstd_decompressed_body_bytes=len(payload),
+        json_max_estimated_bytes=128 * 1024,
+    )
+    middleware = RequestAdmissionMiddleware(
+        decompression,
+        controller=controller,
+    )
+    trace_id = "0123456789abcdef0123456789abcdef"
+    messages = asyncio.run(
+        _run_asgi(
+            middleware,
+            [{"type": "http.request", "body": compressed, "more_body": False}],
+            headers=[
+                (b"content-type", b"application/json"),
+                (b"content-encoding", b"zstd"),
+                (b"content-length", str(len(compressed)).encode("ascii")),
+                (b"x-request-id", b"request-zstd-observation"),
+                (b"traceparent", f"00-{trace_id}-0123456789abcdef-01".encode()),
+            ],
+            path="/v1/responses",
+        )
+    )
+
+    assert _asgi_response(messages)[0] == 200
+    assert [event.decision for event in decisions] == ["claim", "release"]
+    claim = decisions[0]
+    assert claim.request_self_request_id == "request-zstd-observation"
+    assert claim.request_self_trace_id == trace_id
+    assert claim.request_self_declared_content_length_bytes == len(compressed)
+    assert claim.request_self_wire_bytes == len(compressed)
+    assert claim.request_self_decoded_bytes == len(payload)
+    assert claim.request_self_decoder_workspace_bytes == workspace
+    assert claim.request_self_json_raw_bytes == len(payload)
+    assert claim.request_self_json_structural_item_count is not None
+    assert claim.request_self_json_structural_item_count > 0
+    assert claim.request_self_json_peak_depth == 1
+    assert claim.request_self_json_estimated_bytes is not None
+    assert claim.request_self_json_estimated_bytes > len(payload) * 5
+    assert claim.request_self_json_raw_memory_multiplier == 5
+    assert claim.request_self_json_structural_item_memory_bytes == 1024
+    release = decisions[1]
+    assert release.request_self_wire_bytes == len(compressed)
+    assert release.request_self_decoded_bytes == len(payload)
+    assert release.request_self_json_estimated_bytes == (
+        claim.request_self_json_estimated_bytes
+    )
+
+
+def test_json_complexity_release_keeps_terminal_estimator_facts_and_reason():
+    payload = json.dumps({"input": ["x"] * 64}).encode()
+    decisions = []
+    controller = RequestAdmissionController(
+        capacity=1,
+        waiter_limit=0,
+        wait_timeout_seconds=1,
+        max_body_bytes=64 * 1024,
+        body_budget_bytes=64 * 1024,
+        large_body_threshold_weighted_bytes=1,
+        large_body_limit=1,
+        decision_observer=decisions.append,
+    )
+    middleware = RequestAdmissionMiddleware(
+        RequestBodyDecompressionMiddleware(
+            _echo_asgi,
+            max_identity_body_bytes=len(payload),
+            json_max_estimated_bytes=len(payload) * 5 + 1024,
+        ),
+        controller=controller,
+    )
+
+    messages = asyncio.run(
+        _run_asgi(
+            middleware,
+            [{"type": "http.request", "body": payload, "more_body": False}],
+            headers=[(b"content-type", b"application/json")],
+            path="/v1/responses",
+        )
+    )
+
+    assert _asgi_response(messages)[0] == 413
+    assert [event.decision for event in decisions] == ["claim", "release"]
+    release = decisions[-1]
+    assert release.release_reason == "body_too_complex"
+    assert release.request_self_decoded_bytes == len(payload)
+    assert release.request_self_json_estimated_bytes is not None
+    assert release.request_self_json_estimated_bytes > len(payload) * 5
+    assert release.request_self_json_structural_item_count is not None
+
+
+def test_identity_overflow_release_keeps_attempted_decoded_bytes_and_reason():
+    payload = b"0123456789abcdef"
+    decisions = []
+    controller = RequestAdmissionController(
+        capacity=1,
+        waiter_limit=0,
+        wait_timeout_seconds=1,
+        max_body_bytes=64,
+        body_budget_bytes=64,
+        large_body_threshold_weighted_bytes=1,
+        large_body_limit=1,
+        decision_observer=decisions.append,
+    )
+    middleware = RequestAdmissionMiddleware(
+        RequestBodyDecompressionMiddleware(
+            _echo_asgi,
+            max_identity_body_bytes=8,
+        ),
+        controller=controller,
+    )
+
+    messages = asyncio.run(
+        _run_asgi(
+            middleware,
+            [{"type": "http.request", "body": payload, "more_body": False}],
+            path="/v1/responses",
+        )
+    )
+
+    assert _asgi_response(messages)[0] == 413
+    release = decisions[-1]
+    assert release.decision == "release"
+    assert release.release_reason == "body_too_large"
+    assert release.request_self_wire_bytes == len(payload)
+    assert release.request_self_decoded_bytes == len(payload)
+
+
+def test_zstd_overflow_release_keeps_attempted_decoded_bytes_and_reason():
+    payload = b"a" * 1536
+    compressed = zstd.ZstdCompressor(
+        level=3,
+        write_content_size=False,
+    ).compress(payload)
+    decisions = []
+    controller = RequestAdmissionController(
+        capacity=1,
+        waiter_limit=0,
+        wait_timeout_seconds=1,
+        max_body_bytes=4 * 1024 * 1024,
+        body_budget_bytes=4 * 1024 * 1024,
+        large_body_threshold_weighted_bytes=1,
+        large_body_limit=1,
+        decision_observer=decisions.append,
+    )
+    middleware = RequestAdmissionMiddleware(
+        RequestBodyDecompressionMiddleware(
+            _echo_asgi,
+            max_zstd_compressed_body_bytes=len(compressed),
+            max_zstd_decompressed_body_bytes=1024,
+        ),
+        controller=controller,
+    )
+
+    messages = asyncio.run(
+        _run_asgi(
+            middleware,
+            [{"type": "http.request", "body": compressed, "more_body": False}],
+            headers=[(b"content-encoding", b"zstd")],
+            path="/v1/responses",
+        )
+    )
+
+    assert _asgi_response(messages)[0] == 413
+    release = decisions[-1]
+    assert release.decision == "release"
+    assert release.release_reason == "body_too_large"
+    assert release.request_self_wire_bytes == len(compressed)
+    assert release.request_self_decoded_bytes == 1025
 
 
 def test_zstd_decoded_reservation_rejection_propagates_unchanged():

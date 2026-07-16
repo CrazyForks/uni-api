@@ -63,6 +63,77 @@ def test_dynamic_parent_budget_uses_limit_current_reservations_and_guard():
     assert snapshot.available_bytes == 200
 
 
+def test_cached_snapshot_is_io_free_and_reports_sample_sequence_and_age():
+    clock = [10.0]
+    calls = 0
+
+    def sample() -> ProcessMemorySample:
+        nonlocal calls
+        calls += 1
+        return ProcessMemorySample(
+            current_bytes=100 + calls,
+            limit_bytes=1_000,
+            source="fake",
+        )
+
+    governor = AdaptiveMemoryGovernor(
+        source=sample,
+        guard_bytes=100,
+        guard_ratio=0,
+        sample_cache_seconds=60,
+        clock=lambda: clock[0],
+    )
+    empty = governor.snapshot_cached()
+    assert calls == 0
+    assert empty.source == "unavailable"
+    assert empty.sample_sequence == 0
+    assert empty.sample_age_ms is None
+
+    sampled = governor.snapshot(force=True)
+    assert calls == 1
+    assert sampled.current_bytes == 101
+    assert sampled.sample_sequence == 1
+    assert sampled.sample_age_ms == 0
+
+    clock[0] = 10.125
+    cached = governor.snapshot_cached()
+    assert calls == 1
+    assert cached.current_bytes == 101
+    assert cached.sample_sequence == 1
+    assert cached.sample_age_ms == 125
+
+
+def test_failed_refresh_does_not_make_a_stale_cgroup_sample_look_fresh():
+    clock = [10.0]
+    fail = [False]
+
+    def sample() -> ProcessMemorySample:
+        if fail[0]:
+            raise OSError("bounded cgroup read failure")
+        return ProcessMemorySample(
+            current_bytes=100,
+            limit_bytes=1_000,
+            source="fake",
+        )
+
+    governor = AdaptiveMemoryGovernor(
+        source=sample,
+        guard_bytes=100,
+        guard_ratio=0,
+        sample_cache_seconds=60,
+        clock=lambda: clock[0],
+    )
+    assert governor.snapshot(force=True).sample_sequence == 1
+
+    clock[0] = 20.0
+    fail[0] = True
+    stale = governor.snapshot(force=True)
+    assert stale.current_bytes == 100
+    assert stale.sample_sequence == 1
+    assert stale.sample_age_ms == 10_000
+    assert stale.sample_error == "OSError: bounded cgroup read failure"
+
+
 def test_existing_reservations_survive_dynamic_downscale():
     memory = FakeMemory(current=100, limit=1000)
     governor = AdaptiveMemoryGovernor(
@@ -140,6 +211,7 @@ def test_resolves_nested_cgroup_v1_memory_controller(tmp_path):
     assert sample.limit_bytes == 1000
     assert sample.events == {"max": 7}
     assert sample.source == "cgroup-v1"
+
 
 
 def test_unlimited_environment_preserves_finite_fallback_budget():

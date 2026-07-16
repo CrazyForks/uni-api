@@ -20,6 +20,10 @@ from core.models import ModerationRequest
 from core.utils import safe_get
 from uni_api.admission import AdmissionRejected
 from uni_api.http_content import is_json_media_type
+from uni_api.middleware.admission import (
+    ADMISSION_REQUEST_ID_STATE_KEY,
+    ADMISSION_TRACE_ID_STATE_KEY,
+)
 from uni_api.middleware.request_decompression import (
     REQUEST_BODY_COMPLEXITY_INFO_KEY,
     RequestBodyTooComplex,
@@ -127,7 +131,9 @@ class StatsMiddleware(BaseHTTPMiddleware):
         return api_key_index.get(token)
 
     def _request_context(self, request: Request, *, trace, incoming_trace: dict[str, str], start_time: float, token: str) -> dict[str, Any]:
-        request_id = str(uuid.uuid4())
+        request_id = str(
+            getattr(request.state, ADMISSION_REQUEST_ID_STATE_KEY, "") or ""
+        ).strip() or str(uuid.uuid4())
         return RequestContext(
             request_id=request_id,
             trace_id=trace.trace_id,
@@ -493,6 +499,22 @@ class StatsMiddleware(BaseHTTPMiddleware):
         try:
             await runtime_gauges.record_event_loop_lag()
             incoming_trace = deps.incoming_trace_context(request.headers)
+            admission_trace_id = str(
+                getattr(request.state, ADMISSION_TRACE_ID_STATE_KEY, "") or ""
+            ).strip().lower()
+            if (
+                len(admission_trace_id) == 32
+                and admission_trace_id != "0" * 32
+                and all(
+                    character in "0123456789abcdef"
+                    for character in admission_trace_id
+                )
+            ):
+                # RequestAdmissionMiddleware is the outermost boundary and
+                # establishes correlation before queued-body admission can
+                # emit a decision. Reuse that exact trace inside Stats instead
+                # of creating a second identity for the same request.
+                incoming_trace["trace_id"] = admission_trace_id
             trace = deps.trace_factory(
                 trace_id=incoming_trace["trace_id"],
                 parent_span_id=incoming_trace.get("parent_span_id"),

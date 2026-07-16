@@ -70,7 +70,10 @@ class JSONMemorySnapshot:
     tokens: int
     depth: int
     peak_depth: int
+    scalar_bytes: int
     estimated_bytes: int
+    raw_memory_multiplier: int
+    structural_item_memory_bytes: int
 
 
 class IncrementalJSONMemoryEstimator:
@@ -129,7 +132,10 @@ class IncrementalJSONMemoryEstimator:
             tokens=self.tokens,
             depth=self.depth,
             peak_depth=self.peak_depth,
+            scalar_bytes=self._scalar_bytes,
             estimated_bytes=self.estimated_bytes,
+            raw_memory_multiplier=self.raw_memory_multiplier,
+            structural_item_memory_bytes=self.token_memory_bytes,
         )
 
     def feed(self, chunk: bytes | bytearray | memoryview) -> int:

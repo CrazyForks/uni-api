@@ -6,8 +6,15 @@ import main
 from fugue_observability import (
     FugueObservabilityClient,
     FugueObservabilityConfig,
+    build_uni_api_ember_admission_503_response_write_event,
+    build_uni_api_ember_large_body_admission_event,
     build_uni_api_ember_request_telemetry,
     fugue_observability_config_from_env,
+)
+from uni_api.admission import (
+    Admission503ResponseWriteOutcome,
+    RequestAdmissionController,
+    RequestBodyObservation,
 )
 
 
@@ -18,6 +25,130 @@ def test_fugue_observability_disabled_without_endpoint(monkeypatch):
     config = fugue_observability_config_from_env(service_version="test")
 
     assert config.enabled is False
+
+
+def test_large_body_admission_decision_is_a_body_free_clickhouse_app_event():
+    async def scenario():
+        decisions = []
+        controller = RequestAdmissionController(
+            capacity=2,
+            waiter_limit=2,
+            wait_timeout_seconds=1,
+            max_body_bytes=64,
+            body_budget_bytes=128,
+            large_body_threshold_weighted_bytes=16,
+            large_body_limit=1,
+            decision_observer=decisions.append,
+        )
+        lease = await controller.acquire()
+        await lease.reserve_body_bytes(
+            17,
+            observation=RequestBodyObservation(
+                request_id="request-decision",
+                trace_id="trace-decision",
+                method="POST",
+                path="/v1/responses",
+                wire_bytes=11,
+                decoded_bytes=11,
+                json_raw_bytes=11,
+                json_structural_item_count=2,
+                json_depth=0,
+                json_peak_depth=1,
+                json_scalar_bytes=0,
+                json_estimated_bytes=17,
+                json_raw_memory_multiplier=5,
+                json_structural_item_memory_bytes=1024,
+            ),
+        )
+        await lease.release()
+        return decisions[0]
+
+    decision = asyncio.run(scenario())
+    event = build_uni_api_ember_large_body_admission_event(
+        service_name="uni-api-ember",
+        service_version="test",
+        identity_attrs={
+            "tenant_id": "tenant_123",
+            "project_id": "project_123",
+            "app_id": "app_123",
+        },
+        decision=decision,
+    )
+
+    assert event["event_type"] == "large_body_admission_decision"
+    assert event["app_id"] == "app_123"
+    assert event["request_id"] == "request-decision"
+    assert event["trace_id"] == "trace-decision"
+    assert event["attributes"]["fugue_table"] == "app_events"
+    assert event["attributes"]["decision"] == "claim"
+    assert event["attributes"]["request_self_wire_bytes"] == "11"
+    assert event["attributes"]["runtime_global_large_body_active_after"] == "1"
+    assert event["summary"]["request_self_json_structural_item_count"] == 2
+    assert json.loads(event["summary_json"])["request_self_path"] == "/v1/responses"
+    serialized = json.dumps(event, sort_keys=True)
+    assert "authorization" not in serialized.lower()
+    assert "request body content" not in serialized.lower()
+
+
+def test_admission_503_write_outcome_is_a_joinable_body_free_app_event():
+    event = build_uni_api_ember_admission_503_response_write_event(
+        service_name="uni-api-ember",
+        service_version="test",
+        identity_attrs={"tenant_id": "tenant_123", "app_id": "app_123"},
+        outcome=Admission503ResponseWriteOutcome(
+            schema_version=1,
+            occurred_at_unix_ms=1_000_000,
+            reason="large_body_capacity_exhausted",
+            intended_status_code=503,
+            asgi_response_write_completed=False,
+            request_self_lease_id="lease-safe-1",
+            request_self_request_id="request-safe-1",
+            request_self_trace_id="trace-safe-1",
+            request_self_method="POST",
+            request_self_path="/v1/responses",
+            runtime_global_admission_503_response_write_completed_total_after=6,
+            runtime_global_admission_503_response_write_failed_total_after=1,
+        ),
+    )
+
+    assert event["event_type"] == "admission_503_response_write_outcome"
+    assert event["attributes"]["fugue_table"] == "app_events"
+    assert event["request_id"] == "request-safe-1"
+    assert event["trace_id"] == "trace-safe-1"
+    assert event["status_code"] == 503
+    assert event["summary"]["asgi_response_write_completed"] is False
+    assert json.loads(event["summary_json"])["request_self_lease_id"] == (
+        "lease-safe-1"
+    )
+
+
+def test_large_body_decision_queue_drop_is_visible_to_controller_and_exporter():
+    async def scenario():
+        client = FugueObservabilityClient(
+            FugueObservabilityConfig(endpoint="https://observability.invalid")
+        )
+        client._queue = asyncio.Queue(maxsize=1)
+        client._queue.put_nowait(("/v1/logs", {"events": [{}]}))
+        controller = RequestAdmissionController(
+            capacity=1,
+            waiter_limit=0,
+            wait_timeout_seconds=1,
+            max_body_bytes=64,
+            body_budget_bytes=64,
+            large_body_threshold_weighted_bytes=16,
+            large_body_limit=1,
+            decision_observer=client.emit_large_body_admission_decision,
+        )
+        lease = await controller.acquire()
+        await lease.reserve_body_bytes(17)
+        snapshot = controller.snapshot()
+        delivery = client.delivery_snapshot()
+        await lease.release()
+        return snapshot, delivery
+
+    snapshot, delivery = asyncio.run(scenario())
+    assert snapshot["large_body_decision_observer_enqueue_failures_total"] == 1
+    assert delivery["large_body_decision_enqueue_dropped_total"] == 1
 
 
 def test_body_complexity_diagnostics_reach_fact_log_and_dedicated_span_safely():
@@ -128,6 +259,87 @@ def test_normal_request_does_not_emit_body_complexity_diagnostics():
     assert "request_body_rejected" not in serialized
 
 
+def test_early_admission_rejection_only_emits_observed_stage_spans():
+    telemetry = build_uni_api_ember_request_telemetry(
+        service_name="uni-api-ember",
+        service_version="test",
+        identity_attrs={"tenant_id": "tenant_123", "app_id": "app_123"},
+        current_info={
+            "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+            "request_id": "early_admission_rejection_123",
+            "endpoint": "POST /v1/responses",
+            "status_code": 503,
+            "admission_rejected": True,
+            "error_type": "large_body_capacity_exhausted",
+            "process_time": 0.01,
+            "timing_spans": {"request_received": 0},
+        },
+        runtime_metrics={},
+    )
+
+    assert [
+        (event["attributes"]["stage"], event["attributes"]["stage_ms"])
+        for event in telemetry["traces"]
+    ] == [("request_received", "0")]
+
+
+def test_client_pool_stage_is_emitted_from_observed_pool_timing():
+    telemetry = build_uni_api_ember_request_telemetry(
+        service_name="uni-api-ember",
+        service_version="test",
+        identity_attrs={"tenant_id": "tenant_123", "app_id": "app_123"},
+        current_info={
+            "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+            "request_id": "client_pool_timing_123",
+            "endpoint": "POST /v1/responses",
+            "status_code": 503,
+            "process_time": 0.01,
+            "timing_spans": {
+                "request_received": 0,
+                "client_pool_acquire_start": 2,
+                "client_pool_acquire_end": 7,
+                "client_pool_acquired": 7,
+                "upstream_pool_wait_ms": 5,
+            },
+        },
+        runtime_metrics={},
+    )
+
+    assert [
+        event["attributes"]["stage"] for event in telemetry["traces"]
+    ] == ["request_received", "client_pool_acquired"]
+    client_pool_span = telemetry["traces"][1]["attributes"]
+    assert client_pool_span["stage_ms"] == "5"
+    assert client_pool_span["client_pool_acquire_start_ms"] == "2"
+    assert client_pool_span["client_pool_acquire_end_ms"] == "7"
+
+
+def test_failed_client_pool_attempt_does_not_emit_acquired_span():
+    telemetry = build_uni_api_ember_request_telemetry(
+        service_name="uni-api-ember",
+        service_version="test",
+        identity_attrs={"tenant_id": "tenant_123", "app_id": "app_123"},
+        current_info={
+            "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+            "request_id": "client_pool_rejected_123",
+            "endpoint": "POST /v1/responses",
+            "status_code": 503,
+            "process_time": 0.01,
+            "timing_spans": {
+                "request_received": 0,
+                "client_pool_acquire_start": 2,
+                "client_pool_acquire_end": 7,
+                "upstream_pool_wait_ms": 5,
+            },
+        },
+        runtime_metrics={},
+    )
+
+    assert [
+        event["attributes"]["stage"] for event in telemetry["traces"]
+    ] == ["request_received"]
+
+
 def test_uni_api_ember_telemetry_redacts_secrets_and_body():
     telemetry = build_uni_api_ember_request_telemetry(
         service_name="uni-api-ember",
@@ -182,6 +394,7 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
                 "retry_status_code": 503,
                 "retry_provider": "oaix",
                 "upstream_pool_wait_ms": 17,
+                "client_pool_acquired": 27,
                 "Authorization": "Bearer ember-secret-token",
                 "Cookie": "session=ember-cookie-secret",
                 "database_url": "postgresql://user:pass@db/ember",
@@ -334,8 +547,17 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
             "request_body_reserved_weighted_bytes": 8192,
             "upstream_response_reserved_weighted_bytes": 16384,
             "request_retained_reserved_weighted_bytes": 24576,
+            "runtime_global_request_body_reserved_weighted_bytes": 8192,
+            "runtime_global_upstream_response_reserved_weighted_bytes": 16384,
+            "runtime_global_retained_reserved_weighted_bytes": 24576,
+            "runtime_global_large_body_active": 1,
+            "runtime_global_admission_rejection_decision_total": 7,
+            "runtime_global_admission_503_response_write_completed_total": 6,
+            "runtime_global_admission_503_response_write_failed_total": 1,
             "request_deferred_memory_requests": 2,
             "request_deferred_memory_weighted_bytes": 4096,
+            "runtime_global_deferred_memory_requests": 2,
+            "runtime_global_deferred_memory_weighted_bytes": 4096,
             "waiting_first_byte": 4,
             "event_loop_lag_ms": 2,
             "upstream_pool_in_use": 3,
@@ -459,6 +681,20 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
         metrics["uniapi_ember_request_body_reserved_weighted_bytes"]["value"]
         == 8192
     )
+    assert metrics["uniapi_ember_request_body_reserved_weighted_bytes"][
+        "attributes"
+    ]["metric_scope"] == "runtime_global"
+    assert metrics["uniapi_ember_request_body_reserved_weighted_bytes"][
+        "attributes"
+    ]["legacy_alias_of"] == (
+        "uniapi_ember_runtime_global_request_body_reserved_weighted_bytes"
+    )
+    assert (
+        metrics[
+            "uniapi_ember_runtime_global_request_body_reserved_weighted_bytes"
+        ]["value"]
+        == 8192
+    )
     assert (
         metrics[
             "uniapi_ember_upstream_response_reserved_weighted_bytes"
@@ -472,14 +708,32 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
         == 24576
     )
     assert metrics["uniapi_ember_request_deferred_memory_requests"]["value"] == 2
+    assert metrics["uniapi_ember_runtime_global_deferred_memory_requests"][
+        "value"
+    ] == 2
     assert (
         metrics["uniapi_ember_request_deferred_memory_weighted_bytes"]["value"]
         == 4096
     )
     assert metrics["uniapi_ember_stream_parser_reserved_bytes"]["value"] == 2048
     assert metrics["uniapi_ember_stream_parser_rejected_total"]["value"] == 1
+    assert metrics[
+        "uniapi_ember_runtime_global_admission_rejection_decision_total"
+    ]["value"] == 7
+    assert metrics[
+        "uniapi_ember_runtime_global_admission_503_response_write_completed_total"
+    ]["value"] == 6
+    assert metrics[
+        "uniapi_ember_runtime_global_admission_503_response_write_failed_total"
+    ]["value"] == 1
     assert "route_id" not in metrics["uniapi_ember_inflight_requests"]["attributes"]
+    assert metrics["uniapi_ember_inflight_requests"]["attributes"][
+        "metric_scope"
+    ] == "runtime_global"
     assert metrics["uniapi_ember_request_duration_ms"]["attributes"]["route_id"]
+    assert metrics["uniapi_ember_request_duration_ms"]["attributes"][
+        "metric_scope"
+    ] == "request_self"
 
 
 def test_local_admission_503_is_not_counted_as_upstream_failure():

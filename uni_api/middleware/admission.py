@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections import deque
 from collections.abc import Callable
 from inspect import isawaitable
 from time import monotonic
 from typing import Any
+from uuid import uuid4
 
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from uni_api.admission import (
     AdmissionRejected,
+    RequestBodyObservation,
     RequestAdmissionController,
     bind_request_admission_lease,
     reset_request_admission_lease,
@@ -22,13 +25,116 @@ from uni_api.middleware.request_decompression import (
     BODY_BYTES_RESERVATION_SCOPE_KEY,
     BODY_EARLY_RESPONSE_OBSERVER_SCOPE_KEY,
     BODY_REJECTION_RECORDER_SCOPE_KEY,
+    initialize_request_body_observation,
+    observe_request_wire_bytes,
+    request_body_observation_from_scope,
 )
 
 
 RESERVE_BODY_BYTES_STATE_KEY = BODY_BYTES_RESERVATION_SCOPE_KEY
 ADMISSION_LEASE_STATE_KEY = "uni_api_admission_lease"
 ADMISSION_WAIT_MS_STATE_KEY = "uni_api_admission_wait_ms"
+ADMISSION_REQUEST_ID_STATE_KEY = "uni_api_admission_request_id"
+ADMISSION_TRACE_ID_STATE_KEY = "uni_api_admission_trace_id"
 ADMISSION_PREBUFFER_MESSAGE_HIGH_WATERMARK = 16
+_SAFE_CORRELATION_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,96}$")
+_W3C_TRACE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_W3C_SPAN_ID_RE = re.compile(r"^[0-9a-f]{16}$")
+_W3C_BYTE_RE = re.compile(r"^[0-9a-f]{2}$")
+
+
+def _bounded_observation_text(value: Any, *, max_length: int = 160) -> str | None:
+    text = str(value or "").strip()
+    return text[:max_length] if text else None
+
+
+def _safe_correlation_id(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text if _SAFE_CORRELATION_ID_RE.fullmatch(text) else None
+
+
+def _safe_w3c_trace_id(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    if _W3C_TRACE_ID_RE.fullmatch(text) is None or text == "0" * 32:
+        return None
+    return text
+
+
+def _incoming_observation_identifiers(scope: Scope) -> tuple[str, str]:
+    state = scope.setdefault("state", {})
+    if isinstance(state, dict):
+        saved_request_id = _safe_correlation_id(
+            state.get(ADMISSION_REQUEST_ID_STATE_KEY)
+        )
+        saved_trace_id = _safe_w3c_trace_id(
+            state.get(ADMISSION_TRACE_ID_STATE_KEY)
+        )
+        if saved_request_id is not None and saved_trace_id is not None:
+            return saved_request_id, saved_trace_id
+
+    headers = {
+        name.decode("latin-1").lower(): value.decode("latin-1")
+        for name, value in (scope.get("headers") or [])
+    }
+    request_id = _safe_correlation_id(headers.get("x-request-id"))
+    trace_id = None
+    traceparent = str(headers.get("traceparent") or "").strip().lower()
+    fields = traceparent.split("-")
+    if (
+        len(fields) == 4
+        and _W3C_BYTE_RE.fullmatch(fields[0]) is not None
+        and fields[0] != "ff"
+        and _safe_w3c_trace_id(fields[1]) is not None
+        and _W3C_SPAN_ID_RE.fullmatch(fields[2]) is not None
+        and fields[2] != "0" * 16
+        and _W3C_BYTE_RE.fullmatch(fields[3]) is not None
+    ):
+        trace_id = fields[1]
+    if request_id is None and trace_id is not None:
+        request_id = trace_id
+    if trace_id is None:
+        generated = uuid4().hex
+        request_id = request_id or generated
+        trace_id = generated
+    if isinstance(state, dict):
+        state[ADMISSION_REQUEST_ID_STATE_KEY] = request_id
+        state[ADMISSION_TRACE_ID_STATE_KEY] = trace_id
+    return request_id, trace_id
+
+
+def _request_body_observation(scope: Scope) -> RequestBodyObservation:
+    raw = request_body_observation_from_scope(scope)
+    request_id, trace_id = _incoming_observation_identifiers(scope)
+    state = scope.get("state")
+    if isinstance(state, dict):
+        current_info = state.get("uni_api_request_info")
+        if isinstance(current_info, dict):
+            request_id = (
+                _safe_correlation_id(current_info.get("request_id")) or request_id
+            )
+            trace_id = (
+                _safe_correlation_id(current_info.get("trace_id")) or trace_id
+            )
+    return RequestBodyObservation(
+        request_id=request_id,
+        trace_id=trace_id,
+        method=_bounded_observation_text(scope.get("method"), max_length=16),
+        path=_bounded_observation_text(scope.get("path")),
+        declared_content_length_bytes=raw.get("declared_content_length_bytes"),
+        wire_bytes=raw.get("wire_bytes", 0),
+        decoded_bytes=raw.get("decoded_bytes", 0),
+        decoder_workspace_bytes=raw.get("decoder_workspace_bytes", 0),
+        json_raw_bytes=raw.get("json_raw_bytes"),
+        json_structural_item_count=raw.get("json_structural_item_count"),
+        json_depth=raw.get("json_depth"),
+        json_peak_depth=raw.get("json_peak_depth"),
+        json_scalar_bytes=raw.get("json_scalar_bytes"),
+        json_estimated_bytes=raw.get("json_estimated_bytes"),
+        json_raw_memory_multiplier=raw.get("json_raw_memory_multiplier"),
+        json_structural_item_memory_bytes=raw.get(
+            "json_structural_item_memory_bytes"
+        ),
+    )
 
 
 async def _finish_ownership_cleanup(
@@ -64,6 +170,10 @@ class RequestAdmissionMiddleware:
         retry_after_seconds: int = 1,
         on_rejection: Callable[[Scope, AdmissionRejected, float], Any] | None = None,
         on_early_response: Callable[[Scope, int, str], Any] | None = None,
+        on_rejection_response_write: Callable[
+            [Scope, AdmissionRejected, bool], Any
+        ]
+        | None = None,
     ) -> None:
         if retry_after_seconds <= 0:
             raise ValueError("retry_after_seconds must be greater than zero")
@@ -73,6 +183,7 @@ class RequestAdmissionMiddleware:
         self.retry_after_seconds = retry_after_seconds
         self.on_rejection = on_rejection
         self.on_early_response = on_early_response
+        self.on_rejection_response_write = on_rejection_response_write
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -91,6 +202,8 @@ class RequestAdmissionMiddleware:
             return
 
         response_started = False
+        _incoming_observation_identifiers(scope)
+        initialize_request_body_observation(scope)
 
         async def tracking_send(message: Message) -> None:
             nonlocal response_started
@@ -104,6 +217,7 @@ class RequestAdmissionMiddleware:
         handed_off_receive_task: asyncio.Task[Message] | None = None
         available_replayed_credit = 0
         admission_started_at = monotonic()
+        release_reason = "request_completed"
         try:
             lease = await self.controller.try_acquire()
             if lease is None:
@@ -139,9 +253,14 @@ class RequestAdmissionMiddleware:
                 )
                 available_replayed_credit -= credited
                 remaining = int(additional_bytes) - credited
-                if remaining > 0:
-                    return await lease.reserve_body_bytes(remaining)
-                return lease.reserved_body_bytes
+                observation = _request_body_observation(scope)
+                if remaining == 0:
+                    lease.observe_body(observation)
+                    return lease.reserved_body_bytes
+                return await lease.reserve_body_bytes(
+                    remaining,
+                    observation=observation,
+                )
 
             state[RESERVE_BODY_BYTES_STATE_KEY] = reserve_body_bytes
             state[BODY_REJECTION_RECORDER_SCOPE_KEY] = (
@@ -152,6 +271,13 @@ class RequestAdmissionMiddleware:
                 status_code: int,
                 reason: str,
             ) -> None:
+                nonlocal release_reason
+                normalized_reason = str(reason or "request_body_early_response")
+                release_reason = normalized_reason
+                # A terminal parse/size decision may update wire/decoded/JSON
+                # facts without adding another weighted byte. Refresh holder
+                # identity and facts before its eventual release event.
+                lease.observe_body(_request_body_observation(scope))
                 await self._notify_early_response(scope, status_code, reason)
 
             state[BODY_EARLY_RESPONSE_OBSERVER_SCOPE_KEY] = (
@@ -173,12 +299,18 @@ class RequestAdmissionMiddleware:
                 if message.get("type") == "http.request":
                     body = message.get("body", b"") or b""
                     if body:
-                        await lease.reserve_body_bytes(len(body))
+                        observe_request_wire_bytes(scope, len(body))
+                        await lease.reserve_body_bytes(
+                            len(body),
+                            observation=_request_body_observation(scope),
+                        )
                         available_replayed_credit += len(body)
                 return message
 
             await self.app(scope, replay_receive, tracking_send)
         except AdmissionRejected as exc:
+            rejection_reason = str(exc.reason or "admission_rejected")
+            release_reason = rejection_reason
             if response_started:
                 raise
             wait_ms = (
@@ -187,8 +319,48 @@ class RequestAdmissionMiddleware:
                 else (monotonic() - admission_started_at) * 1000.0
             )
             await self._notify_rejection(scope, exc, wait_ms)
-            await self._send_rejection(scope, receive, send, exc)
+            try:
+                write_completed = await self._send_rejection(
+                    scope,
+                    receive,
+                    send,
+                    exc,
+                )
+            except BaseException:
+                release_reason = f"{rejection_reason}_response_write_failed"
+                raise
+            release_reason = (
+                f"{rejection_reason}_response_written"
+                if write_completed
+                else f"{rejection_reason}_response_incomplete"
+            )
+        except asyncio.CancelledError:
+            release_reason = (
+                "request_cancelled"
+                if release_reason == "request_completed"
+                else f"{release_reason}_response_write_cancelled"
+            )
+            raise
+        except BaseException:
+            release_reason = (
+                "request_error"
+                if release_reason == "request_completed"
+                else f"{release_reason}_response_write_failed"
+            )
+            raise
         finally:
+            state = scope.get("state")
+            disconnect_event = (
+                state.get(DOWNSTREAM_DISCONNECT_EVENT_SCOPE_KEY)
+                if isinstance(state, dict)
+                else None
+            )
+            if (
+                release_reason == "request_completed"
+                and isinstance(disconnect_event, asyncio.Event)
+                and disconnect_event.is_set()
+            ):
+                release_reason = "downstream_disconnected"
             abandoned_receive = handed_off_receive_task
             handed_off_receive_task = None
 
@@ -217,7 +389,7 @@ class RequestAdmissionMiddleware:
                             None,
                         )
                     if lease is not None:
-                        await lease.release()
+                        await lease.release(reason=release_reason)
 
             cleanup_task = asyncio.create_task(cleanup_request_ownership())
             try:
@@ -262,7 +434,7 @@ class RequestAdmissionMiddleware:
         lease = None
         queued_body_complete = False
 
-        async def cancel_acquire_and_release_result() -> None:
+        async def cancel_acquire_and_release_result(release_reason: str) -> None:
             # Cancellation can lose the race with a just-granted lease.  Always
             # consume the task result and release any transferred ownership;
             # otherwise a same-turn peer disconnect strands an active slot.
@@ -272,7 +444,7 @@ class RequestAdmissionMiddleware:
                 granted_lease = await acquire_task
             except (asyncio.CancelledError, AdmissionRejected):
                 return
-            await granted_lease.release()
+            await granted_lease.release(reason=release_reason)
 
         async def cancel_disconnect_observer(
             task: asyncio.Task[bool],
@@ -292,6 +464,7 @@ class RequestAdmissionMiddleware:
             receive_to_cleanup: asyncio.Task[Message] | None,
             disconnect_to_cleanup: asyncio.Task[bool] | None,
             known_lease: Any,
+            release_reason: str,
         ) -> None:
             """Release every queued owner even if an earlier step fails."""
 
@@ -315,25 +488,27 @@ class RequestAdmissionMiddleware:
                             pass
                 finally:
                     try:
-                        await cancel_acquire_and_release_result()
+                        await cancel_acquire_and_release_result(release_reason)
                     finally:
                         try:
                             if known_lease is not None:
-                                await known_lease.release()
+                                await known_lease.release(reason=release_reason)
                         finally:
                             buffered.clear()
-                            await pending.release()
+                            await pending.release(reason=release_reason)
 
         async def finish_queued_ownership_cleanup(
             receive_to_cleanup: asyncio.Task[Message] | None,
             disconnect_to_cleanup: asyncio.Task[bool] | None,
             known_lease: Any,
+            release_reason: str,
         ) -> None:
             cleanup_task = asyncio.create_task(
                 cleanup_queued_ownership(
                     receive_to_cleanup,
                     disconnect_to_cleanup,
                     known_lease,
+                    release_reason,
                 )
             )
             await _finish_ownership_cleanup(cleanup_task)
@@ -362,6 +537,7 @@ class RequestAdmissionMiddleware:
                         abandoned_receive,
                         disconnected_wait,
                         lease,
+                        "downstream_disconnected_while_queued",
                     )
                     return None, buffered, None, True
 
@@ -377,12 +553,14 @@ class RequestAdmissionMiddleware:
                                     None,
                                     disconnect_task,
                                     lease,
+                                    "downstream_disconnected_while_queued",
                                 )
                                 disconnect_task = None
                                 lease = None
                                 return None, buffered, None, True
                             if not queued_body_complete:
                                 await self._buffer_pending_message(
+                                    scope,
                                     pending,
                                     buffered,
                                     message,
@@ -399,6 +577,7 @@ class RequestAdmissionMiddleware:
                             abandoned_receive,
                             disconnect_task,
                             lease,
+                            "downstream_disconnected_while_queued",
                         )
                         disconnect_task = None
                         lease = None
@@ -419,6 +598,7 @@ class RequestAdmissionMiddleware:
                             abandoned_receive,
                             None,
                             lease,
+                            "downstream_disconnected_while_queued",
                         )
                         lease = None
                         return None, buffered, None, True
@@ -433,12 +613,18 @@ class RequestAdmissionMiddleware:
                         None,
                         disconnect_task,
                         lease,
+                        "downstream_disconnected_while_queued",
                     )
                     disconnect_task = None
                     return None, buffered, None, True
 
                 if not queued_body_complete:
-                    await self._buffer_pending_message(pending, buffered, message)
+                    await self._buffer_pending_message(
+                        scope,
+                        pending,
+                        buffered,
+                        message,
+                    )
                 if (
                     not queued_body_complete
                     and
@@ -463,21 +649,29 @@ class RequestAdmissionMiddleware:
                 # pending so a peer that disconnects while still queued is
                 # observed before the application is admitted.
                 receive_task = asyncio.create_task(receive())
-        except BaseException:
+        except BaseException as exc:
             abandoned_receive = receive_task
             receive_task = None
             abandoned_disconnect = disconnect_task
             disconnect_task = None
+            if isinstance(exc, asyncio.CancelledError):
+                queued_release_reason = "queued_request_cancelled"
+            elif isinstance(exc, AdmissionRejected):
+                queued_release_reason = f"queued_{exc.reason}"
+            else:
+                queued_release_reason = "queued_request_error"
             await finish_queued_ownership_cleanup(
                 abandoned_receive,
                 abandoned_disconnect,
                 lease,
+                queued_release_reason,
             )
             lease = None
             raise
 
     @staticmethod
     async def _buffer_pending_message(
+        scope: Scope,
         pending: Any,
         buffered: deque[tuple[Message, int]],
         message: Message,
@@ -485,7 +679,13 @@ class RequestAdmissionMiddleware:
         if message.get("type") != "http.request":
             return
         body = message.get("body", b"") or b""
-        await pending.reserve(len(body))
+        if body:
+            observe_request_wire_bytes(scope, len(body))
+        observation = _request_body_observation(scope)
+        if body:
+            await pending.reserve(len(body), observation=observation)
+        else:
+            pending.observe_body(observation)
         buffered.append((message, len(body)))
 
     async def _notify_rejection(
@@ -525,7 +725,7 @@ class RequestAdmissionMiddleware:
         receive: Receive,
         send: Send,
         rejection: AdmissionRejected,
-    ) -> None:
+    ) -> bool:
         status_code = int(rejection.status_code)
         reason = rejection.reason
         if status_code == 413:
@@ -549,4 +749,50 @@ class RequestAdmissionMiddleware:
             },
             headers=headers,
         )
-        await response(scope, receive, send)
+        terminal_body_written = False
+
+        async def tracking_rejection_send(message: Message) -> None:
+            nonlocal terminal_body_written
+            await send(message)
+            if (
+                message.get("type") == "http.response.body"
+                and not message.get("more_body", False)
+            ):
+                terminal_body_written = True
+
+        try:
+            await response(scope, receive, tracking_rejection_send)
+        except BaseException:
+            if status_code == 503:
+                await self._notify_rejection_response_write(
+                    scope,
+                    rejection,
+                    completed=False,
+                )
+            raise
+        if status_code == 503:
+            await self._notify_rejection_response_write(
+                scope,
+                rejection,
+                completed=terminal_body_written,
+            )
+        return terminal_body_written
+
+    async def _notify_rejection_response_write(
+        self,
+        scope: Scope,
+        rejection: AdmissionRejected,
+        *,
+        completed: bool,
+    ) -> None:
+        callback = self.on_rejection_response_write
+        if callback is None:
+            return
+        try:
+            result = callback(scope, rejection, bool(completed))
+            if isawaitable(result):
+                await result
+        except Exception:
+            # A post-write telemetry failure must never replace the deliberate
+            # admission response or make a successful ASGI write look failed.
+            logger.exception("Failed to record admission response write outcome")

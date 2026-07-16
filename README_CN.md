@@ -438,6 +438,18 @@ reservation、大请求阈值、槽位数和当前占用。
 `REQUEST_LARGE_BODY_THRESHOLD_WEIGHTED_BYTES` 的单位是加权保留内存字节，
 不是原始 wire body 字节。
 
+大请求槽位的 claim、reject、release 会输出不含 body 的
+`large_body_admission_decision` 事件。事件用 `request_self_*` 保存当前请求的
+wire、decoded、JSON estimator 分项、加权 reservation 与 request/trace/lease
+事实，用 `runtime_global_*` 保存阈值、active/limit、预算与 cgroup 事实。事件同时保存
+决策时间，以及 governor 最近一次 cgroup 样本的 sequence、决策时 age 和采样 error。
+它不会在持有 admission 锁时执行文件系统 I/O，因此慢速 cgroup 读取不会拖延槽位释放；
+age 字段明确表达这一边界，而不是把缓存值冒充成内核原子瞬时值。holder 身份不会进入
+公开 runtime gauge 或 metric label。admission 拒绝决策数与 ASGI
+503 响应写回成功/失败数分别计数，并用可按 request/trace/lease 关联的
+`admission_503_response_write_outcome` 事件记录单次写回结果。ASGI write completed
+仅表示发送调用完成，不代表远端调用方已经消费响应。
+
 主要覆盖项包括：`REQUEST_ADMISSION_CPU_MILLICORES`（适合 CPU weight
 没有平台含义的独立服务器）、`REQUEST_ADMISSION_ACTIVE_LIMIT`、
 `REQUEST_ADMISSION_WAITER_LIMIT`、`REQUEST_ADMISSION_TOTAL_LIMIT`、

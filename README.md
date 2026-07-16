@@ -441,6 +441,22 @@ wire, JSON estimate, weighted reservation, large-body threshold, limit, and
 active count. `REQUEST_LARGE_BODY_THRESHOLD_WEIGHTED_BYTES` is measured in
 weighted retained-memory bytes, not raw wire bytes.
 
+Large-body slot changes emit body-free `large_body_admission_decision` events
+for claim, reject, and release. Each event carries `request_self_*` wire,
+decoded, JSON-estimator, weighted-reservation, request/trace/lease facts and
+`runtime_global_*` threshold, active/limit, budget, and cgroup facts. The event
+records its decision timestamp together with the governor's latest cgroup
+sample, sample sequence, age-at-decision, and sampling error. It deliberately
+does not perform filesystem I/O while holding the admission lock, so a slow
+cgroup read can never delay slot release; the age field is the explicit
+boundary rather than a claim of an atomic kernel measurement. Holder identities
+stay out of public runtime gauges and metric labels. Admission rejection
+decisions and completed or failed ASGI 503 response writes are separate
+counters; a joinable
+`admission_503_response_write_outcome` event records the per-request write
+result. ASGI write completion does not claim that the remote peer consumed the
+response.
+
 Primary overrides are `REQUEST_ADMISSION_CPU_MILLICORES` (useful when a
 standalone host's default CPU weight is not meaningful),
 `REQUEST_ADMISSION_ACTIVE_LIMIT`, `REQUEST_ADMISSION_WAITER_LIMIT`,

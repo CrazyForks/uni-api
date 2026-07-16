@@ -367,6 +367,10 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 debug=deps.debug,
                 disconnect_event=current_info.get("disconnect_event"),
                 lifecycle_close=lifecycle_close,
+                # alpha/search is a unary tool protocol with no usage object.
+                # Its encrypted payload can exceed the generic JSON observer
+                # budget without indicating a malformed response.
+                observe_usage=request.url.path.rstrip("/") != "/v1/alpha/search",
                 usage_buffer_limit_bytes=(
                     getattr(
                         deps,

@@ -167,6 +167,40 @@ async def test_streaming_observability_wrap_merges_response_current_info():
     assert wrapped.headers["x-request-id"] == "inner"
 
 
+async def test_alpha_search_observability_disables_generic_usage_parser():
+    import main
+
+    trace = main.RequestTrace(trace_id="alpha-trace")
+    current_info = {
+        "request_id": "alpha-request",
+        "api_key": "sk-test",
+        "trace": trace,
+    }
+    response = StreamingResponse(
+        iter([b'{"output":"search result","encrypted_output":"cipher"}']),
+        media_type="application/json",
+    )
+    middleware = object.__new__(main.StatsMiddleware)
+    middleware.dependencies = SimpleNamespace(
+        database_disabled=True,
+        logging_response_class=main.LoggingStreamingResponse,
+        mark_first_byte_observed=lambda info: None,
+        emit_request_observability=lambda info: None,
+        update_stats=None,
+        debug=False,
+    )
+
+    wrapped = await middleware._wrap_response_for_observability(
+        SimpleNamespace(url=SimpleNamespace(path="/v1/alpha/search")),
+        response,
+        current_info,
+        trace,
+    )
+
+    assert wrapped._usage_observation_enabled is False
+    assert wrapped._usage_parser_disabled is False
+
+
 async def test_logging_streaming_response_preserves_handler_timing_spans():
     import main
 

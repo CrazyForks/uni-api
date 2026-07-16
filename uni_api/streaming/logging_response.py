@@ -235,6 +235,7 @@ class LoggingStreamingResponse(Response):
         debug: bool = False,
         disconnect_event: Optional[asyncio.Event] = None,
         lifecycle_close: Optional[AsyncCloseCallback] = None,
+        observe_usage: bool = True,
         usage_buffer_limit_bytes: int = DEFAULT_MAX_PENDING_BYTES,
         downstream_write_timeout_seconds: Optional[float] = None,
         stats_write_timeout_seconds: Optional[float] = None,
@@ -257,6 +258,7 @@ class LoggingStreamingResponse(Response):
         self._debug = debug
         self._disconnect_event = disconnect_event
         self._lifecycle_close = lifecycle_close
+        self._usage_observation_enabled = bool(observe_usage)
         self._usage_buffer_limit_bytes = usage_buffer_limit_bytes
         self._usage_json_buffer_limit_bytes = min(
             usage_buffer_limit_bytes,
@@ -294,7 +296,7 @@ class LoggingStreamingResponse(Response):
                 max_pending_bytes=usage_buffer_limit_bytes,
                 max_event_bytes=usage_buffer_limit_bytes,
             )
-            if self._is_sse_response
+            if self._usage_observation_enabled and self._is_sse_response
             else None
         )
         self._usage_json_buffer = bytearray()
@@ -311,7 +313,11 @@ class LoggingStreamingResponse(Response):
         self._stream_task: Optional[asyncio.Task] = None
         diagnostics = self.current_info.get("responses_stream_diagnostics")
         if isinstance(diagnostics, dict):
-            diagnostics["downstream_usage_observer_status"] = "active"
+            diagnostics["downstream_usage_observer_status"] = (
+                "active" if self._usage_observation_enabled else "not_applicable"
+            )
+            if not self._usage_observation_enabled:
+                diagnostics["downstream_usage_observer_reason"] = "disabled_by_policy"
             diagnostics.setdefault("downstream_usage_object_seen", False)
             diagnostics.setdefault("downstream_usage_counters_seen", False)
             diagnostics.setdefault("downstream_usage_input_known", False)
@@ -591,7 +597,7 @@ class LoggingStreamingResponse(Response):
             )
 
     async def _observe_usage_chunk(self, chunk: bytes) -> None:
-        if self._usage_parser_disabled:
+        if not self._usage_observation_enabled or self._usage_parser_disabled:
             return
 
         if self._usage_sse_parser is not None:
@@ -642,7 +648,7 @@ class LoggingStreamingResponse(Response):
         return
 
     async def _finish_usage_observation(self) -> None:
-        if self._usage_parser_disabled:
+        if not self._usage_observation_enabled or self._usage_parser_disabled:
             return
         if self._usage_sse_parser is not None:
             try:

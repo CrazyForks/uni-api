@@ -1371,6 +1371,53 @@ def test_usage_observation_is_bounded_without_truncating_customer_bytes():
     asyncio.run(scenario())
 
 
+def test_usage_observation_can_be_disabled_for_non_usage_json():
+    async def scenario():
+        sent = []
+        payload = (
+            b'{"output":"'
+            + (b"x" * (70 * 1024))
+            + b'","usage":{"prompt_tokens":7,"completion_tokens":9,'
+            + b'"total_tokens":16}}'
+        )
+
+        async def body():
+            yield payload
+
+        async def send(message):
+            sent.append(message)
+
+        diagnostics = {}
+        current_info = {
+            "start_time": 0,
+            "responses_stream_diagnostics": diagnostics,
+        }
+        response = LoggingStreamingResponse(
+            body(),
+            media_type="application/json",
+            current_info=current_info,
+            observe_usage=False,
+            usage_buffer_limit_bytes=128 * 1024,
+        )
+        await response(_scope(), _never_receive, send)
+
+        customer_body = b"".join(
+            message.get("body", b"")
+            for message in sent
+            if message["type"] == "http.response.body"
+        )
+        assert customer_body == payload
+        assert "usage_parse_error" not in current_info
+        assert "prompt_tokens" not in current_info
+        assert "completion_tokens" not in current_info
+        assert "total_tokens" not in current_info
+        assert current_info["stream_outcome"] == "completed"
+        assert diagnostics["downstream_usage_observer_status"] == "not_applicable"
+        assert diagnostics["downstream_usage_observer_reason"] == "disabled_by_policy"
+
+    asyncio.run(scenario())
+
+
 def test_sse_done_frame_finishes_without_a_false_incomplete_error():
     async def scenario():
         sent = []

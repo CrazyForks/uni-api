@@ -739,6 +739,7 @@ class RoutingPlan:
     api_key_weights: tuple[dict[str, Any], ...]
     request_total_tokens: int
     request_body_bytes: int
+    endpoint: Optional[str]
     scheduling_algorithm: str
     auto_retry: Any
     role: str
@@ -887,6 +888,7 @@ class RoutingPlan:
             api_key_weights=api_key_weights,
             request_total_tokens=request_total_tokens,
             request_body_bytes=request_body_bytes,
+            endpoint=endpoint,
             scheduling_algorithm=scheduling_algorithm,
             auto_retry=preferences["AUTO_RETRY"]
             if isinstance(preferences, dict) and "AUTO_RETRY" in preferences
@@ -925,6 +927,19 @@ class RoutingPlan:
 
         return None
 
+    def restrict_to_provider(self, provider_name: str) -> bool:
+        matching_providers = tuple(
+            provider
+            for provider in self._state.matching_providers
+            if provider.get("provider") == provider_name
+        )
+        if not matching_providers:
+            return False
+        self._state.matching_providers = matching_providers
+        self._state.retry_count = 0
+        self._state.index = 0
+        return True
+
     async def refresh_matching_providers(self, *, debug: bool = False) -> None:
         matching_providers = await _call_provider_resolver(
             self.provider_resolver,
@@ -936,6 +951,7 @@ class RoutingPlan:
             models_list=self.models_list,
             api_key_model_rules=self.api_key_model_rules,
             api_key_weights=self.api_key_weights,
+            endpoint=self.endpoint,
             channel_manager=self.channel_manager,
             request_total_tokens=self.request_total_tokens,
             request_body_bytes=self.request_body_bytes,

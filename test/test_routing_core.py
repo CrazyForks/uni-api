@@ -456,6 +456,39 @@ def test_retry_decision_without_an_available_attempt_is_not_a_transition(
     asyncio.run(run())
 
 
+def test_upstream_runner_honors_retry_decider_and_attempt_cap(monkeypatch):
+    async def run():
+        plan = await _routing_plan_with_retry_count(monkeypatch, 10)
+        calls = []
+        decisions = []
+
+        async def execute_attempt(attempt):
+            calls.append(attempt.provider_name)
+            raise RuntimeError("retryable upstream failure")
+
+        async def retry_decider(
+            _exc,
+            status_code,
+            _error_message,
+            _attempt,
+            prepare_failure,
+        ):
+            decisions.append((status_code, prepare_failure))
+            return True
+
+        response = await UpstreamRunner(plan).run(
+            execute_attempt,
+            retry_decider=retry_decider,
+            max_attempts=3,
+        )
+
+        assert response.status_code == 500
+        assert calls == ["provider-a", "provider-b", "provider-a"]
+        assert decisions == [(500, False)] * 3
+
+    asyncio.run(run())
+
+
 def test_routing_attempt_ledger_keeps_first_and_last_sixteen(monkeypatch):
     async def run():
         attempts = [
@@ -723,5 +756,153 @@ def test_get_right_order_providers_resolves_nested_api_key_route():
         )
         assert [provider["provider"] for provider in providers] == ["sk-child"]
         assert providers[0]["base_url"] == "http://127.0.0.1:8000/v1/chat/completions"
+
+    asyncio.run(run())
+
+
+def test_alpha_search_defaults_to_all_providers_except_exact_exclusions(
+    monkeypatch,
+):
+    providers = [
+        {
+            "provider": "provider-default",
+            "base_url": "https://default.example/v1/responses",
+            "api": "key-default",
+            "model": ["gpt-5.4"],
+            "engine": "gpt",
+        },
+        {
+            "provider": "provider-compact-only",
+            "base_url": "https://compact.example/v1/responses",
+            "api": "key-compact",
+            "model": ["gpt-5.4"],
+            "engine": "codex",
+            "exclude_endpoints": ["/v1/responses/compact"],
+        },
+        {
+            "provider": "provider-alpha-top-level",
+            "base_url": "https://alpha-top.example/v1/responses",
+            "api": "key-alpha-top",
+            "model": ["gpt-5.4"],
+            "engine": "gemini",
+            "exclude_endpoints": ["v1/alpha/search/"],
+        },
+        {
+            "provider": "provider-alpha-preference",
+            "base_url": "https://alpha-pref.example/v1/responses",
+            "api": "key-alpha-pref",
+            "model": ["gpt-5.4"],
+            "preferences": {
+                "exclude_endpoints": ["/v1/alpha/search"],
+            },
+        },
+    ]
+    for provider in providers:
+        monkeypatch.setitem(
+            provider_api_circular_list,
+            provider["provider"],
+            _ProviderKeys(),
+        )
+    config = {
+        "providers": providers,
+        "api_keys": [{"api": "sk-test", "model": ["gpt-5.4"]}],
+    }
+
+    async def run():
+        alpha = await get_right_order_providers(
+            "gpt-5.4",
+            config,
+            0,
+            "fixed_priority",
+            ["sk-test"],
+            {"sk-test": ["gpt-5.4"]},
+            endpoint="/v1/alpha/search",
+        )
+        responses = await get_right_order_providers(
+            "gpt-5.4",
+            config,
+            0,
+            "fixed_priority",
+            ["sk-test"],
+            {"sk-test": ["gpt-5.4"]},
+            endpoint="/v1/responses",
+        )
+        assert [provider["provider"] for provider in alpha] == [
+            "provider-default",
+            "provider-compact-only",
+        ]
+        assert [provider["provider"] for provider in responses] == [
+            "provider-default",
+            "provider-compact-only",
+            "provider-alpha-top-level",
+            "provider-alpha-preference",
+        ]
+
+    asyncio.run(run())
+
+
+def test_routing_plan_refresh_preserves_endpoint(monkeypatch):
+    provider_name = "provider-a"
+    monkeypatch.setitem(
+        provider_api_circular_list,
+        provider_name,
+        _ProviderKeys(),
+    )
+    endpoints = []
+
+    async def resolver(
+        request_model_name,
+        config,
+        api_index,
+        scheduling_algorithm,
+        api_list,
+        models_list,
+        *,
+        endpoint=None,
+        **_kwargs,
+    ):
+        _ = config, api_index, scheduling_algorithm, api_list, models_list
+        endpoints.append(endpoint)
+        return [
+            {
+                "provider": provider_name,
+                "_model_dict_cache": {
+                    request_model_name: request_model_name,
+                },
+                "base_url": "https://provider-a.example/v1/responses",
+                "api": ["key-a"],
+                "preferences": {},
+            }
+        ]
+
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            config={
+                "api_keys": [
+                    {
+                        "api": "sk-test",
+                        "model": ["gpt-5.4"],
+                    }
+                ]
+            },
+            api_list=["sk-test"],
+            models_list={"sk-test": ["gpt-5.4"]},
+            channel_manager=None,
+        )
+    )
+
+    async def run():
+        plan = await RoutingPlan.create(
+            app,
+            "gpt-5.4",
+            0,
+            {},
+            {},
+            endpoint="/v1/alpha/search",
+            provider_resolver=resolver,
+        )
+        await plan.refresh_matching_providers()
+        assert endpoints == ["/v1/alpha/search", "/v1/alpha/search"]
+        assert plan.endpoint == "/v1/alpha/search"
 
     asyncio.run(run())

@@ -548,13 +548,20 @@ class UpstreamRunner:
         rollback_rate_limit_errors: Optional[list[str]] = None,
         allow_channel_exclusion: bool = False,
         should_cool_down=None,
+        retry_decider=None,
+        max_attempts: Optional[int] = None,
         on_retry=None,
         on_cooldown=None,
     ) -> Any:
         final_local_admission_reason: Optional[str] = None
         final_local_admission_retry_after: Optional[int] = None
         pending_retry_entry: Optional[dict[str, Any]] = None
+        attempts_started = 0
         while True:
+            if max_attempts is not None and attempts_started >= max(0, int(max_attempts)):
+                if pending_retry_entry is not None:
+                    pending_retry_entry["outcome"] = "retry_exhausted"
+                break
             if before_next_attempt is not None:
                 maybe_response = await _maybe_await(before_next_attempt())
                 if maybe_response is not None:
@@ -571,6 +578,7 @@ class UpstreamRunner:
                 break
 
             attempt_entry = self._start_routing_attempt(attempt)
+            attempts_started += 1
             self._record_retry_transition(pending_retry_entry, attempt_entry)
             pending_retry_entry = None
 
@@ -584,6 +592,7 @@ class UpstreamRunner:
                 rollback_rate_limit_errors=rollback_rate_limit_errors,
                 allow_channel_exclusion=allow_channel_exclusion,
                 should_cool_down=should_cool_down,
+                retry_decider=retry_decider,
                 on_retry=on_retry,
                 on_cooldown=on_cooldown,
             )
@@ -626,6 +635,7 @@ class UpstreamRunner:
         rollback_rate_limit_errors: Optional[list[str]] = None,
         allow_channel_exclusion: bool = False,
         should_cool_down=None,
+        retry_decider=None,
         on_retry=None,
         on_cooldown=None,
     ) -> UpstreamAttemptResult:
@@ -643,6 +653,7 @@ class UpstreamRunner:
                         exclude_error_substrings=exclude_error_substrings,
                         rollback_rate_limit_errors=rollback_rate_limit_errors,
                         should_cool_down=should_cool_down,
+                        retry_decider=retry_decider,
                         on_retry=on_retry,
                         on_cooldown=on_cooldown,
                         prepare_failure=True,
@@ -663,6 +674,7 @@ class UpstreamRunner:
                 rollback_rate_limit_errors=rollback_rate_limit_errors,
                 allow_channel_exclusion=allow_channel_exclusion,
                 should_cool_down=should_cool_down,
+                retry_decider=retry_decider,
                 on_retry=on_retry,
                 on_cooldown=on_cooldown,
                 prepare_failure=False,
@@ -679,6 +691,7 @@ class UpstreamRunner:
         rollback_rate_limit_errors: Optional[list[str]] = None,
         allow_channel_exclusion: bool = False,
         should_cool_down=None,
+        retry_decider=None,
         on_retry=None,
         on_cooldown=None,
         prepare_failure: bool,
@@ -793,6 +806,18 @@ class UpstreamRunner:
                 and not local_admission_rejection
                 and not semantic_request_failure
             )
+            if retry_decider is not None:
+                retry_decision = bool(
+                    await _maybe_await(
+                        retry_decider(
+                            exc,
+                            status_code,
+                            error_message,
+                            attempt,
+                            True,
+                        )
+                    )
+                )
             self._record_routing_failure(
                 attempt,
                 exc,
@@ -827,6 +852,18 @@ class UpstreamRunner:
                 original_model=attempt.original_model,
             )
         )
+        if retry_decider is not None:
+            retry_decision = bool(
+                await _maybe_await(
+                    retry_decider(
+                        exc,
+                        status_code,
+                        error_message,
+                        attempt,
+                        False,
+                    )
+                )
+            )
         self._record_routing_failure(
             attempt,
             exc,

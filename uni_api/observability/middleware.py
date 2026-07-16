@@ -281,7 +281,10 @@ class StatsMiddleware(BaseHTTPMiddleware):
             limited_response = await self._rate_limit_response(final_api_key, model, current_info)
             if limited_response is not None:
                 return limited_response
-        if inspection.request_type is None:
+        if (
+            inspection.request_type is None
+            and request.url.path.rstrip("/") != "/v1/alpha/search"
+        ):
             logger.error("Unknown request type for middleware inspection: %s", request.url.path)
         return inspection.moderated_content
 

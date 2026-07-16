@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Optional
-from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlsplit, urlunparse, urlunsplit
 
 
 LINGJING_UPSTREAM_OPENAPI_PREFIX = "/api/entrance/openapi"
@@ -36,6 +36,46 @@ def normalize_responses_compact_upstream_url(base_url: str, engine: str) -> str:
     if base.endswith("/compact"):
         return base
     return f"{base}/compact"
+
+
+def normalize_alpha_search_upstream_url(base_url: str) -> str:
+    """Map an OpenAI/Codex base URL to its sibling alpha/search endpoint.
+
+    The mapping is intentionally provider- and engine-neutral.  Unsupported
+    path shapes fail closed instead of guessing and accidentally producing a
+    nested ``/responses/alpha/search`` URL.
+    """
+
+    base = (base_url or "").strip()
+    if not base:
+        raise ValueError("alpha/search provider base_url is empty")
+
+    parsed = urlsplit(base)
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError("alpha/search provider base_url must be an absolute URL")
+
+    path = parsed.path.rstrip("/") or "/"
+    if path.endswith("/alpha/search"):
+        upstream_path = path
+    elif path.endswith("/responses"):
+        upstream_path = f"{path[: -len('/responses')]}/alpha/search"
+    elif path in {"/v1", "/backend-api/codex"}:
+        upstream_path = f"{path}/alpha/search"
+    else:
+        raise ValueError(
+            "alpha/search provider base_url path must end with "
+            "/responses, /v1, /backend-api/codex, or /alpha/search"
+        )
+
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            upstream_path,
+            parsed.query,
+            parsed.fragment,
+        )
+    )
 
 
 def normalize_messages_upstream_url(base_url: str) -> str:
@@ -113,4 +153,3 @@ def normalize_lingjing_draw_task_upstream_url(
             query=f"taskId={quote(str(task_id), safe='')}",
         )
     return ""
-

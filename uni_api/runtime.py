@@ -84,6 +84,10 @@ from uni_api.auth.codex_oauth import (
     split_codex_api_key,
 )
 from uni_api.api.admin import api_config_response, api_config_update_response
+from uni_api.api.alpha_search import (
+    ALPHA_SEARCH_ENDPOINT,
+    AlphaSearchRequestHandler,
+)
 from uni_api.api.chat import (
     chat_completions_response,
     messages_response,
@@ -4357,6 +4361,35 @@ def _httpx_timeout_from_policy(
         write=write_timeout,
         pool=pool_timeout,
     )
+
+
+def _resolve_alpha_search_timeout(
+    *,
+    provider_name: str,
+    original_model: str,
+    request_model: str,
+    role: str,
+    engine: str,
+) -> Optional[httpx.Timeout]:
+    timeout_value = get_preference(
+        app.state.provider_timeouts,
+        provider_name,
+        (original_model, request_model),
+        DEFAULT_TIMEOUT,
+    )
+    timeout_resolution = apply_timeout_policy(
+        base_timeout=int(timeout_value),
+        timeout_policy=getattr(app.state, "timeout_policy", {}),
+        provider_name=provider_name,
+        endpoint=ALPHA_SEARCH_ENDPOINT,
+        method="POST",
+        stream=False,
+        engine=engine,
+        original_model=original_model,
+        request_model=request_model,
+        role=role,
+    )
+    return _httpx_timeout_from_policy(timeout_resolution, stream=False)
 
 
 class DownstreamDisconnectedDuringWait(Exception):
@@ -8915,6 +8948,18 @@ class LingjingOpenapiHandler:
 
 model_handler = ModelRequestHandler()
 responses_handler = ResponsesRequestHandler()
+alpha_search_handler = AlphaSearchRequestHandler(
+    app=app,
+    get_runtime_api_list=get_runtime_api_list,
+    api_key_has_model_rules=api_key_has_model_rules,
+    resolve_codex_upstream_auth=_resolve_codex_upstream_auth,
+    resolve_timeout=_resolve_alpha_search_timeout,
+    add_trace_headers=_add_trace_headers,
+    record_plan_observability=_record_plan_observability,
+    record_retry_observability=_record_retry_observability,
+    provider_resolver=get_right_order_providers,
+    debug=lambda: is_debug,
+)
 messages_handler = MessagesPassthroughHandler()
 video_task_handler = VideoTaskHandler()
 lingjing_openapi_handler = LingjingOpenapiHandler()
@@ -8980,6 +9025,21 @@ async def responses_route(
         request=request,
         background_tasks=background_tasks,
         api_index=api_index,
+    )
+
+
+@app.post(ALPHA_SEARCH_ENDPOINT, dependencies=[Depends(rate_limit_dependency)])
+async def alpha_search_route(
+    http_request: Request,
+    background_tasks: BackgroundTasks,
+    request_body: Any = Body(...),
+    api_index: int = Depends(verify_api_key),
+):
+    return await alpha_search_handler.request_search(
+        http_request=http_request,
+        request_body=request_body,
+        api_index=api_index,
+        background_tasks=background_tasks,
     )
 
 @app.post("/v1/responses/compact", dependencies=[Depends(rate_limit_dependency)])

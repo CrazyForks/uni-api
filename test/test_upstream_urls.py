@@ -1,5 +1,8 @@
+import pytest
+
 from uni_api.upstream.urls import (
     lingjing_upstream_query,
+    normalize_alpha_search_upstream_url,
     normalize_content_generation_tasks_upstream_url,
     normalize_lingjing_draw_task_upstream_url,
     normalize_lingjing_openapi_upstream_url,
@@ -7,6 +10,46 @@ from uni_api.upstream.urls import (
     normalize_responses_compact_upstream_url,
     normalize_responses_upstream_url,
 )
+
+
+def test_alpha_search_url_normalization_uses_sibling_paths_and_preserves_query():
+    assert (
+        normalize_alpha_search_upstream_url(
+            "https://example.com/v1/responses?region=us"
+        )
+        == "https://example.com/v1/alpha/search?region=us"
+    )
+    assert (
+        normalize_alpha_search_upstream_url(
+            "https://chatgpt.com/backend-api/codex/responses"
+        )
+        == "https://chatgpt.com/backend-api/codex/alpha/search"
+    )
+    assert (
+        normalize_alpha_search_upstream_url("https://example.com/v1")
+        == "https://example.com/v1/alpha/search"
+    )
+    assert (
+        normalize_alpha_search_upstream_url(
+            "https://chatgpt.com/backend-api/codex"
+        )
+        == "https://chatgpt.com/backend-api/codex/alpha/search"
+    )
+    assert (
+        normalize_alpha_search_upstream_url(
+            "https://example.com/v1/alpha/search/"
+        )
+        == "https://example.com/v1/alpha/search"
+    )
+
+
+def test_alpha_search_url_normalization_rejects_unknown_paths():
+    with pytest.raises(ValueError, match="base_url path"):
+        normalize_alpha_search_upstream_url(
+            "https://example.com/v1/chat/completions"
+        )
+    with pytest.raises(ValueError, match="absolute URL"):
+        normalize_alpha_search_upstream_url("/v1/responses")
 
 
 def test_responses_url_normalization_preserves_gpt_and_appends_codex_endpoint():
@@ -57,4 +100,3 @@ def test_lingjing_draw_task_url_normalization():
         method="GET",
         task_id="task/id",
     ).endswith("/api/entrance/openapi/draw/task/query?taskId=task%2Fid")
-

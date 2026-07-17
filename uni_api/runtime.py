@@ -2923,6 +2923,46 @@ async def _resolve_codex_upstream_auth(
     return api_key, codex_account_id
 
 
+def _postcommit_sse_protocol_error_event() -> bytes:
+    """Return a protocol-valid, payload-redacted synthetic SSE terminal."""
+
+    return (
+        "event: error\n"
+        "data: "
+        + json.dumps(
+            {
+                "type": "error",
+                "error": {
+                    "message": "Upstream SSE protocol error",
+                    "type": "stream_error",
+                    "code": "upstream_sse_protocol_error",
+                    "status_code": 502,
+                },
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        + "\n\n"
+    ).encode("utf-8")
+
+
+def _record_postcommit_sse_protocol_error_isolation(
+    current_info: dict[str, Any],
+    exc: SSEProtocolError,
+) -> None:
+    current_info["success"] = False
+    current_info["stream_outcome"] = "upstream_stream_abort"
+    current_info["stream_error_status_code"] = 502
+    current_info["stream_error_event_type"] = "error"
+    current_info["stream_error_after_response_start"] = True
+    current_info["error_type"] = type(exc).__name__
+    current_info["postcommit_sse_protocol_error_isolated"] = True
+    image_diagnostics = current_info.get("image_stream_diagnostics")
+    if isinstance(image_diagnostics, dict):
+        image_diagnostics["synthetic_terminal"] = True
+        image_diagnostics["synthetic_terminal_type"] = "error"
+
+
 async def _track_legacy_stream_outcome(
     source: Any,
     *,
@@ -3018,6 +3058,20 @@ async def _track_legacy_stream_outcome(
                     provider_api_key=provider_api_key,
                     fallback_background_tasks=fallback_background_tasks,
                 )
+            if isinstance(exc, SSEProtocolError):
+                # This iterator is already downstream of response.start.  Letting
+                # the exception escape through BaseHTTPMiddleware can make its
+                # outer body channel reach EOF before Uvicorn sees the exception,
+                # allowing the HTTP/1.1 connection to be reused and then reset.
+                # Emit one synthetic terminal while this inner iterator still
+                # owns the stream, then finish normally so the transport remains
+                # isolated from the protocol failure.
+                _record_postcommit_sse_protocol_error_isolation(
+                    current_info,
+                    exc,
+                )
+                yield _postcommit_sse_protocol_error_event()
+                return
             if semantic_failure:
                 # Starlette's BaseHTTPMiddleware transports an inner streaming
                 # response through an in-memory ASGI channel.  Exceptions that
@@ -7716,7 +7770,15 @@ class MessagesPassthroughHandler:
         except DownstreamDisconnectedDuringWait:
             self._messages_finalize_stream_disconnect(ctx, attempt)
             return
-        except (SSEProtocolError,) + UPSTREAM_NETWORK_ERRORS as exc:
+        except SSEProtocolError as exc:
+            self._messages_finalize_stream_failure(ctx, attempt, exc)
+            _record_postcommit_sse_protocol_error_isolation(
+                ctx["current_info"],
+                exc,
+            )
+            yield _postcommit_sse_protocol_error_event()
+            return
+        except UPSTREAM_NETWORK_ERRORS as exc:
             self._messages_finalize_stream_failure(ctx, attempt, exc)
             raise
         except AdmissionRejected as exc:

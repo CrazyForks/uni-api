@@ -559,6 +559,9 @@ def build_uni_api_ember_request_telemetry(
     is_stream = _safe_bool(current_info.get("stream"))
     api_key_hash = _secret_hash(current_info.get("api_key"))
     responses_diagnostics = _responses_stream_diagnostics(current_info)
+    image_stream_diagnostics = current_info.get("image_stream_diagnostics")
+    if not isinstance(image_stream_diagnostics, dict):
+        image_stream_diagnostics = {}
     request_body_complexity_attrs = _request_body_complexity_attrs(
         current_info
     )
@@ -644,6 +647,45 @@ def build_uni_api_ember_request_telemetry(
                     ),
                     "downstream_disconnected": _bool_text(
                         _safe_bool(current_info.get("downstream_disconnected"))
+                    ),
+                    "postcommit_sse_protocol_error_isolated": _bool_text(
+                        _safe_bool(
+                            current_info.get(
+                                "postcommit_sse_protocol_error_isolated"
+                            )
+                        )
+                    ),
+                    "image_stream_contract_version": _optional_int_text(
+                        image_stream_diagnostics.get("contract_version")
+                    ),
+                    "image_stream_last_event_type": _safe_text(
+                        image_stream_diagnostics.get("last_event_type"),
+                        max_len=96,
+                    ),
+                    "image_stream_last_data_type": _safe_text(
+                        image_stream_diagnostics.get("last_data_type"),
+                        max_len=96,
+                    ),
+                    "image_stream_eof": _bool_text(
+                        _safe_bool(image_stream_diagnostics.get("eof"))
+                    ),
+                    "image_stream_terminal_seen": _bool_text(
+                        _safe_bool(
+                            image_stream_diagnostics.get("terminal_seen")
+                        )
+                    ),
+                    "image_stream_synthetic_terminal": _bool_text(
+                        _safe_bool(
+                            image_stream_diagnostics.get(
+                                "synthetic_terminal"
+                            )
+                        )
+                    ),
+                    "image_stream_synthetic_terminal_type": _safe_text(
+                        image_stream_diagnostics.get(
+                            "synthetic_terminal_type"
+                        ),
+                        max_len=96,
                     ),
                     **request_body_complexity_attrs,
                 }
@@ -816,6 +858,45 @@ def build_uni_api_ember_request_telemetry(
                     ),
                     "response_committed": _bool_text(
                         _safe_bool(current_info.get("response_committed"))
+                    ),
+                    "postcommit_sse_protocol_error_isolated": _bool_text(
+                        _safe_bool(
+                            current_info.get(
+                                "postcommit_sse_protocol_error_isolated"
+                            )
+                        )
+                    ),
+                    "image_stream_contract_version": _optional_int_text(
+                        image_stream_diagnostics.get("contract_version")
+                    ),
+                    "image_stream_last_event_type": _safe_text(
+                        image_stream_diagnostics.get("last_event_type"),
+                        max_len=96,
+                    ),
+                    "image_stream_last_data_type": _safe_text(
+                        image_stream_diagnostics.get("last_data_type"),
+                        max_len=96,
+                    ),
+                    "image_stream_eof": _bool_text(
+                        _safe_bool(image_stream_diagnostics.get("eof"))
+                    ),
+                    "image_stream_terminal_seen": _bool_text(
+                        _safe_bool(
+                            image_stream_diagnostics.get("terminal_seen")
+                        )
+                    ),
+                    "image_stream_synthetic_terminal": _bool_text(
+                        _safe_bool(
+                            image_stream_diagnostics.get(
+                                "synthetic_terminal"
+                            )
+                        )
+                    ),
+                    "image_stream_synthetic_terminal_type": _safe_text(
+                        image_stream_diagnostics.get(
+                            "synthetic_terminal_type"
+                        ),
+                        max_len=96,
                     ),
                     "prompt_tokens": _responses_token_text(
                         current_info,

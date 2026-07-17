@@ -826,6 +826,51 @@ def test_legacy_stream_channel_result_is_finalized_only_at_terminal_outcome(
         assert failed_info["routing_attempts"][0]["outcome"] == "stream_failed"
         assert failed_info["routing_attempts"][0]["semantic_status_code"] == 502
 
+        async def protocol_failed_source():
+            yield b"event: image_edit.partial_image\ndata: {}\n\n"
+            raise SSEProtocolError("upstream ended before image terminal")
+
+        protocol_info = {
+            "request_id": "protocol-failed",
+            "api_key": "key",
+            "routing_attempts": [{"index": 1, "outcome": "stream_pending"}],
+            "image_stream_diagnostics": {
+                "contract_version": 1,
+                "last_event_type": "image_edit.partial_image",
+                "eof": True,
+                "terminal_seen": False,
+                "synthetic_terminal": False,
+            },
+        }
+        protocol_failed = runtime._track_legacy_stream_outcome(
+            protocol_failed_source(),
+            current_info=protocol_info,
+            channel_id="provider",
+            model="model",
+            provider_api_key="provider-key",
+            fallback_background_tasks=None,
+        )
+        assert b"image_edit.partial_image" in await anext(protocol_failed)
+        protocol_terminal = await anext(protocol_failed)
+        assert protocol_terminal.startswith(b"event: error\n")
+        assert b'"type":"error"' in protocol_terminal
+        assert b'"code":"upstream_sse_protocol_error"' in protocol_terminal
+        with pytest.raises(StopAsyncIteration):
+            await anext(protocol_failed)
+        assert recorded == [True, False, False]
+        assert protocol_info["postcommit_sse_protocol_error_isolated"] is True
+        assert protocol_info["stream_error_after_response_start"] is True
+        assert protocol_info["stream_error_event_type"] == "error"
+        assert protocol_info["image_stream_diagnostics"][
+            "synthetic_terminal"
+        ] is True
+        assert protocol_info["image_stream_diagnostics"][
+            "synthetic_terminal_type"
+        ] == "error"
+        assert protocol_info["routing_attempts"][0]["outcome"] == (
+            "stream_failed"
+        )
+
         semantic_error = responses_failure_error(
             {
                 "type": "error",
@@ -875,7 +920,7 @@ def test_legacy_stream_channel_result_is_finalized_only_at_terminal_outcome(
         assert semantic_attempt["terminal_event_type"] == "error"
         assert semantic_attempt["error_code"] == "context_length_exceeded"
         assert semantic_attempt["outcome"] == "semantic_failure_terminal"
-        assert recorded == [True, False]
+        assert recorded == [True, False, False]
 
         async def abandoned_source():
             yield b"first"
@@ -896,7 +941,7 @@ def test_legacy_stream_channel_result_is_finalized_only_at_terminal_outcome(
         )
         assert await anext(abandoned) == b"first"
         await abandoned.aclose()
-        assert recorded == [True, False]
+        assert recorded == [True, False, False]
         assert abandoned_info["routing_attempts"][0]["outcome"] == (
             "cancelled_or_consumer_closed"
         )

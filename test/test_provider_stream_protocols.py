@@ -6,7 +6,9 @@ import pytest
 
 import uni_api.providers.responses as responses_module
 from uni_api.admission.json_parsing import parse_owned_json_value
+from uni_api.observability.request_context import request_info
 from uni_api.providers.responses import (
+    IMAGE_STREAM_TERMINAL_CONTRACT_VERSION,
     fetch_aws_response_stream,
     fetch_claude_response_stream,
     fetch_cloudflare_response_stream,
@@ -139,6 +141,64 @@ def test_dalle_sse_accepts_only_a_full_image_terminal():
     body = asyncio.run(run())
     assert "image_generation.partial_image" in body
     assert "image_generation.completed" in body
+
+
+@pytest.mark.parametrize(
+    ("event_name", "payload_type", "expected_last_event"),
+    [
+        (
+            "image_edit.completed",
+            "image_edit.result",
+            "image_edit.completed",
+        ),
+        ("message", "image_edit.completed", "message"),
+    ],
+)
+def test_dalle_sse_accepts_image_edit_terminal_from_event_or_data_type(
+    event_name,
+    payload_type,
+    expected_last_event,
+):
+    response = _TerminalTrapResponse(
+        [
+            (
+                f"event: {event_name}\n"
+                f'data: {{"type":"{payload_type}"}}\n\n'
+            ).encode("utf-8")
+        ],
+        content_type="text/event-stream",
+    )
+    current_info = {"request_id": "image-edit-contract"}
+    token = request_info.set(current_info)
+
+    async def run():
+        return b"".join(
+            [
+                chunk.encode("utf-8") if isinstance(chunk, str) else chunk
+                async for chunk in fetch_dalle_response_stream(
+                    _Client(response),
+                    "https://example.test/v1/images/edits",
+                    {},
+                    {"prompt": "test"},
+                )
+            ]
+        )
+
+    try:
+        body = asyncio.run(run())
+    finally:
+        request_info.reset(token)
+
+    assert f"event: {event_name}".encode("utf-8") in body
+    diagnostics = current_info["image_stream_diagnostics"]
+    assert diagnostics == {
+        "contract_version": IMAGE_STREAM_TERMINAL_CONTRACT_VERSION,
+        "last_event_type": expected_last_event,
+        "last_data_type": payload_type,
+        "eof": False,
+        "terminal_seen": True,
+        "synthetic_terminal": False,
+    }
 
 
 def test_doubao_translation_rejects_eof_without_protocol_terminal():

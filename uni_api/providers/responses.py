@@ -20,6 +20,7 @@ from uni_api.admission.json_parsing import (
     run_json_cpu,
 )
 from uni_api.http_content import is_json_media_type
+from uni_api.observability.request_context import get_request_info
 from uni_api.serialization import json
 
 from core.utils import (
@@ -74,6 +75,48 @@ from uni_api.upstream.response_limits import (
 
 ResponseHeadersSink = Callable[[Any], None]
 _MAX_TOKEN_COUNT = (1 << 63) - 1
+
+# OAIX and Ember image SSE contract. The compatibility entries remain accepted
+# for upstreams that still expose Responses-native or generic terminal names.
+IMAGE_STREAM_TERMINAL_CONTRACT_VERSION = 1
+IMAGE_STREAM_CONTRACT_SUCCESS_TERMINALS = frozenset(
+    {
+        "image_generation.completed",
+        "image_edit.completed",
+    }
+)
+IMAGE_STREAM_COMPAT_SUCCESS_TERMINALS = frozenset(
+    {
+        "done",
+        "completed",
+        "response.completed",
+        *IMAGE_STREAM_CONTRACT_SUCCESS_TERMINALS,
+    }
+)
+IMAGE_STREAM_FAILURE_TERMINALS = frozenset(
+    {
+        "error",
+        "response.failed",
+        "response.incomplete",
+        "image_generation.failed",
+        "image_edit.failed",
+    }
+)
+
+
+def _redacted_image_stream_event_type(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized == "[done]":
+        return "[DONE]"
+    if not normalized or len(normalized) > 96:
+        return "redacted"
+    if all(
+        character.isascii()
+        and (character.isalnum() or character in "._-")
+        for character in normalized
+    ):
+        return normalized
+    return "redacted"
 
 
 def _coerce_token_count(value: Any) -> int:
@@ -2728,6 +2771,17 @@ async def fetch_dalle_response_stream(client, url, headers, payload, timeout=200
             return
 
         terminal_seen = False
+        image_stream_diagnostics = {
+            "contract_version": IMAGE_STREAM_TERMINAL_CONTRACT_VERSION,
+            "last_event_type": None,
+            "last_data_type": None,
+            "eof": False,
+            "terminal_seen": False,
+            "synthetic_terminal": False,
+        }
+        current_info = get_request_info()
+        if current_info:
+            current_info["image_stream_diagnostics"] = image_stream_diagnostics
         events = _iter_owned_sse_events(response.aiter_bytes())
         async with aclosing(events):
             async for event_owner in events:
@@ -2747,34 +2801,34 @@ async def fetch_dalle_response_stream(client, url, headers, payload, timeout=200
                         else ""
                     )
                     normalized_event = event_owner.event_name.strip().lower()
+                    image_stream_diagnostics["last_event_type"] = (
+                        _redacted_image_stream_event_type(normalized_event)
+                    )
+                    image_stream_diagnostics["last_data_type"] = (
+                        _redacted_image_stream_event_type(payload_type)
+                        if payload_type
+                        else None
+                    )
                     if event_payload == "[DONE]":
                         terminal_seen = True
-                    elif normalized_event in {
-                        "done",
-                        "completed",
-                        "response.completed",
-                        "image_generation.completed",
-                    } or payload_type in {
-                        "done",
-                        "completed",
-                        "response.completed",
-                        "image_generation.completed",
-                    }:
+                        image_stream_diagnostics["last_event_type"] = "[DONE]"
+                    elif (
+                        normalized_event
+                        in IMAGE_STREAM_COMPAT_SUCCESS_TERMINALS
+                        or payload_type
+                        in IMAGE_STREAM_COMPAT_SUCCESS_TERMINALS
+                    ):
                         terminal_seen = True
-                    elif normalized_event in {
-                        "error",
-                        "response.failed",
-                        "response.incomplete",
-                        "image_generation.failed",
-                    } or payload_type in {
-                        "error",
-                        "response.failed",
-                        "response.incomplete",
-                        "image_generation.failed",
-                    }:
+                    elif (
+                        normalized_event in IMAGE_STREAM_FAILURE_TERMINALS
+                        or payload_type in IMAGE_STREAM_FAILURE_TERMINALS
+                    ):
+                        terminal_seen = True
+                        image_stream_diagnostics["terminal_seen"] = True
                         raise SSEProtocolError(
                             "DALL-E SSE upstream emitted failure terminal"
                         )
+                    image_stream_diagnostics["terminal_seen"] = terminal_seen
                     yield raw_event + end_of_line
                     if terminal_seen:
                         return
@@ -2784,6 +2838,7 @@ async def fetch_dalle_response_stream(client, url, headers, payload, timeout=200
                     payload_type = None
                     normalized_event = None
                     await event_owner.aclose()
+        image_stream_diagnostics["eof"] = True
         if not terminal_seen:
             raise SSEProtocolError(
                 "DALL-E SSE upstream ended without a terminal event"

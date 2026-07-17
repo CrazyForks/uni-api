@@ -999,6 +999,51 @@ def test_responses_request_summary_is_never_sampled_away():
     assert client._queue.qsize() == 0
 
 
+def test_image_stream_terminal_contract_is_exported_without_payload_data():
+    telemetry = build_uni_api_ember_request_telemetry(
+        service_name="uni-api-ember",
+        service_version="test",
+        identity_attrs={"app_id": "app_123"},
+        current_info={
+            "request_id": "image-edit-observability",
+            "endpoint": "POST /v1/images/edits",
+            "status_code": 200,
+            "wire_status_code": 200,
+            "stream": True,
+            "stream_outcome": "upstream_stream_abort",
+            "postcommit_sse_protocol_error_isolated": True,
+            "image_stream_diagnostics": {
+                "contract_version": 1,
+                "last_event_type": "image_edit.partial_image",
+                "last_data_type": "image_edit.partial_image",
+                "eof": True,
+                "terminal_seen": False,
+                "synthetic_terminal": True,
+                "synthetic_terminal_type": "error",
+                "payload": "must-not-be-exported",
+            },
+        },
+    )
+
+    request_log = telemetry["logs"][0]
+    attributes = request_log["attributes"]
+    summary = request_log["summary"]
+    for values in (attributes, summary):
+        assert values["postcommit_sse_protocol_error_isolated"] == "true"
+        assert values["image_stream_contract_version"] == "1"
+        assert values["image_stream_last_event_type"] == (
+            "image_edit.partial_image"
+        )
+        assert values["image_stream_last_data_type"] == (
+            "image_edit.partial_image"
+        )
+        assert values["image_stream_eof"] == "true"
+        assert values["image_stream_terminal_seen"] == "false"
+        assert values["image_stream_synthetic_terminal"] == "true"
+        assert values["image_stream_synthetic_terminal_type"] == "error"
+    assert "must-not-be-exported" not in json.dumps(telemetry)
+
+
 def test_traceparent_is_inherited_and_forwarded():
     incoming = main._incoming_trace_context(
         {

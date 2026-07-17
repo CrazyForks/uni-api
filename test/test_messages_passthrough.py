@@ -491,9 +491,19 @@ def test_messages_stream_truncation_records_failure_without_false_success(
             probe,
         )
         assert b"content_block_delta" in await anext(stream)
-        expected = httpx.ReadError if network_abort else main.SSEProtocolError
-        with pytest.raises(expected):
-            await anext(stream)
+        if network_abort:
+            with pytest.raises(httpx.ReadError):
+                await anext(stream)
+        else:
+            terminal = await anext(stream)
+            assert terminal.startswith(b"event: error\n")
+            assert b'"type":"error"' in terminal
+            assert b'"code":"upstream_sse_protocol_error"' in terminal
+            with pytest.raises(StopAsyncIteration):
+                await anext(stream)
+            assert ctx["current_info"][
+                "postcommit_sse_protocol_error_isolated"
+            ] is True
 
         assert results == [False]
         assert ctx["current_info"]["success"] is False
@@ -635,10 +645,16 @@ def test_messages_malformed_terminal_data_is_protocol_failure(monkeypatch):
             probe,
             probe,
         )
-        with pytest.raises(main.SSEProtocolError, match="JSON object"):
+        terminal = await anext(stream)
+        assert terminal.startswith(b"event: error\n")
+        assert b'"code":"upstream_sse_protocol_error"' in terminal
+        with pytest.raises(StopAsyncIteration):
             await anext(stream)
 
         assert results == [False]
         assert ctx["current_info"]["success"] is False
+        assert ctx["current_info"][
+            "postcommit_sse_protocol_error_isolated"
+        ] is True
 
     asyncio.run(scenario())

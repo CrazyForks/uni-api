@@ -24,14 +24,6 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 from core.models import RequestModel, Message
 from core.utils import (
-    c3s,
-    c3o,
-    c3h,
-    c35s,
-    c4,
-    gemini1,
-    gemini_preview,
-    gemini2_5_pro_exp,
     BaseAPI,
     safe_get,
     get_engine,
@@ -851,6 +843,22 @@ async def get_access_token(client_email, private_key):
                 if persistent_reservation is not None:
                     await persistent_reservation.release()
 
+
+def _get_vertex_region(provider):
+    return str(provider.get("region") or "global").strip() or "global"
+
+
+def _get_vertex_model_url(provider, project_id, publisher, model, stream):
+    region = _get_vertex_region(provider)
+    base_url = (provider.get("base_url") or "https://aiplatform.googleapis.com").rstrip("/")
+    if "google-vertex-ai" not in base_url:
+        base_url = (
+            "https://aiplatform.googleapis.com"
+            if region == "global"
+            else f"https://{region}-aiplatform.googleapis.com"
+        )
+    return f"{base_url}/v1/projects/{project_id}/locations/{region}/publishers/{publisher}/models/{model}:{stream}"
+
 async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
     headers = {
         'Content-Type': 'application/json'
@@ -869,33 +877,17 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
     original_model = model_dict[request.model]
     # search_tool = None
 
-    # https://cloud.google.com/vertex-ai/generative-ai/docs/models/gemini/2-0-flash?hl=zh-cn
-    pro_models = ["gemini-2.5"]
-    global_models = ["gemini-2.5-flash-image-preview", "gemini-3-pro", "gemini-3-flash", "gemini-3.1-pro"]
-    if any(global_model in original_model for global_model in global_models):
-        location = gemini_preview
-    elif any(pro_model in original_model for pro_model in pro_models):
-        location = gemini2_5_pro_exp
-    else:
-        location = gemini1
-
     if api_key is not None and len(api_key) > 2 and api_key[2] == ".":
         base = (provider.get("base_url") or "https://aiplatform.googleapis.com").rstrip("/")
         url = f"{base}/v1/publishers/google/models/{original_model}:{gemini_stream}?key={api_key}"
         headers.pop("Authorization", None)
-    elif "google-vertex-ai" in provider.get("base_url", "") or any(global_model in original_model for global_model in global_models):
-        url = provider.get("base_url").rstrip('/') + "/v1/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL_ID}:{stream}".format(
-            LOCATION=await location.next(),
-            PROJECT_ID=project_id,
-            MODEL_ID=original_model,
-            stream=gemini_stream
-        )
     else:
-        url = "https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL_ID}:{stream}".format(
-            LOCATION=await location.next(),
-            PROJECT_ID=project_id,
-            MODEL_ID=original_model,
-            stream=gemini_stream
+        url = _get_vertex_model_url(
+            provider,
+            project_id,
+            "google",
+            original_model,
+            gemini_stream,
         )
 
     request_messages = copy.deepcopy(request.messages)
@@ -1051,23 +1043,14 @@ async def get_vertex_claude_payload(request, engine, provider, api_key=None):
 
     model_dict = get_model_dict(provider)
     original_model = model_dict[request.model]
-    if "claude-3-5-sonnet" in original_model or "claude-3-7-sonnet" in original_model or "4-5@" in original_model:
-        location = c35s
-    elif "claude-3-opus" in original_model:
-        location = c3o
-    elif "claude-sonnet-4" in original_model or "claude-opus-4" in original_model:
-        location = c4
-    elif "claude-3-sonnet" in original_model:
-        location = c3s
-    elif "claude-3-haiku" in original_model:
-        location = c3h
 
     claude_stream = "streamRawPredict"
-    url = "https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/anthropic/models/{MODEL}:{stream}".format(
-        LOCATION=await location.next(),
-        PROJECT_ID=project_id,
-        MODEL=original_model,
-        stream=claude_stream
+    url = _get_vertex_model_url(
+        provider,
+        project_id,
+        "anthropic",
+        original_model,
+        claude_stream,
     )
 
     messages = []

@@ -599,7 +599,8 @@ async def test_provider_adapter_request_golden_matrix():
             },
             "upstream-key",
             lambda request: (
-                "/projects/project-a/locations/us-east5/" in request.url
+                request.url.startswith("https://aiplatform.googleapis.com/")
+                and "/projects/project-a/locations/global/" in request.url
                 and "/publishers/anthropic/models/claude-3-haiku:streamRawPredict" in request.url
                 and request.payload["messages"][0]["content"] == "hello"
             ),

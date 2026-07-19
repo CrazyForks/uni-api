@@ -2,6 +2,10 @@ import asyncio
 
 import httpx
 
+from uni_api.idempotency import (
+    OAIX_ROUTING_ATTEMPT_HEADER,
+    apply_oaix_routing_attempt_id,
+)
 from uni_api.providers.responses import fetch_response, fetch_response_stream
 
 
@@ -109,3 +113,42 @@ async def _fetch_response_stream_captures_oaix_headers():
 
 def test_fetch_response_stream_captures_oaix_headers():
     asyncio.run(_fetch_response_stream_captures_oaix_headers())
+
+
+def test_oaix_routing_attempt_header_requires_explicit_provider_capability(
+    monkeypatch,
+):
+    monkeypatch.delenv("OAIX_ROUTING_ATTEMPT_PROVIDERS", raising=False)
+    attempt_id = "attempt-123"
+    disabled_headers = {}
+    enabled_headers = {}
+
+    assert apply_oaix_routing_attempt_id(
+        disabled_headers,
+        provider={
+            "provider": "fugue-codex",
+            "base_url": "https://oaix.fugue.pro/v1/responses",
+            "preferences": {},
+        },
+        routing_attempt_id=attempt_id,
+    ) is False
+    assert disabled_headers == {}
+
+    assert apply_oaix_routing_attempt_id(
+        enabled_headers,
+        provider={
+            "provider": "fugue-codex",
+            "preferences": {"oaix_routing_attempt_id": True},
+        },
+        routing_attempt_id=attempt_id,
+    ) is True
+    assert enabled_headers == {OAIX_ROUTING_ATTEMPT_HEADER: attempt_id}
+
+    env_headers = {}
+    monkeypatch.setenv("OAIX_ROUTING_ATTEMPT_PROVIDERS", "fugue-codex")
+    assert apply_oaix_routing_attempt_id(
+        env_headers,
+        provider={"provider": "fugue-codex", "preferences": {}},
+        routing_attempt_id=attempt_id,
+    ) is True
+    assert env_headers == {OAIX_ROUTING_ATTEMPT_HEADER: attempt_id}

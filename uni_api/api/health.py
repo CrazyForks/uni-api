@@ -13,6 +13,7 @@ async def observability_runtime_response(
     *,
     stream_cleanup_snapshot: Callable[[], dict[str, Any]] | None = None,
     provider_key_pools_snapshot: Callable[[], dict[str, Any]] | None = None,
+    idempotency_snapshot: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     await runtime_gauges.record_event_loop_lag()
     snapshot = runtime_gauges.snapshot()
@@ -22,4 +23,6 @@ async def observability_runtime_response(
         snapshot["stream_cleanup_tasks"] = stream_cleanup_snapshot()
     if provider_key_pools_snapshot is not None:
         snapshot["provider_key_pools"] = provider_key_pools_snapshot()
+    if idempotency_snapshot is not None:
+        snapshot["idempotency"] = idempotency_snapshot()
     return snapshot

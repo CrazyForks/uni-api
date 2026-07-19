@@ -132,6 +132,7 @@ import uni_api.config.legacy_loader as legacy_config_loader
 from uni_api.config.compiler import compile_runtime_config
 from uni_api.config.timeout_policy import apply_timeout_policy, init_timeout_policy
 from uni_api.http_content import is_json_media_type
+from uni_api.idempotency import apply_oaix_routing_attempt_id
 from uni_api.observability.paid_keys import compute_paid_api_key_state
 from uni_api.observability.request_context import (
     get_request_info,
@@ -172,6 +173,10 @@ from uni_api.middleware.admission import (
     ADMISSION_REQUEST_ID_STATE_KEY,
     ADMISSION_TRACE_ID_STATE_KEY,
     RequestAdmissionMiddleware,
+)
+from uni_api.middleware.idempotency import (
+    IdempotencyMiddleware,
+    build_default_idempotency_coordinator,
 )
 from uni_api.middleware.request_decompression import (
     REQUEST_BODY_CPU_WORKERS,
@@ -1308,6 +1313,7 @@ request_admission_controller = RequestAdmissionController(
     memory_governor=process_memory_governor,
     decision_observer=emit_large_body_admission_decision,
 )
+idempotency_coordinator = build_default_idempotency_coordinator()
 runtime_gauges.attach_request_admission(request_admission_controller.snapshot)
 runtime_gauges.attach_stream_parser_budget(stream_parser_retained_budget_snapshot)
 
@@ -2124,6 +2130,14 @@ async def update_paid_api_keys_states(app, paid_key):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 启动时的代码
+    logger.info(
+        "Logical idempotency coordinator: %s",
+        json.dumps(
+            idempotency_coordinator.snapshot(),
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+    )
     if not DISABLE_DATABASE:
         await create_tables()
 
@@ -2572,6 +2586,45 @@ async def ensure_config(request: Request, call_next):
     return await call_next(request)
 
 
+def _observe_idempotency_claim(
+    event: str,
+    fields: dict[str, Any],
+) -> None:
+    if event not in {"wait", "replay", "conflict", "unavailable"}:
+        return
+    trace_logger.info(
+        "idempotency event=%s key_fingerprint=%s method=%s path=%s",
+        event,
+        fields.get("key_fingerprint"),
+        fields.get("method"),
+        fields.get("path"),
+    )
+
+
+app.add_middleware(
+    IdempotencyMiddleware,
+    coordinator=idempotency_coordinator,
+    enabled=_env_bool("IDEMPOTENCY_ENABLED", True),
+    max_request_body_bytes=max(
+        REQUEST_WIRE_BODY_MAX_BYTES,
+        ZSTD_REQUEST_COMPRESSED_MAX_BYTES,
+    ),
+    request_body_idle_timeout_seconds=max(
+        0.001,
+        _env_float("REQUEST_BODY_IDLE_TIMEOUT_SECONDS", 15.0),
+    ),
+    request_body_total_timeout_seconds=max(
+        0.001,
+        _env_float("REQUEST_BODY_TOTAL_TIMEOUT_SECONDS", 120.0),
+    ),
+    wait_timeout_seconds=max(
+        0.001,
+        _env_float("IDEMPOTENCY_WAIT_TIMEOUT_SECONDS", 30 * 60),
+    ),
+    observer=_observe_idempotency_claim,
+)
+
+
 def _bypass_request_admission(scope: dict[str, Any]) -> bool:
     return (
         str(scope.get("method") or "").upper() in {"GET", "HEAD"}
@@ -2784,6 +2837,7 @@ async def observability_runtime():
         getattr(app.state, "client_manager", None),
         stream_cleanup_snapshot=background_stream_cleanup_snapshot,
         provider_key_pools_snapshot=lambda: provider_key_pools_snapshot(app),
+        idempotency_snapshot=idempotency_coordinator.snapshot,
     )
 
 
@@ -3164,6 +3218,11 @@ async def process_request(
     provider_api_key_raw = prepared.provider_api_key_raw
     url = prepared.url
     headers = prepared.headers
+    apply_oaix_routing_attempt_id(
+        headers,
+        provider=provider,
+        routing_attempt_id=provider.get("_routing_attempt_id"),
+    )
     payload = prepared.payload
     last_message_role = prepared.last_message_role
 
@@ -3521,10 +3580,14 @@ class ModelRequestHandler:
                 keepalive_interval = None
 
             attempt.provider_api_key_raw = await runner.select_provider_api_key(attempt)
+            attempt_provider = dict(provider)
+            attempt_provider["_routing_attempt_id"] = (
+                attempt.routing_attempt_id
+            )
             process_task = asyncio.create_task(
                 process_request(
                     request_data,
-                    provider,
+                    attempt_provider,
                     background_tasks,
                     endpoint,
                     plan.role,
@@ -6203,6 +6266,11 @@ class ResponsesRequestExecution:
         if engine == "codex":
             force_codex_client_headers(headers)
         _add_trace_headers(headers, self.current_info)
+        apply_oaix_routing_attempt_id(
+            headers,
+            provider=attempt.provider,
+            routing_attempt_id=attempt.routing_attempt_id,
+        )
         return headers
 
     def _build_payload(self, attempt: Any) -> dict[str, Any]:
@@ -6248,6 +6316,7 @@ class ResponsesRequestExecution:
         upstream_host = urlparse(str(attempt.state.get("upstream_url") or "")).netloc
         entry = {
             "index": len(attempts) + 1,
+            "routing_attempt_id": attempt.routing_attempt_id,
             "endpoint": self.endpoint,
             "provider": attempt.state.get("channel_id", attempt.provider_name),
             "model": self.request_model_name,
@@ -7537,6 +7606,11 @@ class MessagesPassthroughHandler:
         apply_post_body_parameter_overrides(payload, provider, request_model_name)
 
         headers = self._messages_headers(ctx["http_request"], provider, attempt.state["api_key"])
+        apply_oaix_routing_attempt_id(
+            headers,
+            provider=attempt.provider,
+            routing_attempt_id=attempt.routing_attempt_id,
+        )
         self._messages_log_attempt(ctx, attempt, payload, headers)
         json_payload = await run_json_cpu(json.dumps, payload)
 

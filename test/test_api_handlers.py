@@ -29,10 +29,15 @@ class _ClientManager:
 async def test_health_and_observability_handlers_are_pure_api_boundaries():
     assert await healthz_response("1.2.3") == {"status": "ok", "version": "1.2.3"}
 
-    runtime = await observability_runtime_response(_RuntimeGauges(), _ClientManager())
+    runtime = await observability_runtime_response(
+        _RuntimeGauges(),
+        _ClientManager(),
+        idempotency_snapshot=lambda: {"mode": "memory-single-process"},
+    )
 
     assert runtime["inflight_requests"] == 0
     assert runtime["upstream_http_clients"] == {"client_count": 1}
+    assert runtime["idempotency"] == {"mode": "memory-single-process"}
 
 
 def test_list_models_payload_uses_cache_before_fallback():

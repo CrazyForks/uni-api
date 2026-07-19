@@ -15,6 +15,7 @@ from starlette.responses import Response
 
 from core.utils import get_engine, provider_api_circular_list, safe_get
 from uni_api.admission.json_parsing import run_json_cpu
+from uni_api.idempotency import apply_oaix_routing_attempt_id
 from uni_api.providers.header_passthrough import apply_provider_preference_headers
 from uni_api.providers.payloads import force_codex_client_headers
 from uni_api.routing.planner import (
@@ -705,6 +706,11 @@ class _AlphaSearchExecution:
             force_codex_client_headers(headers)
         _set_header(headers, "Content-Type", "application/json")
         _set_header(headers, "Accept", "application/json")
+        apply_oaix_routing_attempt_id(
+            headers,
+            provider=attempt.provider,
+            routing_attempt_id=attempt.routing_attempt_id,
+        )
         return headers
 
     async def _retry_decider(

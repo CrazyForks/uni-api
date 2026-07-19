@@ -393,10 +393,12 @@ def test_upstream_runner_stops_after_success_at_exact_attempt_boundary(
     async def run():
         plan = await _routing_plan_with_retry_count(monkeypatch, 1)
         calls = []
+        routing_attempt_ids = []
         current_info = {}
 
         async def execute_attempt(attempt):
             calls.append(attempt.provider_name)
+            routing_attempt_ids.append(attempt.routing_attempt_id)
             if len(calls) < 3:
                 raise RuntimeError("retryable upstream failure")
             return SimpleNamespace(status_code=200)
@@ -412,6 +414,11 @@ def test_upstream_runner_stops_after_success_at_exact_attempt_boundary(
 
         assert response.status_code == 200
         assert calls == ["provider-a", "provider-b", "provider-a"]
+        assert len(set(routing_attempt_ids)) == 3
+        assert [
+            item["routing_attempt_id"]
+            for item in current_info["routing_attempts"]
+        ] == routing_attempt_ids
         assert current_info["attempt_count"] == 3
         assert current_info["retry_decision_count"] == 2
         assert current_info["retry_transition_count"] == 2

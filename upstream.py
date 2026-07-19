@@ -6,6 +6,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
+from uuid import uuid4
 
 import httpx
 from fastapi import HTTPException
@@ -263,6 +264,7 @@ class UpstreamAttemptContext:
     provider: dict
     provider_name: str
     original_model: str
+    routing_attempt_id: str = field(default_factory=lambda: uuid4().hex)
     provider_api_key_raw: Optional[str] = None
     state: dict[str, Any] = field(default_factory=dict)
 
@@ -381,6 +383,7 @@ class UpstreamRunner:
                 getattr(self.plan, "request_model_name", "") or ""
             )[:256],
             "actual_model": str(attempt.original_model or "")[:256],
+            "routing_attempt_id": attempt.routing_attempt_id,
             "outcome": "started",
             "_started_monotonic": time.monotonic(),
         }

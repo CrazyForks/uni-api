@@ -24,6 +24,10 @@ from uni_api.middleware.admission import (
     ADMISSION_REQUEST_ID_STATE_KEY,
     ADMISSION_TRACE_ID_STATE_KEY,
 )
+from uni_api.middleware.idempotency import (
+    IDEMPOTENCY_KEY_FINGERPRINT_STATE_KEY,
+    IDEMPOTENCY_ROLE_STATE_KEY,
+)
 from uni_api.middleware.request_decompression import (
     REQUEST_BODY_COMPLEXITY_INFO_KEY,
     RequestBodyTooComplex,
@@ -134,6 +138,23 @@ class StatsMiddleware(BaseHTTPMiddleware):
         request_id = str(
             getattr(request.state, ADMISSION_REQUEST_ID_STATE_KEY, "") or ""
         ).strip() or str(uuid.uuid4())
+        extras: dict[str, Any] = {"trace": trace}
+        idempotency_key_fingerprint = getattr(
+            request.state,
+            IDEMPOTENCY_KEY_FINGERPRINT_STATE_KEY,
+            None,
+        )
+        if idempotency_key_fingerprint:
+            extras["idempotency_key_fingerprint"] = str(
+                idempotency_key_fingerprint
+            )
+            extras["idempotency_role"] = str(
+                getattr(
+                    request.state,
+                    IDEMPOTENCY_ROLE_STATE_KEY,
+                    "owner",
+                )
+            )
         return RequestContext(
             request_id=request_id,
             trace_id=trace.trace_id,
@@ -147,7 +168,7 @@ class StatsMiddleware(BaseHTTPMiddleware):
             client_ip=self.dependencies.get_client_ip(request),
             api_key=token,
             timing_spans=trace.snapshot(),
-            extras={"trace": trace},
+            extras=extras,
         ).to_dict()
 
     def _paid_key_enabled_response(self, token: str, api_index: int, request: Request, trace) -> JSONResponse | None:

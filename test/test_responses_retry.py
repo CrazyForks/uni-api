@@ -18,7 +18,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import main
 import uni_api.runtime as runtime
 from core.models import ResponsesRequest
-from upstream import should_retry_provider
+from upstream import normalize_provider_exception, should_retry_provider
 
 
 def test_oaix_keepalive_classifier_rejects_large_frames_before_sync_parse(monkeypatch):
@@ -31,6 +31,26 @@ def test_oaix_keepalive_classifier_rejects_large_frames_before_sync_parse(monkey
     )
 
     assert not runtime._is_oaix_precommit_keepalive(b"x" * 1025)
+
+
+def test_first_byte_deadline_timeout_reports_configured_seconds():
+    async def trigger_timeout():
+        loop = asyncio.get_running_loop()
+        with pytest.raises(httpx.ReadTimeout) as captured:
+            await runtime._await_first_byte_deadline(
+                asyncio.sleep(60),
+                timeout_seconds=20,
+                deadline=loop.time(),
+            )
+        return captured.value
+
+    error = asyncio.run(trigger_timeout())
+
+    assert error.request.extensions["timeout"]["read"] == 20
+    assert normalize_provider_exception(error) == (
+        504,
+        "Request timed out after 20 seconds",
+    )
 
 
 class DummyCircularList:

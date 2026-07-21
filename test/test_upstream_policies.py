@@ -29,6 +29,52 @@ def test_provider_error_classifier_normalizes_http_and_network_errors():
     assert classifier.remap_status_code(500, "string_above_max_length") == 413
 
 
+@pytest.mark.parametrize(
+    ("read_timeout", "expected"),
+    [
+        (20, "Request timed out after 20 seconds"),
+        (20.5, "Request timed out after 20.5 seconds"),
+        ("30", "Request timed out after 30 seconds"),
+    ],
+)
+def test_provider_error_classifier_reports_configured_read_timeout(read_timeout, expected):
+    classifier = ProviderErrorClassifier(_safe_get)
+    request = httpx.Request(
+        "POST",
+        "https://provider.example/v1/responses",
+        extensions={"timeout": {"read": read_timeout}},
+    )
+
+    assert classifier.normalize_exception(httpx.ReadTimeout("timed out", request=request)) == (
+        504,
+        expected,
+    )
+
+
+@pytest.mark.parametrize(
+    "extensions",
+    [
+        {},
+        {"timeout": {"read": None}},
+        {"timeout": {"read": -1}},
+        {"timeout": {"read": float("inf")}},
+        {"timeout": {"read": "invalid"}},
+    ],
+)
+def test_provider_error_classifier_never_reports_unknown_or_invalid_timeout(extensions):
+    classifier = ProviderErrorClassifier(_safe_get)
+    request = httpx.Request(
+        "POST",
+        "https://provider.example/v1/responses",
+        extensions=extensions,
+    )
+
+    assert classifier.normalize_exception(httpx.ReadTimeout("timed out", request=request)) == (
+        504,
+        "Request timed out",
+    )
+
+
 def test_provider_error_classifier_preserves_local_upstream_admission_503():
     classifier = ProviderErrorClassifier(_safe_get)
 

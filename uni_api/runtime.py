@@ -4513,6 +4513,16 @@ class DownstreamDisconnectedDuringWait(Exception):
     """The downstream peer left while an upstream operation was pending."""
 
 
+def _upstream_read_timeout(message: str, *, timeout_seconds: float) -> httpx.ReadTimeout:
+    seconds = float(timeout_seconds)
+    request = httpx.Request(
+        "POST",
+        "https://uni-api.local/upstream-timeout",
+        extensions={"timeout": {"read": seconds}},
+    )
+    return httpx.ReadTimeout(message, request=request)
+
+
 async def _await_first_byte_deadline(
     awaitable: Awaitable[Any],
     *,
@@ -4598,9 +4608,9 @@ async def _await_first_byte_deadline(
             total_timeout_for_message if timeout_label == "total response" else first_byte_timeout_for_message
         )
         timeout_for_message = timeout_for_message if timeout_for_message is not None else 0
-        raise httpx.ReadTimeout(
+        raise _upstream_read_timeout(
             f"Request timed out waiting for {timeout_label} after {timeout_for_message:g} seconds",
-            request=httpx.Request("POST", "https://uni-api.local/upstream-timeout"),
+            timeout_seconds=timeout_for_message,
         ) from exc
     except BaseException:
         if task_result_owned:
@@ -4672,16 +4682,16 @@ async def _await_stream_next_with_total_deadline(
         return await upstream_iter.__anext__()
     remaining = total_deadline - asyncio.get_running_loop().time()
     if remaining <= 0:
-        raise httpx.ReadTimeout(
+        raise _upstream_read_timeout(
             f"Request timed out waiting for total response after {float(total_timeout_seconds):g} seconds",
-            request=httpx.Request("POST", "https://uni-api.local/upstream-timeout"),
+            timeout_seconds=float(total_timeout_seconds),
         )
     try:
         return await asyncio.wait_for(upstream_iter.__anext__(), timeout=remaining)
     except asyncio.TimeoutError as exc:
-        raise httpx.ReadTimeout(
+        raise _upstream_read_timeout(
             f"Request timed out waiting for total response after {float(total_timeout_seconds):g} seconds",
-            request=httpx.Request("POST", "https://uni-api.local/upstream-timeout"),
+            timeout_seconds=float(total_timeout_seconds),
         ) from exc
 
 async def _prime_passthrough_upstream_stream(

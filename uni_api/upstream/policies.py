@@ -23,6 +23,18 @@ NETWORK_ERRORS = (
 )
 
 
+def _timeout_seconds_text(value: Any) -> Optional[str]:
+    if isinstance(value, bool):
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    return f"{seconds:g}"
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderErrorClassifier:
     safe_get: Callable[..., Any]
@@ -76,8 +88,11 @@ class ProviderErrorClassifier:
             return local_status, local_reason
         if isinstance(exc, httpx.ReadTimeout):
             timeout_extensions = getattr(getattr(exc, "request", None), "extensions", {}) or {}
-            timeout_value = self.safe_get(timeout_extensions, "timeout", "read", default=-1)
-            return 504, f"Request timed out after {timeout_value} seconds"
+            timeout_value = self.safe_get(timeout_extensions, "timeout", "read", default=None)
+            timeout_text = _timeout_seconds_text(timeout_value)
+            if timeout_text is not None:
+                return 504, f"Request timed out after {timeout_text} seconds"
+            return 504, "Request timed out"
         if isinstance(exc, httpx.ConnectError):
             return 503, "Unable to connect to service"
         if isinstance(exc, httpx.ReadError):

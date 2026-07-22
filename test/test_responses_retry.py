@@ -805,6 +805,171 @@ def test_responses_codex_strips_max_output_tokens(monkeypatch):
     assert "max_output_tokens" not in sent_payload
 
 
+def test_responses_normalizes_polluted_custom_tool_call_input(monkeypatch):
+    client_manager = _configure_responses_test(
+        monkeypatch,
+        engine="codex",
+        provider_preferences={
+            "normalize_responses_custom_tool_call_ids": True,
+        },
+    )
+    request = ResponsesRequest(
+        model="gpt-5.4",
+        input=[
+            {
+                "type": "reasoning",
+                "id": "item_reasoning123",
+            },
+            {
+                "type": "custom_tool_call",
+                "id": "item_7eb1bd749e0a9e692c69ed40",
+                "call_id": "call_foCUR1DBzdZeYyOccLpOmwUF",
+                "name": "exec",
+                "input": "{}",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "id": "ctco_output123",
+                "call_id": "call_foCUR1DBzdZeYyOccLpOmwUF",
+                "output": "ok",
+            },
+        ],
+    )
+
+    response = _run_responses_request(request)
+
+    assert response.status_code == 200
+    sent_payload = json.loads(client_manager.post_calls[0]["content"])
+    assert sent_payload["input"][0]["type"] == "reasoning"
+    assert sent_payload["input"][1]["id"] == "ctc_7eb1bd749e0a9e692c69ed40"
+    assert sent_payload["input"][1]["call_id"] == "call_foCUR1DBzdZeYyOccLpOmwUF"
+    assert sent_payload["input"][2]["call_id"] == "call_foCUR1DBzdZeYyOccLpOmwUF"
+    assert request.input[1]["id"] == "item_7eb1bd749e0a9e692c69ed40"
+
+
+def test_responses_normalizes_non_stream_custom_tool_call_output(monkeypatch):
+    client_manager = _configure_responses_test(
+        monkeypatch,
+        engine="codex",
+        provider_preferences={
+            "normalize_responses_custom_tool_call_ids": True,
+        },
+    )
+    client_manager.response = httpx.Response(
+        200,
+        request=httpx.Request("POST", "https://example.com/v1/responses"),
+        json={
+            "id": "resp_1",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "custom_tool_call",
+                    "id": "item_output123",
+                    "call_id": "call_output123",
+                    "name": "exec",
+                    "input": "{}",
+                }
+            ],
+        },
+    )
+
+    response = _run_responses_request(
+        ResponsesRequest(model="gpt-5.4", input="hello", stream=False)
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["output"][0]["id"] == "ctc_output123"
+
+
+def test_responses_normalizes_stream_custom_tool_call_ids_consistently(monkeypatch):
+    client_manager = _configure_responses_test(
+        monkeypatch,
+        engine="codex",
+        provider_preferences={
+            "normalize_responses_custom_tool_call_ids": True,
+        },
+    )
+    item = {
+        "type": "custom_tool_call",
+        "id": "item_stream123",
+        "call_id": "call_stream123",
+        "name": "exec",
+        "input": "{}",
+    }
+    client_manager.response = DummyStreamingUpstreamResponse(
+        chunks=[
+            _responses_sse(
+                "response.output_item.added",
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": dict(item),
+                },
+            ),
+            _responses_sse(
+                "response.custom_tool_call_input.delta",
+                {
+                    "type": "response.custom_tool_call_input.delta",
+                    "output_index": 0,
+                    "item_id": "item_stream123",
+                    "delta": "{}",
+                },
+            ),
+            _responses_sse(
+                "response.custom_tool_call_input.done",
+                {
+                    "type": "response.custom_tool_call_input.done",
+                    "output_index": 0,
+                    "item_id": "item_stream123",
+                    "input": "{}",
+                },
+            ),
+            _responses_sse(
+                "response.output_item.done",
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": dict(item),
+                },
+            ),
+            _responses_sse(
+                "response.completed",
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "status": "completed",
+                        "output": [dict(item)],
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 1,
+                            "total_tokens": 2,
+                        },
+                    },
+                },
+            ),
+        ],
+        headers={"content-type": "text/event-stream"},
+    )
+
+    current_info = {
+        "request_id": "req-test",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input="hello", stream=True),
+        current_info=current_info,
+    )
+
+    assert response.status_code == 200
+    assert "item_stream123" not in body
+    assert body.count("ctc_stream123") == 5
+    assert current_info["custom_tool_call_id_normalized"] is True
+    assert current_info["custom_tool_call_id_normalization_count"] == 3
+    assert current_info["custom_tool_call_id_reference_rewrite_count"] == 2
+
+
 @pytest.mark.parametrize(
     ("requested_tier", "expected_tier"),
     [

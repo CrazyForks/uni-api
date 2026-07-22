@@ -256,6 +256,12 @@ from uni_api.upstream.responses_errors import (
     ResponsesSemanticError,
     responses_failure_error,
 )
+from uni_api.upstream.responses_normalization import (
+    ResponsesCustomToolCallIdCollisionError,
+    ResponsesCustomToolCallIdNormalizationResult,
+    ResponsesCustomToolCallIdNormalizer,
+    responses_custom_tool_call_id_normalization_enabled,
+)
 from core.utils import safe_get
 
 from sqlalchemy import inspect, text
@@ -6246,6 +6252,7 @@ class ResponsesRequestExecution:
         upstream_url = attempt.state["upstream_url"]
         proxy = attempt.state["proxy"]
         headers = self._build_headers(attempt)
+        attempt.state["failure_stage"] = "validation"
         payload = self._build_payload(attempt)
         json_payload = await run_json_cpu(json.dumps, payload)
         attempt.state["payload_bytes"] = len(json_payload.encode("utf-8"))
@@ -6300,7 +6307,52 @@ class ResponsesRequestExecution:
         )
         if engine == "codex":
             strip_unsupported_codex_payload_fields(payload, strip_store=attempt.state["wants_compact"])
+        if self._custom_tool_call_id_normalization_enabled(attempt):
+            try:
+                result = ResponsesCustomToolCallIdNormalizer().normalize(payload)
+            except ResponsesCustomToolCallIdCollisionError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            self._record_custom_tool_call_id_normalization(
+                attempt,
+                result,
+                direction="input",
+            )
         return payload
+
+    def _custom_tool_call_id_normalization_enabled(self, attempt: Any) -> bool:
+        return responses_custom_tool_call_id_normalization_enabled(
+            attempt.provider,
+            (self.request_model_name, attempt.original_model),
+        )
+
+    def _record_custom_tool_call_id_normalization(
+        self,
+        attempt: Any,
+        result: ResponsesCustomToolCallIdNormalizationResult,
+        *,
+        direction: str,
+        event_type: Optional[str] = None,
+    ) -> None:
+        if not result.changed:
+            return
+        self.current_info["custom_tool_call_id_normalized"] = True
+        self.current_info["custom_tool_call_id_normalization_count"] = int(
+            self.current_info.get("custom_tool_call_id_normalization_count") or 0
+        ) + int(result.normalized_ids)
+        self.current_info["custom_tool_call_id_reference_rewrite_count"] = int(
+            self.current_info.get("custom_tool_call_id_reference_rewrite_count") or 0
+        ) + int(result.rewritten_references)
+        trace_logger.info(
+            "%s custom_tool_call ID normalized request_id=%s provider=%s direction=%s event_type=%s normalized_ids=%s rewritten_references=%s paths=%s",
+            self.endpoint,
+            self.request_id,
+            attempt.provider_name,
+            direction,
+            event_type or "none",
+            result.normalized_ids,
+            result.rewritten_references,
+            ",".join(result.paths) or "none",
+        )
 
     def _record_upstream_attempt_start(self, attempt: Any) -> None:
         attempts = self.current_info.get("upstream_attempts")
@@ -6698,6 +6750,11 @@ class ResponsesRequestExecution:
             max_pending_bytes=RESPONSES_CANONICAL_EVENT_MAX_BYTES,
             max_event_bytes=RESPONSES_CANONICAL_EVENT_MAX_BYTES,
         )
+        custom_tool_call_id_normalizer = (
+            ResponsesCustomToolCallIdNormalizer()
+            if self._custom_tool_call_id_normalization_enabled(attempt)
+            else None
+        )
 
         async def source_events():
             """Frame transport chunks before exposing any protocol event."""
@@ -6872,6 +6929,34 @@ class ResponsesRequestExecution:
                         if event_was_normalized and reservation is not None:
                             await reservation.release()
                             reservation = None
+
+                        if custom_tool_call_id_normalizer is not None:
+                            try:
+                                normalization_result = (
+                                    custom_tool_call_id_normalizer.normalize(
+                                        event_payload
+                                    )
+                                )
+                            except ResponsesCustomToolCallIdCollisionError as exc:
+                                raise SSEProtocolError(str(exc)) from exc
+                            if normalization_result.changed:
+                                event_bytes = _encode_responses_sse_event(
+                                    event_type,
+                                    event_payload,
+                                )
+                                if reservation is not None:
+                                    await reservation.release()
+                                    reservation = None
+                                diagnostics.observe_normalization(
+                                    "custom_tool_call_id_prefix",
+                                    event_type,
+                                )
+                                self._record_custom_tool_call_id_normalization(
+                                    attempt,
+                                    normalization_result,
+                                    direction="output",
+                                    event_type=event_type,
+                                )
 
                         _validate_responses_terminal_payload(
                             event_type,
@@ -7326,12 +7411,36 @@ class ResponsesRequestExecution:
         if semantic_failure is not None:
             raise semantic_failure
 
+        response_content = upstream_resp.content
+        if self._custom_tool_call_id_normalization_enabled(attempt):
+            try:
+                normalization_result = ResponsesCustomToolCallIdNormalizer().normalize(
+                    data
+                )
+            except ResponsesCustomToolCallIdCollisionError as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+            if normalization_result.changed:
+                response_content = (
+                    await run_json_cpu(
+                        json.dumps,
+                        data,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                ).encode("utf-8")
+                self._record_custom_tool_call_id_normalization(
+                    attempt,
+                    normalization_result,
+                    direction="output",
+                    event_type=str(data.get("type") or "response"),
+                )
+
         self._record_upstream_attempt_result(attempt, status_code=upstream_resp.status_code, success=True)
         self._mark_success(attempt.state["channel_id"], attempt.provider_api_key_raw)
         response_headers = _copy_upstream_response_headers(upstream_resp.headers)
         return Response(
             status_code=upstream_resp.status_code,
-            content=upstream_resp.content,
+            content=response_content,
             headers=response_headers,
             media_type=response_headers.get("content-type", "application/json"),
         )

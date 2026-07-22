@@ -4,6 +4,12 @@
 bounded Fugue observability queue. Export failures are fail-open and never
 block requests or stream delivery.
 
+Each snapshot is exported in two forms: Prometheus-compatible metric events
+and a bounded `worker_runtime_snapshot` `app_events` record. The latter keeps
+all per-worker facts queryable when a Fugue installation runs without a
+Prometheus remote-write backend; it deliberately excludes the latest profile
+body and all request data.
+
 ## Worker metrics
 
 The worker snapshot and `/v1/observability/runtime` expose:

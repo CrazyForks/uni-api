@@ -3,6 +3,7 @@ import re
 import asyncio
 
 import main
+import pytest
 from fugue_observability import (
     FugueObservabilityClient,
     FugueObservabilityConfig,
@@ -12,6 +13,7 @@ from fugue_observability import (
     build_uni_api_ember_terminal_hop_metric_event,
     build_uni_api_ember_worker_cpu_profile_event,
     build_uni_api_ember_worker_metric_events,
+    build_uni_api_ember_worker_runtime_snapshot_event,
     fugue_observability_config_from_env,
 )
 from uni_api.admission import (
@@ -94,6 +96,93 @@ def test_terminal_hop_raw_metric_has_no_request_id_label():
     assert event["metric"].endswith("flush_to_receive_milliseconds")
     assert "request_id" not in event["attributes"]
     assert "trace_id" not in event["attributes"]
+
+
+def test_worker_snapshot_has_queryable_bounded_app_event_fallback():
+    event = build_uni_api_ember_worker_runtime_snapshot_event(
+        service_name="uni-api-ember",
+        service_version="1.7.200",
+        identity_attrs={"app_id": "app_123", "runtime_id": "runtime_123"},
+        snapshot={
+            "worker_metrics_schema_version": 1,
+            "worker_id": "pod-1:33",
+            "worker_pid": 33,
+            "worker_started_at": "2026-07-22T10:00:00+00:00",
+            "worker_source_revision": "9114e05",
+            "worker_cpu_seconds_total": 123.5,
+            "worker_cpu_cores": 0.97,
+            "worker_sse_events_per_second": 25.5,
+            "worker_sse_bytes_per_second": 500_000.25,
+            "worker_inflight_requests": 74,
+            "worker_cpu_seconds_per_sse_mebibyte": 1.25,
+            "worker_cpu_profile_enabled": True,
+            "worker_cpu_profile_running": False,
+            "oaix_terminal_flush_to_ember_receive_histogram": {
+                "count": 3,
+                "sum_ms": 8120.5,
+                "cumulative_buckets": {"100": 1, "10000": 3},
+                "infinite_bucket": 3,
+            },
+            "worker_cpu_profile_latest": {
+                "top_stacks": [{"request_body": "must-not-be-copied"}]
+            },
+            "authorization": "Bearer must-not-be-copied",
+        },
+    )
+
+    serialized = json.dumps(event, sort_keys=True)
+    assert event["event_type"] == "worker_runtime_snapshot"
+    assert event["attributes"]["fugue_table"] == "app_events"
+    assert event["attributes"]["worker_id"] == "pod-1:33"
+    assert event["summary"]["worker_cpu_cores"] == 0.97
+    assert event["summary"]["worker_inflight_requests"] == 74
+    assert event["summary"][
+        "oaix_terminal_flush_to_ember_receive_histogram"
+    ]["cumulative_buckets"]["10000"] == 3
+    assert "must-not-be-copied" not in serialized
+    assert "Bearer" not in serialized
+
+
+def test_worker_snapshot_posts_durable_event_before_prometheus_metrics():
+    async def scenario():
+        client = FugueObservabilityClient(
+            FugueObservabilityConfig(
+                endpoint="https://observability.invalid",
+                identity_attrs={"app_id": "app_123"},
+            )
+        )
+        client._queue = asyncio.Queue(maxsize=10)
+        calls = []
+
+        async def capture(path, payload):
+            calls.append((path, payload))
+
+        client._post_json = capture
+        worker = asyncio.create_task(client._worker())
+        try:
+            assert client.emit_worker_runtime_snapshot(
+                {
+                    "worker_metrics_schema_version": 1,
+                    "worker_id": "pod-1:33",
+                    "worker_cpu_cores": 0.97,
+                    "worker_inflight_requests": 74,
+                }
+            )
+            await client._queue.join()
+        finally:
+            worker.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await worker
+        return calls
+
+    calls = asyncio.run(scenario())
+    assert [path for path, _payload in calls] == ["/v1/logs", "/v1/metrics"]
+    assert calls[0][1]["events"][0]["event_type"] == (
+        "worker_runtime_snapshot"
+    )
+    assert all(
+        event["kind"] == "metric" for event in calls[1][1]["events"]
+    )
 
 
 def test_worker_cpu_profile_event_only_exports_bounded_code_locations():

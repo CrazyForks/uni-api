@@ -354,6 +354,7 @@ class FugueObservabilityClient:
                 _DeferredTerminalHopObservation,
             )
             build_failed = False
+            posts: list[tuple[str, dict[str, Any]]] | None = None
             try:
                 if large_body_decision:
                     try:
@@ -405,12 +406,27 @@ class FugueObservabilityClient:
                             identity_attrs=self.config.identity_attrs,
                             snapshot=item.snapshot,
                         )
+                        snapshot_event = (
+                            build_uni_api_ember_worker_runtime_snapshot_event(
+                                service_name=self.config.service_name,
+                                service_version=self.config.service_version,
+                                identity_attrs=self.config.identity_attrs,
+                                snapshot=item.snapshot,
+                            )
+                        )
                     except Exception:
                         build_failed = True
                         self._export_errors += 1
                         self._worker_runtime_snapshot_build_errors += 1
                         raise
-                    path, payload = _METRIC_ENDPOINT, {"events": events}
+                    # Persist the per-worker snapshot in app_events first.
+                    # Some Fugue installations intentionally run without a
+                    # Prometheus remote-write backend; the structured event
+                    # keeps the same facts queryable in that configuration.
+                    posts = [
+                        (_LOG_ENDPOINT, {"events": [snapshot_event]}),
+                        (_METRIC_ENDPOINT, {"events": events}),
+                    ]
                 elif worker_cpu_profile:
                     try:
                         event = build_uni_api_ember_worker_cpu_profile_event(
@@ -441,8 +457,20 @@ class FugueObservabilityClient:
                     path, payload = _METRIC_ENDPOINT, {"events": [event]}
                 else:
                     path, payload = item
-                if payload.get("events"):
-                    await self._post_json(path, payload)
+                if posts is None:
+                    posts = [(path, payload)]
+                post_errors: list[Exception] = []
+                for post_path, post_payload in posts:
+                    if not post_payload.get("events"):
+                        continue
+                    try:
+                        await self._post_json(post_path, post_payload)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        post_errors.append(exc)
+                if post_errors:
+                    raise post_errors[0]
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -794,6 +822,130 @@ def build_uni_api_ember_worker_metric_events(
             }
         )
     return events
+
+
+def build_uni_api_ember_worker_runtime_snapshot_event(
+    *,
+    service_name: str,
+    service_version: str | None,
+    identity_attrs: dict[str, str] | None,
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    summary = _bounded_worker_runtime_summary(snapshot)
+    worker_id = _safe_text(summary.get("worker_id"), max_len=192)
+    source_revision = _safe_text(
+        summary.get("worker_source_revision"),
+        max_len=64,
+    )
+    summary_json = json.dumps(summary, separators=(",", ":"), sort_keys=True)
+    return {
+        "timestamp": _iso_timestamp(datetime.now(timezone.utc)),
+        "kind": "log",
+        "level": "info",
+        "service": service_name,
+        "source": service_name,
+        "event": "worker_runtime_snapshot",
+        "event_type": "worker_runtime_snapshot",
+        "message": "worker runtime snapshot",
+        "app_id": _safe_text((identity_attrs or {}).get("app_id")),
+        "attributes": _drop_empty(
+            {
+                **(identity_attrs or {}),
+                "component": f"{service_name}-worker",
+                "service_version": _safe_text(service_version),
+                "fugue_table": "app_events",
+                "severity": "info",
+                "worker_id": worker_id,
+                "source_revision": source_revision,
+                "worker_cpu_cores": _optional_float_text(
+                    summary.get("worker_cpu_cores")
+                ),
+                "worker_inflight_requests": _optional_int_text(
+                    summary.get("worker_inflight_requests")
+                ),
+            }
+        ),
+        "summary": summary,
+        "summary_json": summary_json,
+    }
+
+
+def _bounded_worker_runtime_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "worker_metrics_schema_version": _safe_int(
+            snapshot.get("worker_metrics_schema_version"),
+            1,
+        ),
+        "worker_id": _safe_text(snapshot.get("worker_id"), max_len=192),
+        "worker_pid": max(0, _safe_int(snapshot.get("worker_pid"), 0)),
+        "worker_started_at": _safe_text(
+            snapshot.get("worker_started_at"),
+            max_len=64,
+        ),
+        "worker_source_revision": _safe_text(
+            snapshot.get("worker_source_revision"),
+            max_len=64,
+        ),
+    }
+    numeric_keys = (
+        "worker_cpu_seconds_total",
+        "worker_cpu_cores",
+        "worker_single_core_saturation_ratio",
+        "worker_sse_events_total",
+        "worker_sse_bytes_total",
+        "worker_sse_events_per_second",
+        "worker_sse_bytes_per_second",
+        "worker_inflight_requests",
+        "worker_cpu_seconds_per_sse_mebibyte",
+        "worker_metrics_sample_elapsed_seconds",
+        "worker_cpu_profile_trigger_cores",
+        "worker_cpu_profile_trigger_samples",
+        "worker_cpu_profile_trigger_streak",
+        "worker_cpu_profile_trigger_total",
+        "worker_cpu_profile_completed_total",
+        "worker_cpu_profile_failed_total",
+        "oaix_terminal_flush_to_ember_receive_invalid_total",
+        "oaix_terminal_flush_marker_missing_total",
+    )
+    for key in numeric_keys:
+        value = _finite_metric_value(snapshot.get(key))
+        if value is not None:
+            summary[key] = value
+    summary["worker_cpu_profile_enabled"] = _safe_bool(
+        snapshot.get("worker_cpu_profile_enabled")
+    )
+    summary["worker_cpu_profile_running"] = _safe_bool(
+        snapshot.get("worker_cpu_profile_running")
+    )
+
+    histogram = snapshot.get("oaix_terminal_flush_to_ember_receive_histogram")
+    if isinstance(histogram, dict):
+        safe_histogram: dict[str, Any] = {}
+        for source_key, target_key in (
+            ("count", "count"),
+            ("sum_ms", "sum_ms"),
+            ("infinite_bucket", "infinite_bucket"),
+        ):
+            value = _finite_metric_value(histogram.get(source_key))
+            if value is not None and value >= 0:
+                safe_histogram[target_key] = value
+        buckets = histogram.get("cumulative_buckets")
+        if isinstance(buckets, dict):
+            safe_buckets: dict[str, float | int] = {}
+            for raw_bound, raw_count in list(buckets.items())[:32]:
+                bound = _safe_metric_bucket_suffix(raw_bound)
+                count = _finite_metric_value(raw_count)
+                if bound and count is not None and count >= 0:
+                    safe_buckets[bound.replace("_", ".")] = count
+            safe_histogram["cumulative_buckets"] = safe_buckets
+        summary["oaix_terminal_flush_to_ember_receive_histogram"] = (
+            safe_histogram
+        )
+    return {
+        key: value
+        for key, value in summary.items()
+        if value is not None and value != ""
+    }
 
 
 def build_uni_api_ember_terminal_hop_metric_event(

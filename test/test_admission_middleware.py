@@ -8,6 +8,7 @@ from uni_api.admission import (
     AdmissionRejected,
     RequestAdmissionController,
     RequestBodyObservation,
+    get_request_admission_lease,
 )
 from uni_api.admission.memory import AdaptiveMemoryGovernor, ProcessMemorySample
 from uni_api.disconnect import DOWNSTREAM_DISCONNECT_EVENT_SCOPE_KEY
@@ -103,6 +104,59 @@ def test_admission_lease_covers_the_complete_streaming_asgi_lifecycle():
         await task
         assert controller.snapshot()["active"] == 0
         assert sent[-1]["more_body"] is False
+
+    asyncio.run(run())
+
+
+def test_final_asgi_body_closes_pending_response_attempt():
+    async def run():
+        events = []
+        controller = _controller(
+            max_response_bytes=8,
+            response_buffer_observer=lambda event: events.append(event) or True,
+        )
+
+        async def streaming_app(_scope, _receive, send):
+            lease = get_request_admission_lease()
+            assert lease is not None
+            lease.begin_response_attempt(
+                {},
+                routing_attempt_id="attempt-1",
+                routing_attempt_index=1,
+                provider="provider-a",
+                request_model="model-x",
+                actual_model="model-x",
+            )
+            lease.finish_response_attempt(
+                outcome="stream_pending",
+                keep_active=True,
+            )
+            reservation = await lease.reserve_temporary_response_bytes(1)
+            await reservation.release()
+            await send(
+                {"type": "http.response.start", "status": 200, "headers": []}
+            )
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": b"ok",
+                    "more_body": False,
+                }
+            )
+
+        middleware = RequestAdmissionMiddleware(
+            streaming_app,
+            controller=controller,
+        )
+        sent = []
+        await middleware(_scope(), _receive, lambda message: _append(sent, message))
+
+        assert len(events) == 1
+        assert events[0].outcome == "stream_completed"
+        assert controller.snapshot()["active"] == 0
+
+    async def _append(target, message):
+        target.append(message)
 
     asyncio.run(run())
 

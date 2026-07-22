@@ -202,14 +202,26 @@ class RequestAdmissionMiddleware:
             return
 
         response_started = False
+        response_completed = False
         _incoming_observation_identifiers(scope)
         initialize_request_body_observation(scope)
 
         async def tracking_send(message: Message) -> None:
             nonlocal response_started
+            nonlocal response_completed
             if message["type"] == "http.response.start":
                 response_started = True
+            final_response_body = bool(
+                message["type"] == "http.response.body"
+                and not message.get("more_body", False)
+            )
             await send(message)
+            if final_response_body:
+                response_completed = True
+                if lease is not None:
+                    lease.finish_pending_response_attempt(
+                        outcome="stream_completed"
+                    )
 
         lease = None
         lease_context_token = None
@@ -403,6 +415,20 @@ class RequestAdmissionMiddleware:
                             None,
                         )
                     if lease is not None:
+                        if response_completed:
+                            pending_outcome = "stream_completed"
+                        elif (
+                            isinstance(disconnect_event, asyncio.Event)
+                            and disconnect_event.is_set()
+                        ):
+                            pending_outcome = "downstream_disconnected"
+                        elif "cancel" in release_reason:
+                            pending_outcome = "cancelled_or_consumer_closed"
+                        else:
+                            pending_outcome = "stream_failed"
+                        lease.finish_pending_response_attempt(
+                            outcome=pending_outcome
+                        )
                         await lease.release(reason=release_reason)
 
             cleanup_task = asyncio.create_task(cleanup_request_ownership())

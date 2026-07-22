@@ -626,6 +626,21 @@ class RequestAdmissionLease:
             )
             self._response_attempt = None
 
+    def finish_pending_response_attempt(self, *, outcome: str) -> bool:
+        """Finalize only an attempt still waiting on downstream stream end."""
+
+        attempt = self._response_attempt
+        if not isinstance(attempt, dict):
+            return False
+        lifecycle_key = str(attempt.get("lifecycle_key") or "")
+        lifecycle = self._response_lifecycle_by_attempt.get(lifecycle_key)
+        if not isinstance(lifecycle, dict):
+            return False
+        if str(lifecycle.get("outcome") or "") != "stream_pending":
+            return False
+        self.finish_response_attempt(outcome=str(outcome)[:80])
+        return True
+
     async def reserve_body_bytes(
         self,
         additional_bytes: int,

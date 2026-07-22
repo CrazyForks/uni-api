@@ -389,6 +389,8 @@ def finalize_routing_attempt(
 
 def finalize_latest_routing_attempt(
     current_info: Any,
+    *,
+    response_memory_lease: Any = None,
     **kwargs: Any,
 ) -> None:
     if not isinstance(current_info, dict):
@@ -399,6 +401,7 @@ def finalize_latest_routing_attempt(
     finalize_routing_attempt_entry(attempts[-1], **kwargs)
     finalize_response_memory_attempt(
         outcome=str(kwargs.get("outcome") or "finished"),
+        lease=response_memory_lease,
     )
 
 
@@ -406,12 +409,12 @@ def finalize_response_memory_attempt(
     *,
     outcome: str,
     attempt: Any = None,
+    lease: Any = None,
 ) -> None:
     """Finalize the response-buffer attempt when a stream really terminates."""
 
-    lease = None
     state = getattr(attempt, "state", None)
-    if isinstance(state, dict):
+    if lease is None and isinstance(state, dict):
         lease = state.get("_response_memory_lease")
     if lease is None:
         lease = get_request_admission_lease()
@@ -622,12 +625,39 @@ class UpstreamRunner:
     ) -> Optional[dict[str, Any]]:
         entry = attempt.state.get("_routing_attempt_entry")
         if not isinstance(entry, dict):
+            failure = attempt.state.get("_routing_failure")
+            response = result.response
+            collected_stream_outcome = str(
+                getattr(
+                    response,
+                    "_uni_api_response_attempt_terminal_outcome",
+                    "",
+                )
+                or ""
+            )[:80]
+            if isinstance(failure, dict):
+                outcome = (
+                    "retry_decided"
+                    if bool(failure.get("retry_decision"))
+                    else "failed"
+                )
+            elif (
+                response is not None
+                and hasattr(response, "body_iterator")
+                and not collected_stream_outcome
+            ):
+                outcome = "stream_pending"
+            else:
+                outcome = collected_stream_outcome or "finished"
             lease = attempt.state.get("_response_memory_lease")
             if lease is not None:
-                lease.finish_response_attempt(outcome="finished")
+                lease.finish_response_attempt(
+                    outcome=outcome,
+                    keep_active=outcome == "stream_pending",
+                )
             UpstreamRunner._finish_transport_diagnostics(
                 attempt,
-                outcome="finished",
+                outcome=outcome,
             )
             return None
 
@@ -661,7 +691,19 @@ class UpstreamRunner:
         response_status = getattr(response, "status_code", None)
         if isinstance(response_status, int):
             entry["wire_status_code"] = int(response_status)
-        if response is not None and hasattr(response, "body_iterator"):
+        collected_stream_outcome = str(
+            getattr(
+                response,
+                "_uni_api_response_attempt_terminal_outcome",
+                "",
+            )
+            or ""
+        )[:80]
+        if (
+            response is not None
+            and hasattr(response, "body_iterator")
+            and not collected_stream_outcome
+        ):
             entry["outcome"] = "stream_pending"
             lease = attempt.state.get("_response_memory_lease")
             if lease is not None:
@@ -681,7 +723,10 @@ class UpstreamRunner:
             and response_status < 400
         )
         entry["success"] = success
-        entry["outcome"] = "succeeded" if success else "finished"
+        entry["outcome"] = (
+            collected_stream_outcome
+            or ("succeeded" if success else "finished")
+        )
         entry.pop("_started_monotonic", None)
         lease = attempt.state.get("_response_memory_lease")
         if lease is not None:

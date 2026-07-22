@@ -778,10 +778,11 @@ def test_legacy_stream_channel_result_is_finalized_only_at_terminal_outcome(
             def finish_response_attempt(self, *, outcome, keep_active=False):
                 response_attempt_outcomes.append((outcome, keep_active))
 
+        response_memory_lease = ResponseMemoryLease()
         monkeypatch.setattr(
             upstream_module,
             "get_request_admission_lease",
-            lambda: ResponseMemoryLease(),
+            lambda: None,
         )
 
         def record(*args, success, **kwargs):
@@ -805,6 +806,7 @@ def test_legacy_stream_channel_result_is_finalized_only_at_terminal_outcome(
             model="model",
             provider_api_key="provider-key",
             fallback_background_tasks=None,
+            response_memory_lease=response_memory_lease,
         )
         assert [chunk async for chunk in completed] == [b"one", b"two"]
         assert recorded == [True]
@@ -829,6 +831,7 @@ def test_legacy_stream_channel_result_is_finalized_only_at_terminal_outcome(
             model="model",
             provider_api_key="provider-key",
             fallback_background_tasks=None,
+            response_memory_lease=response_memory_lease,
         )
         assert await anext(failed) == b"first"
         with pytest.raises(RuntimeError, match="midstream abort"):
@@ -863,6 +866,7 @@ def test_legacy_stream_channel_result_is_finalized_only_at_terminal_outcome(
             model="model",
             provider_api_key="provider-key",
             fallback_background_tasks=None,
+            response_memory_lease=response_memory_lease,
         )
         assert b"image_edit.partial_image" in await anext(protocol_failed)
         protocol_terminal = await anext(protocol_failed)
@@ -920,6 +924,7 @@ def test_legacy_stream_channel_result_is_finalized_only_at_terminal_outcome(
             model="model",
             provider_api_key="provider-key",
             fallback_background_tasks=None,
+            response_memory_lease=response_memory_lease,
         )
         assert b"partial" in await anext(semantic_failed)
         semantic_terminal = await anext(semantic_failed)
@@ -952,6 +957,7 @@ def test_legacy_stream_channel_result_is_finalized_only_at_terminal_outcome(
             model="model",
             provider_api_key="provider-key",
             fallback_background_tasks=None,
+            response_memory_lease=response_memory_lease,
         )
         assert await anext(abandoned) == b"first"
         await abandoned.aclose()

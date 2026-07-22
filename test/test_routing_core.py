@@ -459,6 +459,33 @@ def test_upstream_runner_stops_after_success_at_exact_attempt_boundary(
     asyncio.run(run())
 
 
+def test_upstream_runner_treats_precollected_stream_response_as_terminal(
+    monkeypatch,
+):
+    async def run():
+        plan = await _routing_plan_with_retry_count(monkeypatch, 0)
+        current_info = {}
+        response = SimpleNamespace(
+            status_code=200,
+            body_iterator=iter([b"{}"]),
+            _uni_api_response_attempt_terminal_outcome="succeeded",
+            headers={},
+        )
+
+        async def execute_attempt(_attempt):
+            return response
+
+        returned = await UpstreamRunner(
+            plan,
+            observability_context=current_info,
+        ).run(execute_attempt)
+
+        assert returned is response
+        assert current_info["routing_attempts"][-1]["outcome"] == "succeeded"
+
+    asyncio.run(run())
+
+
 def test_retry_decision_without_an_available_attempt_is_not_a_transition(
     monkeypatch,
 ):

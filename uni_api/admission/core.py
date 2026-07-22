@@ -2185,6 +2185,14 @@ class RequestAdmissionController:
         for lifecycle_key, lifecycle in tuple(
             lease._response_lifecycle_by_attempt.items()
         ):
+            if lifecycle_key == "unattributed":
+                # Temporary allocations used by request JSON/payload parsing
+                # happen before a provider routing attempt exists. Rejections
+                # are emitted immediately with their exact admission branch;
+                # successful preprocessing churn is not a response-attempt
+                # lifecycle event and would otherwise double event volume.
+                completed_lifecycle_keys.append(lifecycle_key)
+                continue
             committed_bytes = int(lifecycle.get("committed_bytes") or 0)
             released_bytes = int(lifecycle.get("released_bytes") or 0)
             summary_events: list[ResponseBufferEvent] = []

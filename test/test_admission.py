@@ -664,6 +664,14 @@ def test_response_buffer_observer_failure_never_changes_memory_ownership():
             response_buffer_observer=broken_observer,
         )
         lease = await controller.acquire()
+        lease.begin_response_attempt(
+            {},
+            routing_attempt_id="attempt-1",
+            routing_attempt_index=1,
+            provider="provider-a",
+            request_model="model-x",
+            actual_model="model-x",
+        )
         reservation = await lease.reserve_temporary_response_bytes(4)
         await reservation.release()
         await lease.release()
@@ -672,6 +680,29 @@ def test_response_buffer_observer_failure_never_changes_memory_ownership():
         assert snapshot["reserved_response_bytes"] == 0
         assert snapshot["active"] == 0
         assert snapshot["response_buffer_event_observer_errors_total"] == 1
+
+    asyncio.run(run())
+
+
+def test_successful_preprocessing_reservations_do_not_emit_attempt_summaries():
+    async def run():
+        events = []
+        controller = RequestAdmissionController(
+            capacity=1,
+            waiter_limit=0,
+            wait_timeout_seconds=1,
+            max_body_bytes=16,
+            body_budget_bytes=16,
+            max_response_bytes=16,
+            response_buffer_observer=lambda event: events.append(event) or True,
+        )
+        lease = await controller.acquire()
+        reservation = await lease.reserve_temporary_response_bytes(4)
+        await reservation.release()
+        await lease.release()
+
+        assert events == []
+        assert controller.snapshot()["reserved_response_bytes"] == 0
 
     asyncio.run(run())
 

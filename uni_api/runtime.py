@@ -3183,6 +3183,7 @@ async def _track_legacy_stream_outcome(
     model: str,
     provider_api_key: Optional[str],
     fallback_background_tasks: BackgroundTasks,
+    response_memory_lease: Any = None,
 ):
     """Finalize legacy channel accounting when the stream really terminates.
 
@@ -3206,6 +3207,7 @@ async def _track_legacy_stream_outcome(
             )
             finalize_latest_routing_attempt(
                 current_info,
+                response_memory_lease=response_memory_lease,
                 outcome=(
                     "downstream_disconnected"
                     if downstream_disconnected
@@ -3238,6 +3240,7 @@ async def _track_legacy_stream_outcome(
             current_info["error_type"] = type(exc).__name__
             finalize_latest_routing_attempt(
                 current_info,
+                response_memory_lease=response_memory_lease,
                 outcome=(
                     "semantic_failure_terminal"
                     if semantic_failure
@@ -3303,6 +3306,7 @@ async def _track_legacy_stream_outcome(
             current_info["provider"] = channel_id
             finalize_latest_routing_attempt(
                 current_info,
+                response_memory_lease=response_memory_lease,
                 outcome="stream_completed",
                 success=True,
             )
@@ -3455,6 +3459,7 @@ async def process_request(
                     model=request.model,
                     provider_api_key=provider_api_key_raw,
                     fallback_background_tasks=background_tasks,
+                    response_memory_lease=get_request_admission_lease(),
                 )
                 defer_channel_result = True
                 response = StarletteStreamingResponse(wrapped_generator, media_type="text/event-stream", headers=upstream_response_headers)
@@ -3498,6 +3503,11 @@ async def process_request(
                 json_data = await collect_openai_chat_completion_from_streaming_sse(wrapped_generator, model=original_model)
                 _mark_first_byte_observed(current_info)
                 response = StarletteStreamingResponse(iter([json_data]), media_type="application/json", headers=upstream_response_headers)
+                setattr(
+                    response,
+                    "_uni_api_response_attempt_terminal_outcome",
+                    "succeeded",
+                )
             else:
                 _log_debug_request_headers(
                     "DEBUG upstream request headers",
@@ -3545,6 +3555,11 @@ async def process_request(
                     decoded_element = await run_json_cpu(json.loads, first_element)
                     encoded_element = await run_json_cpu(json.dumps, decoded_element)
                     response = StarletteStreamingResponse(iter([encoded_element]), media_type="application/json", headers=upstream_response_headers)
+                    setattr(
+                        response,
+                        "_uni_api_response_attempt_terminal_outcome",
+                        "succeeded",
+                    )
 
             # 更新成功计数和首次响应时间
             if not defer_channel_result:

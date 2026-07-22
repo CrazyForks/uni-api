@@ -6,11 +6,13 @@ from fugue_observability import (
     emit_uni_api_ember_admission_503_response_write_outcome,
     emit_uni_api_ember_large_body_admission_decision,
     emit_uni_api_ember_request_observability,
+    emit_uni_api_ember_response_buffer_event,
     fugue_observability_delivery_snapshot,
 )
 from uni_api.admission.observability import (
     Admission503ResponseWriteOutcome,
     LargeBodyAdmissionDecision,
+    ResponseBufferEvent,
 )
 
 
@@ -25,6 +27,10 @@ def emit_large_body_admission_decision(
     decision: LargeBodyAdmissionDecision,
 ) -> bool | None:
     return emit_uni_api_ember_large_body_admission_decision(decision)
+
+
+def emit_response_buffer_event(event: ResponseBufferEvent) -> bool | None:
+    return emit_uni_api_ember_response_buffer_event(event)
 
 
 def observability_exporter_snapshot() -> dict[str, int]:

@@ -487,7 +487,17 @@ async def get_right_order_providers(
         raise HTTPException(status_code=404, detail=f"No available providers at the moment: {request_model}")
 
     num_matching_providers = len(matching_providers)
-    if channel_manager and channel_manager.cooldown_period > 0 and num_matching_providers > 1:
+    channel_filter_enabled = bool(
+        channel_manager
+        and (
+            getattr(channel_manager, "cooldown_period", 0) > 0
+            or getattr(channel_manager, "has_route_circuit", False)
+        )
+    )
+    if channel_filter_enabled and (
+        num_matching_providers > 1
+        or getattr(channel_manager, "has_route_circuit", False)
+    ):
         matching_providers = await channel_manager.get_available_providers(matching_providers)
         num_matching_providers = len(matching_providers)
         if not matching_providers:

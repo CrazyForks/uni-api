@@ -11,6 +11,7 @@ async def observability_runtime_response(
     runtime_gauges: Any,
     client_manager: Any = None,
     *,
+    channel_manager: Any = None,
     stream_cleanup_snapshot: Callable[[], dict[str, Any]] | None = None,
     provider_key_pools_snapshot: Callable[[], dict[str, Any]] | None = None,
     idempotency_snapshot: Callable[[], dict[str, Any]] | None = None,
@@ -19,6 +20,8 @@ async def observability_runtime_response(
     snapshot = runtime_gauges.snapshot()
     if client_manager is not None and hasattr(client_manager, "snapshot"):
         snapshot["upstream_http_clients"] = client_manager.snapshot()
+    if channel_manager is not None and hasattr(channel_manager, "snapshot"):
+        snapshot["provider_model_route_health"] = channel_manager.snapshot()
     if stream_cleanup_snapshot is not None:
         snapshot["stream_cleanup_tasks"] = stream_cleanup_snapshot()
     if provider_key_pools_snapshot is not None:

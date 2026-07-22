@@ -173,6 +173,31 @@ class AdaptiveMemorySnapshot:
     sample_age_ms: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class AdaptiveMemoryReservationDecision:
+    """Atomic result and cgroup facts used by one parent reservation."""
+
+    allowed: bool
+    category: str
+    requested_bytes: int
+    reserved_before_bytes: int
+    projected_reserved_bytes: int
+    reserved_after_bytes: int
+    source: str
+    current_bytes: int | None
+    limit_bytes: int | None
+    high_bytes: int | None
+    soft_limit_bytes: int | None
+    guard_bytes: int
+    capacity_bytes: int
+    available_before_bytes: int
+    available_after_bytes: int
+    sample_error: str | None
+    sample_sequence: int
+    sampled_at_monotonic: float | None
+    sample_age_ms: int | None
+
+
 class AdaptiveMemoryGovernor:
     """One atomic parent budget for every process-owned retained byte.
 
@@ -321,14 +346,73 @@ class AdaptiveMemoryGovernor:
             return soft_limit or self.fallback_budget_bytes
 
     def reserve_nowait(self, category: str, size: int) -> bool:
+        return self.reserve_nowait_decision(category, size).allowed
+
+    def reserve_nowait_decision(
+        self,
+        category: str,
+        size: int,
+    ) -> AdaptiveMemoryReservationDecision:
+        """Reserve immediately and return the exact sample used to decide."""
+
         size = int(size)
         if size < 0:
             raise ValueError("memory reservation cannot be negative")
-        if size == 0:
-            return True
         normalized = str(category or "unknown").strip() or "unknown"
         with self._lock:
-            return self._try_reserve_locked(normalized, size, record_rejection=True)
+            sample = self._refresh_sample_locked()
+            soft_limit, guard, capacity, available_before = self._limits_locked(
+                sample
+            )
+            reserved_before = sum(self._reserved.values())
+            allowed = size <= available_before
+            if allowed and size:
+                self._reserved[normalized] += size
+                self._peak_reserved_bytes = max(
+                    self._peak_reserved_bytes,
+                    reserved_before + size,
+                )
+            elif not allowed:
+                self._rejected[normalized] += 1
+            sampled_at = (
+                self._sampled_at
+                if self._sample_sequence > 0
+                and self._sampled_at != float("-inf")
+                else None
+            )
+            sample_age_ms = (
+                max(
+                    0,
+                    int(round((self._clock() - sampled_at) * 1000.0)),
+                )
+                if sampled_at is not None
+                else None
+            )
+            reserved_after = reserved_before + size if allowed else reserved_before
+            return AdaptiveMemoryReservationDecision(
+                allowed=allowed,
+                category=normalized,
+                requested_bytes=size,
+                reserved_before_bytes=reserved_before,
+                projected_reserved_bytes=reserved_before + size,
+                reserved_after_bytes=reserved_after,
+                source=sample.source,
+                current_bytes=sample.current_bytes,
+                limit_bytes=sample.limit_bytes,
+                high_bytes=sample.high_bytes,
+                soft_limit_bytes=soft_limit,
+                guard_bytes=guard,
+                capacity_bytes=capacity,
+                available_before_bytes=available_before,
+                available_after_bytes=max(
+                    0,
+                    available_before - size if allowed else available_before,
+                ),
+                sample_error=self._sample_error,
+                sample_sequence=self._sample_sequence,
+                sampled_at_monotonic=sampled_at,
+                sample_age_ms=sample_age_ms,
+            )
 
     def _try_reserve_locked(
         self,

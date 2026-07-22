@@ -258,6 +258,7 @@ class RequestAdmissionMiddleware:
             state: dict[str, Any] = scope.setdefault("state", {})
             state[ADMISSION_LEASE_STATE_KEY] = lease
             state[ADMISSION_WAIT_MS_STATE_KEY] = lease.wait_ms
+            lease.observe_body(_request_body_observation(scope))
             async def reserve_body_bytes(additional_bytes: int) -> int:
                 nonlocal available_replayed_credit
                 if int(additional_bytes) < 0:
@@ -751,6 +752,7 @@ class RequestAdmissionMiddleware:
         headers = {"x-uni-api-admission-reason": reason}
         if status_code == 503:
             headers["retry-after"] = str(self.retry_after_seconds)
+            headers["x-uni-api-status-origin"] = "ember_local_admission"
         response = JSONResponse(
             status_code=status_code,
             content={

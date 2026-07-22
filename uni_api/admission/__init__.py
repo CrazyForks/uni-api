@@ -20,6 +20,7 @@ from uni_api.admission.observability import (
     Admission503ResponseWriteOutcome,
     LargeBodyAdmissionDecision,
     LargeBodyHolderSnapshot,
+    ResponseBufferEvent,
     RequestBodyObservation,
 )
 
@@ -31,6 +32,7 @@ __all__ = [
     "LargeBodyCapacityExhausted",
     "LargeBodyAdmissionDecision",
     "LargeBodyHolderSnapshot",
+    "ResponseBufferEvent",
     "PendingBodyReservation",
     "RequestAdmissionController",
     "RequestAdmissionLease",

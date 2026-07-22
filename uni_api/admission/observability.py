@@ -96,6 +96,73 @@ class LargeBodyAdmissionDecision:
 
 
 @dataclass(frozen=True, slots=True)
+class ResponseBufferEvent:
+    """One response-buffer admission or ownership lifecycle fact."""
+
+    schema_version: int
+    sequence: int
+    event: str
+    outcome: str
+    admission_branch: str | None
+    occurred_at_unix_ms: int
+    request_self_lease_id: str
+    request_self_request_id: str | None
+    request_self_trace_id: str | None
+    routing_attempt_id: str | None
+    routing_attempt_index: int | None
+    provider: str | None
+    request_model: str | None
+    actual_model: str | None
+    allocation_id: str
+    allocation_kind: str
+    requested_bytes: int
+    allocation_reserved_before_bytes: int
+    allocation_reserved_after_bytes: int
+    allocation_reserve_call_count: int
+    request_response_reserved_before_bytes: int
+    request_response_reserved_projected_bytes: int
+    request_response_reserved_after_bytes: int
+    request_retained_reserved_before_bytes: int
+    request_retained_reserved_projected_bytes: int
+    request_retained_reserved_after_bytes: int
+    runtime_global_response_reserved_before_bytes: int
+    runtime_global_response_reserved_projected_bytes: int
+    runtime_global_response_reserved_after_bytes: int
+    runtime_global_retained_reserved_before_bytes: int
+    runtime_global_retained_reserved_projected_bytes: int
+    runtime_global_retained_reserved_after_bytes: int
+    retained_from_prior_attempts_bytes: int
+    crosses_retry_boundary: bool
+    request_response_limit_bytes: int
+    request_retained_limit_bytes: int
+    runtime_global_hard_budget_bytes: int
+    parent_governor_allowed: bool | None
+    parent_governor_reserved_before_bytes: int | None
+    parent_governor_projected_reserved_bytes: int | None
+    parent_governor_reserved_after_bytes: int | None
+    parent_governor_available_before_bytes: int | None
+    parent_governor_available_after_bytes: int | None
+    cgroup_memory_source: str | None
+    cgroup_memory_current_bytes_sampled: int | None
+    cgroup_memory_limit_bytes_sampled: int | None
+    cgroup_memory_high_bytes_sampled: int | None
+    cgroup_memory_soft_limit_bytes_sampled: int | None
+    cgroup_memory_guard_bytes_sampled: int | None
+    cgroup_memory_capacity_bytes_sampled: int | None
+    cgroup_memory_sample_sequence: int | None
+    cgroup_memory_sample_age_ms_at_decision: int | None
+    cgroup_memory_sample_error: str | None
+    reserve_started_count: int = 0
+    commit_count: int = 0
+    committed_bytes: int = 0
+    rollback_count: int = 0
+    rolled_back_bytes: int = 0
+    release_count: int = 0
+    released_bytes: int = 0
+    rejection_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class Admission503ResponseWriteOutcome:
     """Per-request ASGI write result, distinct from admission's decision."""
 

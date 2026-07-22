@@ -63,6 +63,43 @@ def test_dynamic_parent_budget_uses_limit_current_reservations_and_guard():
     assert snapshot.available_bytes == 200
 
 
+def test_reservation_decision_is_the_atomic_sample_used_for_rejection():
+    clock = [10.0]
+    governor = AdaptiveMemoryGovernor(
+        source=lambda: ProcessMemorySample(
+            current_bytes=700,
+            limit_bytes=1_000,
+            source="fake",
+        ),
+        guard_bytes=100,
+        guard_ratio=0,
+        sample_cache_seconds=60,
+        clock=lambda: clock[0],
+    )
+
+    allowed = governor.reserve_nowait_decision("body", 150)
+    assert allowed.allowed is True
+    assert allowed.reserved_before_bytes == 0
+    assert allowed.projected_reserved_bytes == 150
+    assert allowed.reserved_after_bytes == 150
+    assert allowed.current_bytes == 700
+    assert allowed.soft_limit_bytes == 900
+    assert allowed.available_before_bytes == 200
+    assert allowed.available_after_bytes == 50
+    assert allowed.sample_sequence == 1
+    assert allowed.sample_age_ms == 0
+
+    clock[0] = 10.025
+    rejected = governor.reserve_nowait_decision("buffered_response", 51)
+    assert rejected.allowed is False
+    assert rejected.reserved_before_bytes == 150
+    assert rejected.projected_reserved_bytes == 201
+    assert rejected.reserved_after_bytes == 150
+    assert rejected.available_before_bytes == 50
+    assert rejected.sample_sequence == 1
+    assert rejected.sample_age_ms == 25
+
+
 def test_cached_snapshot_is_io_free_and_reports_sample_sequence_and_age():
     clock = [10.0]
     calls = 0

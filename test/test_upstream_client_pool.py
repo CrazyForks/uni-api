@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from fastapi import HTTPException
 
 from uni_api.admission import (
     RequestAdmissionController,
@@ -18,6 +19,7 @@ from uni_api.upstream.client_pool import (
     UpstreamUnsupportedContentEncoding,
 )
 from uni_api.upstream.responses_errors import responses_failure_error
+from uni_api.observability.upstream_transport import UpstreamTransportDiagnostics
 from upstream import UpstreamAttemptContext, UpstreamRunner
 
 
@@ -807,6 +809,10 @@ def test_local_admission_fails_fast_and_preserves_retry_headers(monkeypatch):
             response.headers["x-uni-api-admission-reason"]
             == "upstream_queue_full"
         )
+        assert (
+            response.headers["x-uni-api-status-origin"]
+            == "ember_local_admission"
+        )
         assert len(failures) == 1
         assert len(attempts) == 1
 
@@ -860,6 +866,41 @@ def test_nonlocal_failures_do_not_gain_admission_headers(monkeypatch):
         assert response.status_code == 500
         assert "retry-after" not in response.headers
         assert "x-uni-api-admission-reason" not in response.headers
+
+    asyncio.run(run())
+
+
+def test_provider_http_503_is_distinct_from_local_admission_503():
+    async def run():
+        class Plan:
+            auto_retry = False
+
+            def record_failure(self, status_code, _error_message):
+                assert status_code == 503
+
+        entry = {}
+        diagnostics = UpstreamTransportDiagnostics(entry)
+        diagnostics.facts["upstream_http_status_code"] = 503
+        attempt = UpstreamAttemptContext(
+            plan=Plan(),
+            provider={"preferences": {}},
+            provider_name="provider-a",
+            original_model="model-a",
+            state={"_transport_diagnostics": diagnostics},
+        )
+        result = await UpstreamRunner(attempt.plan)._handle_failure(
+            attempt,
+            HTTPException(status_code=503, detail="provider unavailable"),
+            build_error_response=lambda status, message: httpx.Response(
+                status,
+                json={"error": message},
+            ),
+            prepare_failure=False,
+        )
+
+        assert result.status_origin == "provider_http"
+        assert result.response.headers["x-uni-api-status-origin"] == "provider_http"
+        assert "x-uni-api-admission-reason" not in result.response.headers
 
     asyncio.run(run())
 
@@ -922,6 +963,10 @@ def test_local_upstream_admission_does_not_cool_or_mark_channel_failure(monkeypa
         assert (
             result.response.headers["x-uni-api-admission-reason"]
             == "upstream_wait_timeout"
+        )
+        assert (
+            result.response.headers["x-uni-api-status-origin"]
+            == "ember_local_admission"
         )
 
     asyncio.run(run())

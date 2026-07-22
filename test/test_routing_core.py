@@ -293,6 +293,34 @@ def test_get_right_order_providers_applies_channel_cooldown_filter():
     asyncio.run(run())
 
 
+def test_get_right_order_providers_applies_route_circuit_to_single_provider():
+    class ChannelManager:
+        cooldown_period = 0
+        has_route_circuit = True
+
+        async def get_available_providers(self, providers):
+            assert len(providers) == 1
+            return []
+
+    config = _routing_config()
+    config["providers"] = config["providers"][:1]
+
+    async def run():
+        with pytest.raises(HTTPException) as exc_info:
+            await get_right_order_providers(
+                "gpt-4.1",
+                config,
+                0,
+                "fixed_priority",
+                ["sk-test"],
+                {"sk-test": ["gpt-4.1"]},
+                channel_manager=ChannelManager(),
+            )
+        assert exc_info.value.status_code == 503
+
+    asyncio.run(run())
+
+
 def test_compute_start_index_implements_fixed_priority_and_round_robin():
     async def run():
         locks = defaultdict(asyncio.Lock)

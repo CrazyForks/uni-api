@@ -143,6 +143,7 @@ from uni_api.observability.telemetry import (
     emit_admission_503_response_write_outcome,
     emit_large_body_admission_decision,
     emit_request_observability,
+    emit_response_buffer_event,
     observability_exporter_snapshot,
 )
 from uni_api.observability.responses_stream import (
@@ -178,6 +179,7 @@ from uni_api.middleware.idempotency import (
     IdempotencyMiddleware,
     build_default_idempotency_coordinator,
 )
+from uni_api.routing.health import ProviderModelCircuitBreaker
 from uni_api.middleware.request_decompression import (
     REQUEST_BODY_CPU_WORKERS,
     REQUEST_BODY_COMPLEXITY_INFO_KEY,
@@ -607,6 +609,8 @@ class RuntimeGauges:
         self._retired_stream_queue_put_timeouts = 0
         self._admission_503_response_write_completed: Counter[str] = Counter()
         self._admission_503_response_write_failed: Counter[str] = Counter()
+        self._response_budget_alert_state = (False, False)
+        self._response_budget_alert_last_logged_at = 0.0
 
     def attach_request_admission(
         self,
@@ -765,6 +769,39 @@ class RuntimeGauges:
         self.open_sockets = open_sockets
         self.tcp_states = tcp_states
 
+    def _observe_response_budget_alerts(self, admission: dict[str, Any]) -> None:
+        headroom_alert = bool(
+            admission.get("response_budget_soft_headroom_alert")
+        )
+        rejection_alert = bool(admission.get("response_rejection_rate_alert"))
+        state = (headroom_alert, rejection_alert)
+        previous = self._response_budget_alert_state
+        now = time()
+        if any(state) and (
+            state != previous
+            or now - self._response_budget_alert_last_logged_at >= 60.0
+        ):
+            logger.warning(
+                "Response admission budget alert headroom_alert=%s "
+                "rejection_rate_alert=%s soft_remaining_bytes=%s "
+                "soft_remaining_ratio=%s rejections_1m=%s branches=%s",
+                headroom_alert,
+                rejection_alert,
+                admission.get("response_budget_soft_remaining_bytes"),
+                admission.get("response_budget_soft_remaining_ratio"),
+                admission.get("response_rejections_1m"),
+                admission.get("response_rejection_decisions_by_branch") or {},
+            )
+            self._response_budget_alert_last_logged_at = now
+        elif any(previous) and not any(state):
+            logger.info(
+                "Response admission budget alert recovered "
+                "soft_remaining_bytes=%s rejections_1m=%s",
+                admission.get("response_budget_soft_remaining_bytes"),
+                admission.get("response_rejections_1m"),
+            )
+        self._response_budget_alert_state = state
+
     def snapshot(self) -> dict[str, Any]:
         admission: dict[str, Any] = {}
         if self._request_admission_snapshot is not None:
@@ -774,6 +811,7 @@ class RuntimeGauges:
         rejected = admission.get("rejected")
         if not isinstance(rejected, dict):
             rejected = {}
+        self._observe_response_budget_alerts(admission)
 
         upstream_admission: dict[str, Any] = {}
         if self._upstream_client_snapshot is not None:
@@ -940,6 +978,45 @@ class RuntimeGauges:
                 admission.get("rejection_decision_total")
                 or sum(int(value or 0) for value in rejected.values())
             ),
+            "runtime_global_response_admission_rejections_by_branch": dict(
+                admission.get("response_rejection_decisions_by_branch") or {}
+            ),
+            "runtime_global_response_admission_rejection_total": admission.get(
+                "response_rejection_decision_total"
+            ),
+            "runtime_global_response_admission_rejections_1m": admission.get(
+                "response_rejections_1m"
+            ),
+            "runtime_global_response_admission_rejection_rate_per_second_1m": admission.get(
+                "response_rejection_rate_per_second_1m"
+            ),
+            "runtime_global_response_budget_soft_remaining_bytes": admission.get(
+                "response_budget_soft_remaining_bytes"
+            ),
+            "runtime_global_response_budget_soft_remaining_ratio": admission.get(
+                "response_budget_soft_remaining_ratio"
+            ),
+            "runtime_global_response_budget_soft_headroom_alert": admission.get(
+                "response_budget_soft_headroom_alert"
+            ),
+            "runtime_global_response_rejection_rate_alert": admission.get(
+                "response_rejection_rate_alert"
+            ),
+            "runtime_global_response_buffer_events_recorded_total": admission.get(
+                "response_buffer_events_recorded_total"
+            ),
+            "runtime_global_response_buffer_event_history_overwritten_total": admission.get(
+                "response_buffer_event_history_overwritten_total"
+            ),
+            "runtime_global_response_buffer_event_record_failures_total": admission.get(
+                "response_buffer_event_record_failures_total"
+            ),
+            "runtime_global_response_buffer_event_observer_errors_total": admission.get(
+                "response_buffer_event_observer_errors_total"
+            ),
+            "runtime_global_response_buffer_event_observer_enqueue_failures_total": admission.get(
+                "response_buffer_event_observer_enqueue_failures_total"
+            ),
             "runtime_global_admission_503_response_write_completed": dict(
                 self._admission_503_response_write_completed
             ),
@@ -991,6 +1068,18 @@ class RuntimeGauges:
             "runtime_global_admission_503_outcome_export_errors_total": observability_exporter.get(
                 "admission_503_outcome_export_errors_total"
             ),
+            "runtime_global_response_buffer_event_export_enqueued_total": observability_exporter.get(
+                "response_buffer_event_enqueued_total"
+            ),
+            "runtime_global_response_buffer_event_export_enqueue_dropped_total": observability_exporter.get(
+                "response_buffer_event_enqueue_dropped_total"
+            ),
+            "runtime_global_response_buffer_event_export_build_errors_total": observability_exporter.get(
+                "response_buffer_event_build_errors_total"
+            ),
+            "runtime_global_response_buffer_event_export_errors_total": observability_exporter.get(
+                "response_buffer_event_export_errors_total"
+            ),
             "middleware_inflight_requests": self.inflight_requests,
             "waiting_first_byte": len(self.waiting_first_byte_requests) + self.waiting_first_byte_untracked,
             "event_loop_lag_ms": self.event_loop_lag_ms,
@@ -1017,6 +1106,12 @@ class RuntimeGauges:
             ),
             "memory_parent_peak_reserved_bytes": getattr(
                 memory_parent, "peak_reserved_bytes", None
+            ),
+            "memory_parent_sample_sequence": getattr(
+                memory_parent, "sample_sequence", None
+            ),
+            "memory_parent_sample_age_ms": getattr(
+                memory_parent, "sample_age_ms", None
             ),
             "memory_parent_reservations": getattr(
                 memory_parent, "reservations", {}
@@ -1318,6 +1413,7 @@ request_admission_controller = RequestAdmissionController(
     large_body_limit=REQUEST_LARGE_BODY_LIMIT,
     memory_governor=process_memory_governor,
     decision_observer=emit_large_body_admission_decision,
+    response_buffer_observer=emit_response_buffer_event,
 )
 idempotency_coordinator = build_default_idempotency_coordinator()
 runtime_gauges.attach_request_admission(request_admission_controller.snapshot)
@@ -2370,28 +2466,70 @@ def _messages_request_last_text(parsed_body: Any) -> Optional[str]:
     return None
 
 class ChannelManager:
-    def __init__(self, cooldown_period=300):
+    def __init__(
+        self,
+        cooldown_period=300,
+        *,
+        route_circuit: ProviderModelCircuitBreaker | None = None,
+    ):
         self._excluded_models = defaultdict(lambda: None)
         self.cooldown_period = cooldown_period
+        self.route_circuit = (
+            route_circuit or ProviderModelCircuitBreaker.from_environment()
+        )
+        self.has_route_circuit = True
 
     async def exclude_model(self, provider: str, model: str):
         model_key = f"{provider}/{model}"
         self._excluded_models[model_key] = datetime.now()
 
-    async def is_model_excluded(self, provider: str, model: str, cooldown_period=0) -> bool:
+    def _is_legacy_model_excluded(
+        self,
+        provider: str,
+        model: str,
+        cooldown_period: int,
+    ) -> bool:
         model_key = f"{provider}/{model}"
-        excluded_time = self._excluded_models[model_key]
+        excluded_time = self._excluded_models.get(model_key)
         if not excluded_time:
             return False
-
         if datetime.now() - excluded_time > timedelta(seconds=cooldown_period):
             del self._excluded_models[model_key]
             return False
         return True
 
+    async def is_model_excluded(self, provider: str, model: str, cooldown_period=0) -> bool:
+        legacy_excluded = self._is_legacy_model_excluded(
+            provider,
+            model,
+            cooldown_period,
+        )
+        return legacy_excluded or self.route_circuit.is_open(provider, model)
+
+    async def record_model_failure(
+        self,
+        provider: str,
+        model: str,
+        status_code: int,
+    ) -> bool:
+        return self.route_circuit.record_failure(provider, model, status_code)
+
+    async def record_model_success(self, provider: str, model: str) -> bool:
+        return self.route_circuit.record_success(provider, model)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "legacy_cooldown_period_seconds": self.cooldown_period,
+            "legacy_excluded_model_count": sum(
+                1 for value in self._excluded_models.values() if value
+            ),
+            "provider_model_circuit": self.route_circuit.snapshot(),
+        }
+
     async def get_available_providers(self, providers: list) -> list:
         """过滤出可用的providers，仅排除不可用的模型"""
         available_providers = []
+        apply_legacy_cooldown = len(providers) > 1
         for provider in providers:
             provider_name = provider['provider']
             model_dict = provider['model'][0]  # 获取唯一的模型字典
@@ -2400,7 +2538,19 @@ class ChannelManager:
             cooldown_period = provider.get('preferences', {}).get('cooldown_period', self.cooldown_period)
 
             # 检查该模型是否被排除
-            if not await self.is_model_excluded(provider_name, target_model, cooldown_period):
+            circuit_open = self.route_circuit.is_open(
+                provider_name,
+                target_model,
+            )
+            legacy_excluded = bool(
+                apply_legacy_cooldown
+                and self._is_legacy_model_excluded(
+                    provider_name,
+                    target_model,
+                    cooldown_period,
+                )
+            )
+            if not circuit_open and not legacy_excluded:
                 available_providers.append(provider)
 
         return available_providers
@@ -2841,6 +2991,7 @@ async def observability_runtime():
     return await observability_runtime_response(
         runtime_gauges,
         getattr(app.state, "client_manager", None),
+        channel_manager=getattr(app.state, "channel_manager", None),
         stream_cleanup_snapshot=background_stream_cleanup_snapshot,
         provider_key_pools_snapshot=lambda: provider_key_pools_snapshot(app),
         idempotency_snapshot=idempotency_coordinator.snapshot,
@@ -3177,6 +3328,7 @@ def _record_local_admission_rejection(
         current_info["admission_reason"] = reason
         current_info["error_type"] = reason
         current_info["success"] = False
+        current_info["status_origin"] = "ember_local_admission"
     return True
 
 
@@ -5796,6 +5948,7 @@ class ResponsesRequestExecution:
         ) as exc:
             self.current_info["status_code"] = 503
             self.current_info["stream_error_status_code"] = 503
+            self.current_info["status_origin"] = "ember_local_admission"
             await finish_retiring_unreturned_queue(first_lease)
             return JSONResponse(
                 status_code=503,
@@ -5806,7 +5959,10 @@ class ResponsesRequestExecution:
                         "code": type(exc).__name__,
                     }
                 },
-                headers={"retry-after": "1"},
+                headers={
+                    "retry-after": "1",
+                    "x-uni-api-status-origin": "ember_local_admission",
+                },
             )
         except BaseException:
             await finish_retiring_unreturned_queue(first_lease)
@@ -6432,6 +6588,39 @@ class ResponsesRequestExecution:
         entry["success"] = bool(success)
         if attempt.state.get("local_admission_rejected"):
             entry["local_admission_rejected"] = True
+        if attempt.state.get("status_origin"):
+            entry["status_origin"] = str(attempt.state["status_origin"])[:64]
+        routing_entry = attempt.state.get("_routing_attempt_entry")
+        if isinstance(routing_entry, dict):
+            for key in (
+                "failure_stage",
+                "protocol_error_reason",
+                "exception_type",
+                "exception_module",
+                "exception_repr",
+                "exception_chain_json",
+                "httpcore_exception_type",
+                "httpcore_exception_module",
+                "httpcore_exception_repr",
+                "httpcore_exception_chain_json",
+                "upstream_http_status_code",
+                "http_version",
+                "alpn_protocol",
+                "http2_stream_id",
+                "connection_request_count",
+                "http2_concurrent_streams",
+                "http2_max_concurrent_streams",
+                "connection_local_state",
+                "http2_local_connection_state",
+                "http2_local_stream_state",
+                "goaway_error_code",
+                "goaway_error_code_name",
+                "goaway_last_stream_id",
+                "connection_snapshot_json",
+                "httpcore_events_json",
+            ):
+                if key in routing_entry:
+                    entry[key] = routing_entry[key]
         if error_type:
             entry["error_type"] = str(error_type)[:80]
         trace = _coerce_request_trace(self.current_info)

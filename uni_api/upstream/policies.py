@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import HTTPException
 
+from uni_api.observability.exceptions import exception_diagnostics
 from uni_api.upstream.responses_errors import ResponsesSemanticError
 
 
@@ -98,9 +99,11 @@ class ProviderErrorClassifier:
         if isinstance(exc, httpx.ReadError):
             return 502, "Network read error"
         if isinstance(exc, httpx.RemoteProtocolError):
-            return 502, "Remote protocol error"
+            reason = exception_diagnostics(exc)["protocol_error_reason"]
+            return 502, f"Remote protocol error: {reason}"
         if isinstance(exc, httpx.LocalProtocolError):
-            return 502, "Local protocol error"
+            reason = exception_diagnostics(exc)["protocol_error_reason"]
+            return 502, f"Local protocol error: {reason}"
         if isinstance(exc, HTTPException):
             return exc.status_code, str(exc.detail)
         return 500, str(exc) or f"Unknown error: {exc.__class__.__name__}"

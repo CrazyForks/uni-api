@@ -12,7 +12,14 @@ import httpx
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 
+from core.log_config import logger
 from core.utils import get_engine, provider_api_circular_list, safe_get
+from uni_api.admission import get_request_admission_lease
+from uni_api.observability.upstream_transport import (
+    UpstreamTransportDiagnostics,
+    bind_upstream_transport_diagnostics,
+    reset_upstream_transport_diagnostics,
+)
 from uni_api.routing.core import RoutingPlan, select_provider_api_key_raw
 from uni_api.upstream.policies import CooldownPolicy, ProviderErrorClassifier, RetryPolicy
 
@@ -205,20 +212,68 @@ def rollback_failed_rate_limit_record(
 async def maybe_exclude_failed_channel(
     plan: RoutingPlan,
     provider_name: str,
+    actual_model: str,
+    status_code: int,
     error_message: str,
     *,
     exclude_error_substrings: Optional[list[str]] = None,
     debug: bool = False,
-) -> None:
+) -> str | None:
     channel_manager = getattr(plan.app.state, "channel_manager", None)
     exclude_error_substrings = exclude_error_substrings or []
-    if not channel_manager or channel_manager.cooldown_period <= 0 or plan.num_matching_providers <= 1:
-        return
-    if any(error in error_message for error in exclude_error_substrings):
-        return
+    if not channel_manager:
+        return None
+    excluded_from_legacy_cooldown = any(
+        error in error_message for error in exclude_error_substrings
+    )
 
-    await channel_manager.exclude_model(provider_name, plan.request_model_name)
+    if status_code in (403, 404):
+        record_failure = getattr(channel_manager, "record_model_failure", None)
+        if callable(record_failure):
+            opened = bool(
+                await _maybe_await(
+                    record_failure(provider_name, actual_model, status_code)
+                )
+            )
+            if opened:
+                logger.warning(
+                    "Provider-model route circuit opened provider=%s model=%s "
+                    "status_code=%s",
+                    _observable_provider_name(provider_name),
+                    str(actual_model or "")[:256],
+                    status_code,
+                )
+                try:
+                    await plan.refresh_matching_providers(debug=debug)
+                except HTTPException as refresh_exc:
+                    if refresh_exc.status_code != 503:
+                        raise
+                    return "opened_no_alternative"
+                return "opened"
+
+    if excluded_from_legacy_cooldown:
+        return None
+    if (
+        getattr(channel_manager, "cooldown_period", 0) <= 0
+        or plan.num_matching_providers <= 1
+    ):
+        return None
+    await channel_manager.exclude_model(provider_name, actual_model)
     await plan.refresh_matching_providers(debug=debug)
+    return None
+
+
+async def maybe_reset_provider_model_circuit(
+    plan: RoutingPlan,
+    provider_name: str,
+    actual_model: str,
+) -> None:
+    app = getattr(plan, "app", None)
+    state = getattr(app, "state", None)
+    channel_manager = getattr(state, "channel_manager", None)
+    record_success = getattr(channel_manager, "record_model_success", None)
+    if callable(record_success):
+        await _maybe_await(record_success(provider_name, actual_model))
 
 
 async def maybe_clear_provider_auth_cache(
@@ -276,6 +331,7 @@ class UpstreamAttemptResult:
     finalize: bool = False
     local_admission_reason: Optional[str] = None
     local_admission_retry_after: Optional[int] = None
+    status_origin: Optional[str] = None
 
 
 def finalize_routing_attempt_entry(
@@ -371,7 +427,29 @@ class UpstreamRunner:
         attempt: UpstreamAttemptContext,
     ) -> Optional[dict[str, Any]]:
         info = self.observability_context
+        response_memory_lease = get_request_admission_lease()
+        attempt.state["_response_memory_lease"] = response_memory_lease
         if info is None:
+            transport_entry: dict[str, Any] = {}
+            transport_diagnostics = UpstreamTransportDiagnostics(transport_entry)
+            attempt.state["_transport_diagnostics"] = transport_diagnostics
+            attempt.state["_transport_context_token"] = (
+                bind_upstream_transport_diagnostics(transport_diagnostics)
+            )
+            attempt.state["transport_diagnostics"] = transport_entry[
+                "transport_diagnostics"
+            ]
+            if response_memory_lease is not None:
+                response_memory_lease.begin_response_attempt(
+                    None,
+                    routing_attempt_id=attempt.routing_attempt_id,
+                    routing_attempt_index=None,
+                    provider=_observable_provider_name(attempt.provider_name),
+                    request_model=str(
+                        getattr(self.plan, "request_model_name", "") or ""
+                    ),
+                    actual_model=attempt.original_model,
+                )
             return None
 
         attempt_index = max(0, int(info.get("attempt_count") or 0)) + 1
@@ -410,7 +488,39 @@ class UpstreamRunner:
                 int(info.get("routing_attempts_omitted_count") or 0),
             ) + 1
         attempt.state["_routing_attempt_entry"] = entry
+        transport_diagnostics = UpstreamTransportDiagnostics(entry)
+        attempt.state["_transport_diagnostics"] = transport_diagnostics
+        attempt.state["_transport_context_token"] = (
+            bind_upstream_transport_diagnostics(transport_diagnostics)
+        )
+        if response_memory_lease is not None:
+            response_memory_lease.begin_response_attempt(
+                entry,
+                routing_attempt_id=attempt.routing_attempt_id,
+                routing_attempt_index=attempt_index,
+                provider=_observable_provider_name(attempt.provider_name),
+                request_model=str(
+                    getattr(self.plan, "request_model_name", "") or ""
+                ),
+                actual_model=attempt.original_model,
+            )
         return entry
+
+    @staticmethod
+    def _finish_transport_diagnostics(
+        attempt: UpstreamAttemptContext,
+        *,
+        outcome: str,
+    ) -> None:
+        diagnostics = attempt.state.get("_transport_diagnostics")
+        if isinstance(diagnostics, UpstreamTransportDiagnostics):
+            diagnostics.finalize(outcome)
+        token = attempt.state.pop("_transport_context_token", None)
+        if token is not None:
+            try:
+                reset_upstream_transport_diagnostics(token)
+            except (LookupError, RuntimeError, ValueError):
+                pass
 
     def _record_retry_transition(
         self,
@@ -437,6 +547,7 @@ class UpstreamRunner:
         error_message: Any,
         retry_decision: bool,
         local_admission_rejection: bool,
+        status_origin: str,
     ) -> None:
         attempt.state["_routing_failure"] = {
             "wire_status_code": (
@@ -462,6 +573,13 @@ class UpstreamRunner:
                 f"http_{int(status_code)}:{type(exc).__name__}"
             )[:128],
             "local_admission_rejected": bool(local_admission_rejection),
+            "status_origin": str(status_origin)[:64],
+            "provider_model_circuit_opened": bool(
+                attempt.state.get("provider_model_circuit_opened")
+            ),
+            "provider_model_circuit_blocks_retry": bool(
+                attempt.state.get("provider_model_circuit_blocks_retry")
+            ),
         }
         if retry_decision and self.observability_context is not None:
             info = self.observability_context
@@ -477,6 +595,13 @@ class UpstreamRunner:
     ) -> Optional[dict[str, Any]]:
         entry = attempt.state.get("_routing_attempt_entry")
         if not isinstance(entry, dict):
+            lease = attempt.state.get("_response_memory_lease")
+            if lease is not None:
+                lease.finish_response_attempt(outcome="finished")
+            UpstreamRunner._finish_transport_diagnostics(
+                attempt,
+                outcome="finished",
+            )
             return None
 
         started_monotonic = entry.get("_started_monotonic")
@@ -496,6 +621,13 @@ class UpstreamRunner:
                 else "failed"
             )
             entry.pop("_started_monotonic", None)
+            lease = attempt.state.get("_response_memory_lease")
+            if lease is not None:
+                lease.finish_response_attempt(outcome=str(entry["outcome"]))
+            UpstreamRunner._finish_transport_diagnostics(
+                attempt,
+                outcome=str(entry["outcome"]),
+            )
             return entry
 
         response = result.response
@@ -504,6 +636,16 @@ class UpstreamRunner:
             entry["wire_status_code"] = int(response_status)
         if response is not None and hasattr(response, "body_iterator"):
             entry["outcome"] = "stream_pending"
+            lease = attempt.state.get("_response_memory_lease")
+            if lease is not None:
+                lease.finish_response_attempt(
+                    outcome="stream_pending",
+                    keep_active=True,
+                )
+            UpstreamRunner._finish_transport_diagnostics(
+                attempt,
+                outcome="stream_pending",
+            )
             return entry
 
         success = bool(
@@ -514,6 +656,13 @@ class UpstreamRunner:
         entry["success"] = success
         entry["outcome"] = "succeeded" if success else "finished"
         entry.pop("_started_monotonic", None)
+        lease = attempt.state.get("_response_memory_lease")
+        if lease is not None:
+            lease.finish_response_attempt(outcome=str(entry["outcome"]))
+        UpstreamRunner._finish_transport_diagnostics(
+            attempt,
+            outcome=str(entry["outcome"]),
+        )
         return entry
 
     def _runtime_api_list(self) -> list[str]:
@@ -558,6 +707,7 @@ class UpstreamRunner:
     ) -> Any:
         final_local_admission_reason: Optional[str] = None
         final_local_admission_retry_after: Optional[int] = None
+        final_status_origin: Optional[str] = None
         pending_retry_entry: Optional[dict[str, Any]] = None
         attempts_started = 0
         while True:
@@ -600,16 +750,32 @@ class UpstreamRunner:
                 on_cooldown=on_cooldown,
             )
             completed_entry = self._finish_routing_attempt(attempt, result)
+            response_status = getattr(result.response, "status_code", None)
+            if isinstance(response_status, int) and response_status < 400:
+                await maybe_reset_provider_model_circuit(
+                    self.plan,
+                    attempt.provider_name,
+                    attempt.original_model,
+                )
             final_local_admission_reason = result.local_admission_reason
             final_local_admission_retry_after = (
                 result.local_admission_retry_after
             )
+            final_status_origin = result.status_origin
             if result.should_retry:
                 pending_retry_entry = completed_entry
                 continue
             if result.finalize:
                 break
             if result.response is not None:
+                self._apply_status_origin_header(
+                    result.response,
+                    status_origin=result.status_origin,
+                )
+                if self.observability_context is not None:
+                    self.observability_context["status_origin"] = (
+                        result.status_origin
+                    )
                 return result.response
 
         if build_final_response is not None:
@@ -624,6 +790,12 @@ class UpstreamRunner:
             reason=final_local_admission_reason,
             retry_after_seconds=final_local_admission_retry_after,
         )
+        self._apply_status_origin_header(
+            response,
+            status_origin=final_status_origin,
+        )
+        if self.observability_context is not None:
+            self.observability_context["status_origin"] = final_status_origin
         return response
 
     async def _run_attempt(
@@ -701,10 +873,43 @@ class UpstreamRunner:
     ) -> UpstreamAttemptResult:
         status_code, error_message = normalize_provider_exception(exc)
         status_code = remap_status_code_from_error(status_code, error_message)
-        self.plan.record_failure(status_code, error_message)
         local_admission_rejection = bool(
             getattr(exc, "local_admission_rejection", False)
         )
+        diagnostics = attempt.state.get("_transport_diagnostics")
+        observed_wire_status = (
+            diagnostics.facts.get("upstream_http_status_code")
+            if isinstance(diagnostics, UpstreamTransportDiagnostics)
+            else None
+        )
+        if local_admission_rejection:
+            status_origin = "ember_local_admission"
+        elif observed_wire_status == status_code:
+            status_origin = "provider_http"
+        elif bool(getattr(exc, "upstream_semantic_error", False)):
+            status_origin = "provider_semantic"
+        elif isinstance(exc, UPSTREAM_NETWORK_ERRORS):
+            status_origin = "upstream_transport"
+        else:
+            status_origin = "ember_upstream_processing"
+        attempt.state["status_origin"] = status_origin
+        if isinstance(diagnostics, UpstreamTransportDiagnostics):
+            protocol_reason = str(
+                diagnostics.facts.get("protocol_error_reason") or ""
+            )
+            if (
+                isinstance(
+                    exc,
+                    (httpx.LocalProtocolError, httpx.RemoteProtocolError),
+                )
+                and protocol_reason
+                and protocol_reason != "NOT_PROTOCOL_ERROR"
+            ):
+                prefix = (
+                    "Local" if isinstance(exc, httpx.LocalProtocolError) else "Remote"
+                )
+                error_message = f"{prefix} protocol error: {protocol_reason}"
+        self.plan.record_failure(status_code, error_message)
         local_admission_reason = (
             str(getattr(exc, "reason", "") or "upstream_overload")
             if local_admission_rejection
@@ -738,12 +943,20 @@ class UpstreamRunner:
             and not local_admission_rejection
             and not request_scoped_failure
         ):
-            await maybe_exclude_failed_channel(
+            circuit_result = await maybe_exclude_failed_channel(
                 self.plan,
                 attempt.provider_name,
+                attempt.original_model,
+                status_code,
                 error_message,
                 exclude_error_substrings=exclude_error_substrings,
                 debug=self.debug,
+            )
+            attempt.state["provider_model_circuit_opened"] = bool(
+                circuit_result
+            )
+            attempt.state["provider_model_circuit_blocks_retry"] = (
+                circuit_result == "opened_no_alternative"
             )
 
         force_cool_key = _is_codex_chatgpt_model_unsupported_error(
@@ -828,6 +1041,7 @@ class UpstreamRunner:
                 error_message=error_message,
                 retry_decision=retry_decision,
                 local_admission_rejection=local_admission_rejection,
+                status_origin=status_origin,
             )
             if retry_decision:
                 if on_retry is not None:
@@ -836,16 +1050,19 @@ class UpstreamRunner:
                     should_retry=True,
                     local_admission_reason=local_admission_reason,
                     local_admission_retry_after=local_admission_retry_after,
+                    status_origin=status_origin,
                 )
             return UpstreamAttemptResult(
                 finalize=True,
                 local_admission_reason=local_admission_reason,
                 local_admission_retry_after=local_admission_retry_after,
+                status_origin=status_origin,
             )
 
         retry_decision = bool(
             not local_admission_rejection
             and not semantic_request_failure
+            and not attempt.state.get("provider_model_circuit_blocks_retry")
             and should_retry_provider(
                 self.plan.auto_retry,
                 status_code,
@@ -874,6 +1091,7 @@ class UpstreamRunner:
             error_message=error_message,
             retry_decision=retry_decision,
             local_admission_rejection=local_admission_rejection,
+            status_origin=status_origin,
         )
         if retry_decision:
             if on_retry is not None:
@@ -882,6 +1100,7 @@ class UpstreamRunner:
                 should_retry=True,
                 local_admission_reason=local_admission_reason,
                 local_admission_retry_after=local_admission_retry_after,
+                status_origin=status_origin,
             )
 
         if build_error_response is not None:
@@ -896,10 +1115,15 @@ class UpstreamRunner:
             reason=local_admission_reason,
             retry_after_seconds=local_admission_retry_after,
         )
+        self._apply_status_origin_header(
+            response,
+            status_origin=status_origin,
+        )
         return UpstreamAttemptResult(
             response=response,
             local_admission_reason=local_admission_reason,
             local_admission_retry_after=local_admission_retry_after,
+            status_origin=status_origin,
         )
 
     @staticmethod
@@ -915,3 +1139,13 @@ class UpstreamRunner:
             max(1, int(retry_after_seconds or 1))
         )
         response.headers["x-uni-api-admission-reason"] = reason
+
+    @staticmethod
+    def _apply_status_origin_header(
+        response: Any,
+        *,
+        status_origin: Optional[str],
+    ) -> None:
+        if not status_origin or not hasattr(response, "headers"):
+            return
+        response.headers["x-uni-api-status-origin"] = str(status_origin)[:64]

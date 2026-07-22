@@ -36,6 +36,10 @@ from uni_api.observability.responses_stream import (
     observe_client_pool_shutdown_connection,
     observe_client_pool_shutdown_completed,
 )
+from uni_api.observability.upstream_transport import (
+    current_upstream_transport_diagnostics,
+    inject_transport_trace,
+)
 from uni_api.streaming.cleanup import (
     await_isolated_transport_cleanup_safely,
     await_stream_cleanup_safely,
@@ -266,20 +270,34 @@ class _ManagedStreamContext:
             raise RuntimeError("upstream stream context cannot be entered twice")
         lease = await self._client._acquire()
         self._lease = lease
-        raw_context = self._client._client.stream(
-            *self._args,
-            **_force_identity_accept_encoding(self._kwargs),
+        diagnostics = current_upstream_transport_diagnostics()
+        if diagnostics is not None:
+            diagnostics.bind_client(self._client._client)
+        request_kwargs = inject_transport_trace(
+            _force_identity_accept_encoding(self._kwargs),
+            diagnostics,
         )
+        raw_context = self._client._client.stream(*self._args, **request_kwargs)
         self._raw_context = raw_context
         response: httpx.Response | None = None
         try:
             response = await raw_context.__aenter__()
+            if diagnostics is not None:
+                diagnostics.capture_response(
+                    response,
+                    client=self._client._client,
+                )
             self._binding = _ResponseLeaseBinding(response, lease)
             _validate_stream_content_encoding(response)
             if response.is_closed:
                 await response.aclose()
             return response
-        except BaseException:
+        except BaseException as exc:
+            if diagnostics is not None:
+                diagnostics.observe_exception(
+                    exc,
+                    client=self._client._client,
+                )
             try:
                 if response is not None:
                     transport_isolated = await (
@@ -364,14 +382,26 @@ class _ManagedAsyncClient:
         reservation_multiplier: int | None = None,
         **kwargs: Any,
     ) -> httpx.Response:
-        request_kwargs = _force_identity_accept_encoding(kwargs)
+        diagnostics = current_upstream_transport_diagnostics()
+        if diagnostics is not None:
+            diagnostics.bind_client(self._client)
+        request_kwargs = inject_transport_trace(
+            _force_identity_accept_encoding(kwargs),
+            diagnostics,
+        )
         lease = await self._acquire()
         try:
             async with self._client.stream(method, url, **request_kwargs) as response:
+                if diagnostics is not None:
+                    diagnostics.capture_response(response, client=self._client)
                 return await self._buffer_bounded_response(
                     response,
                     reservation_multiplier=reservation_multiplier,
                 )
+        except BaseException as exc:
+            if diagnostics is not None:
+                diagnostics.observe_exception(exc, client=self._client)
+            raise
         finally:
             await lease.release()
 
@@ -558,16 +588,36 @@ class _ManagedAsyncClient:
         **kwargs: Any,
     ) -> httpx.Response:
         request.headers["Accept-Encoding"] = "identity"
+        diagnostics = current_upstream_transport_diagnostics()
+        if diagnostics is not None:
+            diagnostics.bind_client(self._client)
+        combined = inject_transport_trace(
+            {"extensions": request.extensions},
+            diagnostics,
+        )
+        request.extensions = combined.get("extensions", request.extensions)
         lease = await self._acquire()
         try:
             response = await self._client.send(request, stream=True, **kwargs)
-        except BaseException:
+            if diagnostics is not None:
+                diagnostics.capture_response(response, client=self._client)
+        except BaseException as exc:
+            if diagnostics is not None:
+                diagnostics.observe_exception(exc, client=self._client)
             await lease.release()
             raise
 
         if not stream:
             try:
-                return await self._buffer_bounded_response(response)
+                try:
+                    return await self._buffer_bounded_response(response)
+                except BaseException as exc:
+                    if diagnostics is not None:
+                        diagnostics.observe_exception(
+                            exc,
+                            client=self._client,
+                        )
+                    raise
             finally:
                 try:
                     await response.aclose()

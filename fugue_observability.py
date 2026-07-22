@@ -80,6 +80,11 @@ class _DeferredAdmission503ResponseWriteOutcome:
     outcome: Any
 
 
+@dataclass(frozen=True)
+class _DeferredResponseBufferEvent:
+    event: Any
+
+
 class FugueObservabilityClient:
     def __init__(self, config: FugueObservabilityConfig) -> None:
         self.config = config
@@ -87,6 +92,7 @@ class FugueObservabilityClient:
             tuple[str, dict[str, Any]]
             | _DeferredLargeBodyAdmissionDecision
             | _DeferredAdmission503ResponseWriteOutcome
+            | _DeferredResponseBufferEvent
         ] | None = None
         self._tasks: list[asyncio.Task[None]] = []
         self._client: httpx.AsyncClient | None = None
@@ -100,6 +106,10 @@ class FugueObservabilityClient:
         self._admission_503_outcome_enqueue_dropped = 0
         self._admission_503_outcome_build_errors = 0
         self._admission_503_outcome_export_errors = 0
+        self._response_buffer_event_enqueued = 0
+        self._response_buffer_event_enqueue_dropped = 0
+        self._response_buffer_event_build_errors = 0
+        self._response_buffer_event_export_errors = 0
 
     async def start(self) -> None:
         if not self.config.enabled or self._tasks:
@@ -201,6 +211,19 @@ class FugueObservabilityClient:
             self._admission_503_outcome_enqueue_dropped += 1
         return accepted
 
+    def emit_response_buffer_event(self, event: Any) -> bool | None:
+        if not self.config.enabled:
+            return None
+        accepted = self._enqueue(
+            _DeferredResponseBufferEvent(event),
+            event_count=1,
+        )
+        if accepted:
+            self._response_buffer_event_enqueued += 1
+        else:
+            self._response_buffer_event_enqueue_dropped += 1
+        return accepted
+
     def _emit_events(
         self,
         path: str,
@@ -235,6 +258,10 @@ class FugueObservabilityClient:
                 item,
                 _DeferredAdmission503ResponseWriteOutcome,
             )
+            response_buffer_event = isinstance(
+                item,
+                _DeferredResponseBufferEvent,
+            )
             build_failed = False
             try:
                 if large_body_decision:
@@ -265,6 +292,20 @@ class FugueObservabilityClient:
                         self._admission_503_outcome_build_errors += 1
                         raise
                     path, payload = _LOG_ENDPOINT, {"events": [event]}
+                elif response_buffer_event:
+                    try:
+                        event = build_uni_api_ember_response_buffer_event(
+                            service_name=self.config.service_name,
+                            service_version=self.config.service_version,
+                            identity_attrs=self.config.identity_attrs,
+                            response_event=item.event,
+                        )
+                    except Exception:
+                        build_failed = True
+                        self._export_errors += 1
+                        self._response_buffer_event_build_errors += 1
+                        raise
+                    path, payload = _LOG_ENDPOINT, {"events": [event]}
                 else:
                     path, payload = item
                 await self._post_json(path, payload)
@@ -277,6 +318,8 @@ class FugueObservabilityClient:
                     self._large_body_decision_export_errors += 1
                 if write_outcome and not build_failed:
                     self._admission_503_outcome_export_errors += 1
+                if response_buffer_event and not build_failed:
+                    self._response_buffer_event_export_errors += 1
                 if self._export_errors == 1 or self._export_errors % 100 == 0:
                     logger.warning("Fugue observability export failed: %s", type(exc).__name__)
             finally:
@@ -319,6 +362,18 @@ class FugueObservabilityClient:
             ),
             "admission_503_outcome_export_errors_total": (
                 self._admission_503_outcome_export_errors
+            ),
+            "response_buffer_event_enqueued_total": (
+                self._response_buffer_event_enqueued
+            ),
+            "response_buffer_event_enqueue_dropped_total": (
+                self._response_buffer_event_enqueue_dropped
+            ),
+            "response_buffer_event_build_errors_total": (
+                self._response_buffer_event_build_errors
+            ),
+            "response_buffer_event_export_errors_total": (
+                self._response_buffer_event_export_errors
             ),
         }
 
@@ -401,9 +456,67 @@ def emit_uni_api_ember_admission_503_response_write_outcome(
         return False
 
 
+def emit_uni_api_ember_response_buffer_event(event: Any) -> bool | None:
+    client = _client
+    if client is None:
+        return None
+    try:
+        return client.emit_response_buffer_event(event)
+    except Exception:
+        logger.exception("Failed to enqueue Fugue response buffer event")
+        return False
+
+
 def fugue_observability_delivery_snapshot() -> dict[str, int]:
     client = _client
     return client.delivery_snapshot() if client is not None else {}
+
+
+def build_uni_api_ember_response_buffer_event(
+    *,
+    service_name: str,
+    service_version: str | None,
+    identity_attrs: dict[str, str] | None,
+    response_event: Any,
+) -> dict[str, Any]:
+    raw = asdict(response_event)
+    occurred_at_ms = _safe_int(raw.get("occurred_at_unix_ms"), 0)
+    observed_at = datetime.fromtimestamp(
+        max(0, occurred_at_ms) / 1000.0,
+        tz=timezone.utc,
+    )
+    rejected = raw.get("event") == "reject"
+    attributes = _drop_empty(
+        {
+            **(identity_attrs or {}),
+            **raw,
+            "component": service_name,
+            "service_version": service_version,
+            "event_type": "response_buffer_lifecycle",
+            "fugue_table": "app_events",
+            "severity": "warning" if rejected else "info",
+        }
+    )
+    summary_json = json.dumps(raw, separators=(",", ":"), sort_keys=True)
+    return {
+        "timestamp": _iso_timestamp(observed_at),
+        "kind": "log",
+        "level": attributes["severity"],
+        "service": service_name,
+        "source": service_name,
+        "event": "response_buffer_lifecycle",
+        "event_type": "response_buffer_lifecycle",
+        "message": (
+            f"response buffer {raw.get('event', 'event')} "
+            f"{raw.get('outcome', '')}"
+        ).strip(),
+        "app_id": _safe_text((identity_attrs or {}).get("app_id")),
+        "trace_id": _safe_text(raw.get("request_self_trace_id")),
+        "request_id": _safe_text(raw.get("request_self_request_id")),
+        "attributes": attributes,
+        "summary": raw,
+        "summary_json": summary_json,
+    }
 
 
 def build_uni_api_ember_admission_503_response_write_event(
@@ -623,6 +736,10 @@ def build_uni_api_ember_request_telemetry(
                     "ttft_ms": _int_text(ttft_ms),
                     "upstream_ms": _int_text(_stage_delta_ms(spans, "upstream_headers_received", "upstream_send_start")),
                     "status_class": _status_class(status_code),
+                    "status_origin": _safe_text(
+                        current_info.get("status_origin"),
+                        max_len=64,
+                    ),
                     "request_kind": _safe_text(current_info.get("request_kind")),
                     "stream_outcome": stream_outcome,
                     "stream_error_status_code": _optional_int_text(
@@ -695,6 +812,10 @@ def build_uni_api_ember_request_telemetry(
                     "message_roles": _safe_text(current_info.get("message_roles")),
                     "role_counts": _safe_text(current_info.get("role_counts")),
                     "attempt_count": _int_text(attempt_count),
+                    "status_origin": _safe_text(
+                        current_info.get("status_origin"),
+                        max_len=64,
+                    ),
                     "retry_decision_count": _int_text(retry_decision_count),
                     "retry_transition_count": _int_text(
                         retry_transition_count
@@ -1247,6 +1368,38 @@ def build_uni_api_ember_request_telemetry(
                 runtime_metrics,
                 "runtime_global_admission_503_outcome_export_errors_total",
             ),
+            "uniapi_ember_runtime_global_response_buffer_events_recorded_total": _runtime_int(
+                runtime_metrics,
+                "runtime_global_response_buffer_events_recorded_total",
+            ),
+            "uniapi_ember_runtime_global_response_buffer_event_record_failures_total": _runtime_int(
+                runtime_metrics,
+                "runtime_global_response_buffer_event_record_failures_total",
+            ),
+            "uniapi_ember_runtime_global_response_buffer_event_observer_errors_total": _runtime_int(
+                runtime_metrics,
+                "runtime_global_response_buffer_event_observer_errors_total",
+            ),
+            "uniapi_ember_runtime_global_response_buffer_event_observer_enqueue_failures_total": _runtime_int(
+                runtime_metrics,
+                "runtime_global_response_buffer_event_observer_enqueue_failures_total",
+            ),
+            "uniapi_ember_runtime_global_response_buffer_event_export_enqueued_total": _runtime_int(
+                runtime_metrics,
+                "runtime_global_response_buffer_event_export_enqueued_total",
+            ),
+            "uniapi_ember_runtime_global_response_buffer_event_export_enqueue_dropped_total": _runtime_int(
+                runtime_metrics,
+                "runtime_global_response_buffer_event_export_enqueue_dropped_total",
+            ),
+            "uniapi_ember_runtime_global_response_buffer_event_export_build_errors_total": _runtime_int(
+                runtime_metrics,
+                "runtime_global_response_buffer_event_export_build_errors_total",
+            ),
+            "uniapi_ember_runtime_global_response_buffer_event_export_errors_total": _runtime_int(
+                runtime_metrics,
+                "runtime_global_response_buffer_event_export_errors_total",
+            ),
             "uniapi_ember_stream_failures_total": 1
             if _is_stream_failure(current_info)
             else 0,
@@ -1254,6 +1407,14 @@ def build_uni_api_ember_request_telemetry(
             if _safe_bool(current_info.get("downstream_disconnected"))
             else 0,
         },
+    )
+    metrics.extend(
+        _response_admission_metric_events(
+            service_name=service_name,
+            identity_attrs=identity_attrs,
+            timestamp=now,
+            runtime_metrics=runtime_metrics,
+        )
     )
     return {"logs": logs, "traces": traces, "metrics": metrics}
 
@@ -1430,6 +1591,146 @@ def _routing_attempt_log_events(
                         )
                         if "local_admission_rejected" in raw_attempt
                         else None,
+                        "status_origin": _safe_text(
+                            raw_attempt.get("status_origin"),
+                            max_len=64,
+                        ),
+                        "provider_model_circuit_opened": _bool_text(
+                            _safe_bool(
+                                raw_attempt.get(
+                                    "provider_model_circuit_opened"
+                                )
+                            )
+                        )
+                        if "provider_model_circuit_opened" in raw_attempt
+                        else None,
+                        "provider_model_circuit_blocks_retry": _bool_text(
+                            _safe_bool(
+                                raw_attempt.get(
+                                    "provider_model_circuit_blocks_retry"
+                                )
+                            )
+                        )
+                        if "provider_model_circuit_blocks_retry" in raw_attempt
+                        else None,
+                        "failure_stage": _safe_text(
+                            raw_attempt.get("failure_stage"),
+                            max_len=64,
+                        ),
+                        "protocol_error_reason": _safe_text(
+                            raw_attempt.get("protocol_error_reason"),
+                            max_len=128,
+                        ),
+                        "exception_type": _safe_text(
+                            raw_attempt.get("exception_type"),
+                            max_len=128,
+                        ),
+                        "exception_module": _safe_text(
+                            raw_attempt.get("exception_module"),
+                            max_len=256,
+                        ),
+                        "exception_repr": _safe_text(
+                            raw_attempt.get("exception_repr"),
+                            max_len=768,
+                        ),
+                        "exception_chain_json": _safe_text(
+                            raw_attempt.get("exception_chain_json"),
+                            max_len=4096,
+                        ),
+                        "httpcore_exception_type": _safe_text(
+                            raw_attempt.get("httpcore_exception_type"),
+                            max_len=128,
+                        ),
+                        "httpcore_exception_module": _safe_text(
+                            raw_attempt.get("httpcore_exception_module"),
+                            max_len=256,
+                        ),
+                        "httpcore_exception_repr": _safe_text(
+                            raw_attempt.get("httpcore_exception_repr"),
+                            max_len=768,
+                        ),
+                        "httpcore_exception_chain_json": _safe_text(
+                            raw_attempt.get("httpcore_exception_chain_json"),
+                            max_len=4096,
+                        ),
+                        "http_version": _safe_text(
+                            raw_attempt.get("http_version"),
+                            max_len=32,
+                        ),
+                        "upstream_http_status_code": _optional_int_text(
+                            raw_attempt.get("upstream_http_status_code")
+                        ),
+                        "alpn_protocol": _safe_text(
+                            raw_attempt.get("alpn_protocol"),
+                            max_len=32,
+                        ),
+                        "http2_stream_id": _optional_int_text(
+                            raw_attempt.get("http2_stream_id")
+                        ),
+                        "connection_request_count": _optional_int_text(
+                            raw_attempt.get("connection_request_count")
+                        ),
+                        "http2_concurrent_streams": _optional_int_text(
+                            raw_attempt.get("http2_concurrent_streams")
+                        ),
+                        "http2_max_concurrent_streams": _optional_int_text(
+                            raw_attempt.get("http2_max_concurrent_streams")
+                        ),
+                        "connection_local_state": _safe_text(
+                            raw_attempt.get("connection_local_state"),
+                            max_len=64,
+                        ),
+                        "http2_local_connection_state": _safe_text(
+                            raw_attempt.get("http2_local_connection_state"),
+                            max_len=64,
+                        ),
+                        "http2_local_stream_state": _safe_text(
+                            raw_attempt.get("http2_local_stream_state"),
+                            max_len=64,
+                        ),
+                        "goaway_error_code": _optional_int_text(
+                            raw_attempt.get("goaway_error_code")
+                        ),
+                        "goaway_error_code_name": _safe_text(
+                            raw_attempt.get("goaway_error_code_name"),
+                            max_len=128,
+                        ),
+                        "goaway_last_stream_id": _optional_int_text(
+                            raw_attempt.get("goaway_last_stream_id")
+                        ),
+                        "connection_snapshot_json": _safe_text(
+                            raw_attempt.get("connection_snapshot_json"),
+                            max_len=4096,
+                        ),
+                        "httpcore_events_json": _safe_text(
+                            raw_attempt.get("httpcore_events_json"),
+                            max_len=8192,
+                        ),
+                        "response_buffer_reserved_before_bytes": _optional_int_text(
+                            raw_attempt.get(
+                                "response_buffer_reserved_before_bytes"
+                            )
+                        ),
+                        "response_buffer_reserved_after_bytes": _optional_int_text(
+                            raw_attempt.get(
+                                "response_buffer_reserved_after_bytes"
+                            )
+                        ),
+                        "response_buffer_retained_from_prior_attempts_bytes": _optional_int_text(
+                            raw_attempt.get(
+                                "response_buffer_retained_from_prior_attempts_bytes"
+                            )
+                        ),
+                        "response_buffer_retained_after_failed_attempt": _bool_text(
+                            _safe_bool(
+                                raw_attempt.get(
+                                    "response_buffer_retained_after_failed_attempt"
+                                )
+                            )
+                        )
+                        if "response_buffer_retained_after_failed_attempt"
+                        in raw_attempt
+                        else None,
                         "started_ms": _optional_int_text(
                             raw_attempt.get("started_ms")
                         ),
@@ -1491,6 +1792,10 @@ def _upstream_attempt_log_events(
                         "attempt_status_class": _status_class(attempt_status),
                         "attempt_success": _bool_text(_safe_bool(raw_attempt.get("success"))),
                         "attempt_error_type": attempt_error_type,
+                        "status_origin": _safe_text(
+                            raw_attempt.get("status_origin"),
+                            max_len=64,
+                        ),
                         "payload_bytes": _int_text(_safe_int(raw_attempt.get("payload_bytes"), 0)),
                         "timeout_seconds": _int_text(_safe_int(raw_attempt.get("timeout_seconds"), 0)),
                         "timeout_adjusted_from_seconds": timeout_adjusted_from,
@@ -1506,15 +1811,58 @@ def _upstream_attempt_log_events(
                         ),
                         "failure_stage": _safe_text(
                             stream_diagnostics.get("failure_stage")
+                            or raw_attempt.get("failure_stage")
                         ),
                         "oaix_connection_id": _safe_text(
                             stream_diagnostics.get("oaix_connection_id")
                         ),
                         "upstream_http_version": _safe_text(
                             stream_diagnostics.get("http_version")
+                            or raw_attempt.get("http_version")
                         ),
                         "httpcore_stream_id": _optional_int_text(
                             stream_diagnostics.get("httpcore_stream_id")
+                            or raw_attempt.get("http2_stream_id")
+                        ),
+                        "protocol_error_reason": _safe_text(
+                            raw_attempt.get("protocol_error_reason"),
+                            max_len=128,
+                        ),
+                        "exception_module": _safe_text(
+                            raw_attempt.get("exception_module"),
+                            max_len=256,
+                        ),
+                        "exception_repr": _safe_text(
+                            raw_attempt.get("exception_repr"),
+                            max_len=768,
+                        ),
+                        "exception_chain_json": _safe_text(
+                            raw_attempt.get("exception_chain_json"),
+                            max_len=4096,
+                        ),
+                        "alpn_protocol": _safe_text(
+                            raw_attempt.get("alpn_protocol"),
+                            max_len=32,
+                        ),
+                        "connection_request_count": _optional_int_text(
+                            raw_attempt.get("connection_request_count")
+                        ),
+                        "http2_concurrent_streams": _optional_int_text(
+                            raw_attempt.get("http2_concurrent_streams")
+                        ),
+                        "http2_max_concurrent_streams": _optional_int_text(
+                            raw_attempt.get("http2_max_concurrent_streams")
+                        ),
+                        "http2_local_connection_state": _safe_text(
+                            raw_attempt.get("http2_local_connection_state"),
+                            max_len=64,
+                        ),
+                        "http2_local_stream_state": _safe_text(
+                            raw_attempt.get("http2_local_stream_state"),
+                            max_len=64,
+                        ),
+                        "goaway_error_code": _optional_int_text(
+                            raw_attempt.get("goaway_error_code")
                         ),
                         "explicit_proxy_configured": _bool_text(
                             _safe_bool(
@@ -1868,6 +2216,14 @@ def _request_metric_events(
         "uniapi_ember_runtime_global_admission_503_outcome_export_enqueue_dropped_total",
         "uniapi_ember_runtime_global_admission_503_outcome_export_build_errors_total",
         "uniapi_ember_runtime_global_admission_503_outcome_export_errors_total",
+        "uniapi_ember_runtime_global_response_buffer_events_recorded_total",
+        "uniapi_ember_runtime_global_response_buffer_event_record_failures_total",
+        "uniapi_ember_runtime_global_response_buffer_event_observer_errors_total",
+        "uniapi_ember_runtime_global_response_buffer_event_observer_enqueue_failures_total",
+        "uniapi_ember_runtime_global_response_buffer_event_export_enqueued_total",
+        "uniapi_ember_runtime_global_response_buffer_event_export_enqueue_dropped_total",
+        "uniapi_ember_runtime_global_response_buffer_event_export_build_errors_total",
+        "uniapi_ember_runtime_global_response_buffer_event_export_errors_total",
     }
     events = []
     for metric, value in values.items():
@@ -1889,6 +2245,104 @@ def _request_metric_events(
             }
         )
     return events
+
+
+def _response_admission_metric_events(
+    *,
+    service_name: str,
+    identity_attrs: dict[str, str] | None,
+    timestamp: datetime,
+    runtime_metrics: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    runtime = runtime_metrics if isinstance(runtime_metrics, dict) else {}
+    branches = runtime.get(
+        "runtime_global_response_admission_rejections_by_branch"
+    )
+    if not isinstance(branches, dict):
+        branches = {}
+    allowed_branches = (
+        "parent_governor",
+        "per_request_response_limit",
+        "per_request_retained_limit",
+        "global_hard_budget",
+    )
+    base = _drop_empty(
+        {
+            **(identity_attrs or {}),
+            "component": service_name,
+            "metric_scope": "runtime_global",
+        }
+    )
+    rows: list[tuple[str, int, dict[str, Any]]] = []
+    for branch in allowed_branches:
+        rows.append(
+            (
+                "uniapi_ember_runtime_global_response_admission_rejections_total",
+                max(0, _safe_int(branches.get(branch), 0)),
+                {"admission_branch": branch},
+            )
+        )
+    remaining = _runtime_int(
+        runtime,
+        "runtime_global_response_budget_soft_remaining_bytes",
+    )
+    if remaining is not None:
+        rows.append(
+            (
+                "uniapi_ember_runtime_global_response_budget_soft_remaining_bytes",
+                max(0, remaining),
+                {},
+            )
+        )
+    ratio = runtime.get("runtime_global_response_budget_soft_remaining_ratio")
+    try:
+        ratio_basis_points = max(0, min(10000, int(float(ratio) * 10000)))
+    except (TypeError, ValueError):
+        ratio_basis_points = None
+    if ratio_basis_points is not None:
+        rows.append(
+            (
+                "uniapi_ember_runtime_global_response_budget_soft_remaining_ratio_basis_points",
+                ratio_basis_points,
+                {},
+            )
+        )
+    rejections_1m = _runtime_int(
+        runtime,
+        "runtime_global_response_admission_rejections_1m",
+    )
+    if rejections_1m is not None:
+        rows.append(
+            (
+                "uniapi_ember_runtime_global_response_admission_rejections_1m",
+                max(0, rejections_1m),
+                {},
+            )
+        )
+    for alert_name, runtime_key in (
+        (
+            "uniapi_ember_runtime_global_response_budget_soft_headroom_alert",
+            "runtime_global_response_budget_soft_headroom_alert",
+        ),
+        (
+            "uniapi_ember_runtime_global_response_rejection_rate_alert",
+            "runtime_global_response_rejection_rate_alert",
+        ),
+    ):
+        if runtime_key in runtime:
+            rows.append((alert_name, 1 if _safe_bool(runtime[runtime_key]) else 0, {}))
+    return [
+        {
+            "timestamp": _iso_timestamp(timestamp),
+            "kind": "metric",
+            "source": service_name,
+            "message": metric,
+            "metric": metric,
+            "value": value,
+            "attributes": _drop_empty({**base, **attrs}),
+        }
+        for metric, value, attrs in rows
+    ]
 
 
 def _actual_upstream_error_count(current_info: dict[str, Any]) -> int | None:

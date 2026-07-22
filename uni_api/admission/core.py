@@ -10,10 +10,15 @@ from time import monotonic, time
 from typing import Any
 from uuid import uuid4
 
-from uni_api.admission.memory import AdaptiveMemoryGovernor
+from uni_api.admission.memory import (
+    AdaptiveMemoryGovernor,
+    AdaptiveMemoryReservationDecision,
+    AdaptiveMemorySnapshot,
+)
 from uni_api.admission.observability import (
     LargeBodyAdmissionDecision,
     LargeBodyHolderSnapshot,
+    ResponseBufferEvent,
     RequestBodyObservation,
 )
 
@@ -45,8 +50,9 @@ class LargeBodyCapacityExhausted(AdmissionRejected):
 class UpstreamResponseBudgetExhausted(AdmissionRejected):
     local_admission_rejection = True
 
-    def __init__(self) -> None:
+    def __init__(self, admission_branch: str) -> None:
         super().__init__("upstream_response_budget_exhausted", status_code=503)
+        self.admission_branch = str(admission_branch)
 
 
 @dataclass(slots=True)
@@ -452,6 +458,10 @@ class RequestAdmissionLease:
         self._body_observation = RequestBodyObservation()
         self._release_reason = "request_completed"
         self._release_task: asyncio.Task[None] | None = None
+        self._response_attempt: dict[str, Any] | None = None
+        self._response_attempts_started = 0
+        self._response_committed_allocations: dict[str, dict[str, Any]] = {}
+        self._response_lifecycle_by_attempt: dict[str, dict[str, Any]] = {}
 
     @property
     def wait_ms(self) -> float:
@@ -477,6 +487,121 @@ class RequestAdmissionLease:
         if self._release_requested or self._released:
             return
         self._body_observation = observation
+
+    def begin_response_attempt(
+        self,
+        entry: dict[str, Any] | None,
+        *,
+        routing_attempt_id: str,
+        routing_attempt_index: int | None,
+        provider: str,
+        request_model: str,
+        actual_model: str,
+    ) -> None:
+        """Bind response-memory ownership to the currently executing retry."""
+
+        if self._release_requested or self._released:
+            return
+        self._response_attempts_started += 1
+        normalized_index = (
+            int(routing_attempt_index)
+            if isinstance(routing_attempt_index, int)
+            else self._response_attempts_started
+        )
+        retained_before = self._reserved_response_bytes
+        lifecycle_key = (
+            str(routing_attempt_id or "").strip()
+            or f"attempt-{normalized_index}"
+        )[:128]
+        if retained_before > 0:
+            for previous in self._response_lifecycle_by_attempt.values():
+                if (
+                    int(previous.get("committed_bytes") or 0)
+                    > int(previous.get("released_bytes") or 0)
+                ):
+                    previous["held_across_retry"] = True
+        attempt = {
+            "routing_attempt_id": str(routing_attempt_id or "")[:128] or None,
+            "routing_attempt_index": normalized_index,
+            "provider": str(provider or "")[:256] or None,
+            "request_model": str(request_model or "")[:256] or None,
+            "actual_model": str(actual_model or "")[:256] or None,
+            "retained_before_bytes": retained_before,
+            "lifecycle_key": lifecycle_key,
+            "entry": entry,
+        }
+        self._response_attempt = attempt
+        self._response_lifecycle_by_attempt.setdefault(
+            lifecycle_key,
+            {
+                **attempt,
+                "request_response_before": retained_before,
+                "request_response_projected": retained_before,
+                "request_response_after": retained_before,
+                "global_response_before": self._controller._reserved_response_bytes,
+                "global_response_projected": self._controller._reserved_response_bytes,
+                "global_response_after": self._controller._reserved_response_bytes,
+                "reserve_started_count": 0,
+                "reserve_call_count": 0,
+                "requested_bytes": 0,
+                "commit_count": 0,
+                "committed_bytes": 0,
+                "rollback_count": 0,
+                "rolled_back_bytes": 0,
+                "release_count": 0,
+                "released_bytes": 0,
+                "rejection_count": 0,
+                "outcome": "started",
+                "held_across_retry": False,
+            },
+        )
+        if isinstance(entry, dict):
+            entry["response_buffer_reserved_before_bytes"] = retained_before
+            entry["response_buffer_retained_from_prior_attempts_bytes"] = (
+                retained_before
+            )
+            entry["response_buffer_cross_retry_retained"] = bool(
+                normalized_index > 1 and retained_before > 0
+            )
+
+    def finish_response_attempt(
+        self,
+        *,
+        outcome: str,
+        keep_active: bool = False,
+    ) -> None:
+        attempt = self._response_attempt
+        if not isinstance(attempt, dict):
+            return
+        entry = attempt.get("entry")
+        before = int(attempt.get("retained_before_bytes") or 0)
+        after = self._reserved_response_bytes
+        attempt_id = str(attempt.get("routing_attempt_id") or "")
+        committed_by_attempt = sum(
+            int(allocation.get("bytes") or 0)
+            for allocation in self._response_committed_allocations.values()
+            if str(allocation.get("routing_attempt_id") or "") == attempt_id
+        )
+        if isinstance(entry, dict):
+            entry["response_buffer_reserved_after_bytes"] = after
+            entry["response_buffer_reserved_delta_bytes"] = after - before
+            entry["response_buffer_committed_by_attempt_bytes"] = (
+                committed_by_attempt
+            )
+            entry["response_buffer_retained_after_attempt"] = after > 0
+            entry["response_buffer_retained_after_failed_attempt"] = bool(
+                outcome not in {"succeeded", "stream_pending"} and after > 0
+            )
+        lifecycle_key = str(attempt.get("lifecycle_key") or "")
+        lifecycle = self._response_lifecycle_by_attempt.get(lifecycle_key)
+        if isinstance(lifecycle, dict):
+            lifecycle["outcome"] = str(outcome)[:80]
+            lifecycle["request_response_after"] = after
+            lifecycle["global_response_after"] = (
+                self._controller._reserved_response_bytes
+            )
+        if not keep_active:
+            self._response_attempt = None
 
     async def reserve_body_bytes(
         self,
@@ -520,7 +645,11 @@ class RequestAdmissionLease:
             raise ValueError("additional_bytes cannot be negative")
         if self._release_requested:
             raise RuntimeError("cannot reserve bytes on a released request lease")
-        reservation = TemporaryResponseBytesReservation(self, 0)
+        reservation = TemporaryResponseBytesReservation(
+            self,
+            0,
+            allocation_id=self._controller._new_response_allocation_id(),
+        )
         activate_task = asyncio.create_task(
             self._controller._activate_temporary_response(
                 reservation,
@@ -583,9 +712,18 @@ class RequestAdmissionLease:
 class TemporaryResponseBytesReservation:
     """A response-memory charge released as soon as its object graph dies."""
 
-    def __init__(self, lease: RequestAdmissionLease, size: int) -> None:
+    def __init__(
+        self,
+        lease: RequestAdmissionLease,
+        size: int,
+        *,
+        allocation_id: str,
+    ) -> None:
         self._lease = lease
         self.size = int(size)
+        self._allocation_id = allocation_id
+        self._reserve_call_count = 0
+        self._attempt: dict[str, Any] | None = None
         self._active = False
         self._released = False
         self._committed = False
@@ -625,7 +763,7 @@ class TemporaryResponseBytesReservation:
             return
         await self._lease._controller._release_response_bytes(
             self._lease,
-            self.size,
+            self,
         )
         self._released = True
 
@@ -709,7 +847,10 @@ class RequestAdmissionController:
         wall_clock: Callable[[], float] = time,
         decision_observer: Callable[[LargeBodyAdmissionDecision], bool | None]
         | None = None,
+        response_buffer_observer: Callable[[ResponseBufferEvent], bool | None]
+        | None = None,
         decision_history_limit: int = 64,
+        response_event_history_limit: int = 128,
     ) -> None:
         if max_body_bytes < 0:
             raise ValueError("max_body_bytes cannot be negative")
@@ -725,6 +866,8 @@ class RequestAdmissionController:
             )
         if decision_history_limit <= 0:
             raise ValueError("decision_history_limit must be greater than zero")
+        if response_event_history_limit <= 0:
+            raise ValueError("response_event_history_limit must be greater than zero")
 
         self.max_body_bytes = max_body_bytes
         self.body_budget_bytes = body_budget_bytes
@@ -747,6 +890,7 @@ class RequestAdmissionController:
         self._clock = clock
         self._wall_clock = wall_clock
         self._decision_observer = decision_observer
+        self._response_buffer_observer = response_buffer_observer
         self._decision_history: deque[LargeBodyAdmissionDecision] = deque(
             maxlen=int(decision_history_limit)
         )
@@ -758,6 +902,17 @@ class RequestAdmissionController:
         self._identity_nonce = uuid4().hex
         self._lease_sequence = 0
         self._claim_sequence = 0
+        self._response_allocation_sequence = 0
+        self._response_event_sequence = 0
+        self._response_event_history: deque[ResponseBufferEvent] = deque(
+            maxlen=int(response_event_history_limit)
+        )
+        self._response_event_history_overwritten = 0
+        self._response_event_record_failures = 0
+        self._response_event_observer_errors = 0
+        self._response_event_observer_enqueue_failures = 0
+        self._response_rejected_by_branch: Counter[str] = Counter()
+        self._response_rejection_timestamps: deque[float] = deque()
         self._active_gate = BoundedAdmissionGate(
             capacity,
             waiter_limit=waiter_limit,
@@ -779,6 +934,13 @@ class RequestAdmissionController:
     def _new_claim_id_locked(self) -> str:
         self._claim_sequence += 1
         return f"{self._identity_nonce}-claim-{self._claim_sequence:x}"
+
+    def _new_response_allocation_id(self) -> str:
+        self._response_allocation_sequence += 1
+        return (
+            f"{self._identity_nonce}-response-"
+            f"{self._response_allocation_sequence:x}"
+        )
 
     async def acquire(
         self,
@@ -1072,43 +1234,520 @@ class RequestAdmissionController:
         finally:
             self._publish_decision_events(decision_events)
 
+    def _response_lifecycle_locked(
+        self,
+        lease: RequestAdmissionLease,
+        attempt: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        attempt = attempt if isinstance(attempt, dict) else {}
+        key = str(
+            attempt.get("lifecycle_key")
+            or attempt.get("routing_attempt_id")
+            or "unattributed"
+        )[:128]
+        lifecycle = lease._response_lifecycle_by_attempt.get(key)
+        if lifecycle is None:
+            lifecycle = {
+                **attempt,
+                "lifecycle_key": key,
+                "request_response_before": lease._reserved_response_bytes,
+                "request_response_projected": lease._reserved_response_bytes,
+                "request_response_after": lease._reserved_response_bytes,
+                "global_response_before": self._reserved_response_bytes,
+                "global_response_projected": self._reserved_response_bytes,
+                "global_response_after": self._reserved_response_bytes,
+                "reserve_started_count": 0,
+                "reserve_call_count": 0,
+                "requested_bytes": 0,
+                "commit_count": 0,
+                "committed_bytes": 0,
+                "rollback_count": 0,
+                "rolled_back_bytes": 0,
+                "release_count": 0,
+                "released_bytes": 0,
+                "rejection_count": 0,
+                "outcome": "unattributed",
+                "held_across_retry": False,
+            }
+            lease._response_lifecycle_by_attempt[key] = lifecycle
+        return lifecycle
+
+    @staticmethod
+    def _increment_lifecycle(
+        lifecycle: dict[str, Any],
+        key: str,
+        value: int,
+    ) -> None:
+        lifecycle[key] = int(lifecycle.get(key) or 0) + int(value)
+
+    def _update_response_lifecycle_locked(
+        self,
+        lease: RequestAdmissionLease,
+        attempt: dict[str, Any] | None,
+        *,
+        reserve_started: int = 0,
+        reserve_calls: int = 0,
+        requested_bytes: int = 0,
+        commits: int = 0,
+        committed_bytes: int = 0,
+        rollbacks: int = 0,
+        rolled_back_bytes: int = 0,
+        releases: int = 0,
+        released_bytes: int = 0,
+        rejections: int = 0,
+        request_response_projected: int | None = None,
+        request_response_after: int | None = None,
+        global_response_projected: int | None = None,
+        global_response_after: int | None = None,
+    ) -> dict[str, Any]:
+        lifecycle = self._response_lifecycle_locked(lease, attempt)
+        for key, value in (
+            ("reserve_started_count", reserve_started),
+            ("reserve_call_count", reserve_calls),
+            ("requested_bytes", requested_bytes),
+            ("commit_count", commits),
+            ("committed_bytes", committed_bytes),
+            ("rollback_count", rollbacks),
+            ("rolled_back_bytes", rolled_back_bytes),
+            ("release_count", releases),
+            ("released_bytes", released_bytes),
+            ("rejection_count", rejections),
+        ):
+            if value:
+                self._increment_lifecycle(lifecycle, key, value)
+        if request_response_projected is not None:
+            lifecycle["request_response_projected"] = max(
+                int(lifecycle.get("request_response_projected") or 0),
+                int(request_response_projected),
+            )
+        if request_response_after is not None:
+            lifecycle["request_response_after"] = int(request_response_after)
+        if global_response_projected is not None:
+            lifecycle["global_response_projected"] = max(
+                int(lifecycle.get("global_response_projected") or 0),
+                int(global_response_projected),
+            )
+        if global_response_after is not None:
+            lifecycle["global_response_after"] = int(global_response_after)
+        return lifecycle
+
+    def _response_parent_sample(
+        self,
+    ) -> AdaptiveMemorySnapshot | None:
+        if self._memory_governor is None:
+            return None
+        return self._memory_governor.snapshot()
+
+    def _admit_response_bytes_locked(
+        self,
+        lease: RequestAdmissionLease,
+        additional_bytes: int,
+        *,
+        allocation_id: str,
+        allocation_kind: str,
+        allocation_reserved_before: int,
+        allocation_reserve_call_count: int,
+        attempt: dict[str, Any] | None,
+        events: list[ResponseBufferEvent],
+    ) -> AdaptiveMemoryReservationDecision | AdaptiveMemorySnapshot | None:
+        request_response_before = lease._reserved_response_bytes
+        request_response_projected = request_response_before + additional_bytes
+        global_response_before = self._reserved_response_bytes
+        global_response_projected = global_response_before + additional_bytes
+        global_retained_before = self._reserved_body_bytes + global_response_before
+        parent: AdaptiveMemoryReservationDecision | AdaptiveMemorySnapshot | None = (
+            self._response_parent_sample()
+        )
+
+        branch: str | None = None
+        if request_response_projected > self.max_response_bytes:
+            branch = "per_request_response_limit"
+        elif (
+            lease._reserved_body_bytes + request_response_projected
+            > self.max_retained_bytes_per_request
+        ):
+            branch = "per_request_retained_limit"
+        elif (
+            global_retained_before + additional_bytes
+            > self.body_budget_bytes
+        ):
+            branch = "global_hard_budget"
+        elif self._memory_governor is not None:
+            parent = self._memory_governor.reserve_nowait_decision(
+                "buffered_response",
+                additional_bytes,
+            )
+            if not parent.allowed:
+                branch = "parent_governor"
+
+        if branch is None:
+            return parent
+
+        reason = (
+            "upstream_response_too_large"
+            if branch == "per_request_response_limit"
+            else "upstream_response_budget_exhausted"
+        )
+        self._response_rejected[reason] += 1
+        self._response_rejected_by_branch[branch] += 1
+        rejected_at = self._safe_decision_monotonic()
+        self._response_rejection_timestamps.append(rejected_at)
+        rejection_cutoff = rejected_at - 60.0
+        while (
+            self._response_rejection_timestamps
+            and self._response_rejection_timestamps[0] < rejection_cutoff
+        ):
+            self._response_rejection_timestamps.popleft()
+        self._update_response_lifecycle_locked(
+            lease,
+            attempt,
+            reserve_calls=1,
+            requested_bytes=additional_bytes,
+            rejections=1,
+            request_response_projected=request_response_projected,
+            request_response_after=request_response_before,
+            global_response_projected=global_response_projected,
+            global_response_after=global_response_before,
+        )
+        self._record_response_buffer_event_locked(
+            events,
+            lease,
+            event="reject",
+            outcome="rejected",
+            admission_branch=branch,
+            allocation_id=allocation_id,
+            allocation_kind=allocation_kind,
+            requested_bytes=additional_bytes,
+            allocation_reserved_before=allocation_reserved_before,
+            allocation_reserved_after=allocation_reserved_before,
+            allocation_reserve_call_count=allocation_reserve_call_count,
+            request_response_before=request_response_before,
+            request_response_projected=request_response_projected,
+            request_response_after=request_response_before,
+            global_response_before=global_response_before,
+            global_response_projected=global_response_projected,
+            global_response_after=global_response_before,
+            parent=parent,
+            attempt=attempt,
+            rejection_count=1,
+        )
+        raise UpstreamResponseBudgetExhausted(branch)
+
+    def _record_response_buffer_event_locked(
+        self,
+        events: list[ResponseBufferEvent],
+        lease: RequestAdmissionLease,
+        **kwargs: Any,
+    ) -> None:
+        try:
+            event = self._append_response_buffer_event_locked(
+                lease,
+                **kwargs,
+            )
+        except Exception:
+            self._response_event_record_failures += 1
+            return
+        events.append(event)
+
+    def _append_response_buffer_event_locked(
+        self,
+        lease: RequestAdmissionLease,
+        *,
+        event: str,
+        outcome: str,
+        admission_branch: str | None,
+        allocation_id: str,
+        allocation_kind: str,
+        requested_bytes: int,
+        allocation_reserved_before: int,
+        allocation_reserved_after: int,
+        allocation_reserve_call_count: int,
+        request_response_before: int,
+        request_response_projected: int,
+        request_response_after: int,
+        global_response_before: int,
+        global_response_projected: int,
+        global_response_after: int,
+        parent: AdaptiveMemoryReservationDecision | AdaptiveMemorySnapshot | None,
+        attempt: dict[str, Any] | None,
+        reserve_started_count: int = 0,
+        commit_count: int = 0,
+        committed_bytes: int = 0,
+        rollback_count: int = 0,
+        rolled_back_bytes: int = 0,
+        release_count: int = 0,
+        released_bytes: int = 0,
+        rejection_count: int = 0,
+    ) -> ResponseBufferEvent:
+        self._response_event_sequence += 1
+        attempt = attempt if isinstance(attempt, dict) else {}
+        attempt_index = attempt.get("routing_attempt_index")
+        if not isinstance(attempt_index, int):
+            attempt_index = None
+        retained_from_prior = int(attempt.get("retained_before_bytes") or 0)
+        crosses_retry = bool(
+            retained_from_prior > 0 and (attempt_index or 0) > 1
+        ) or bool(attempt.get("held_across_retry"))
+        allocation_attempt_index = attempt_index or 0
+        if event == "release" and allocation_attempt_index:
+            crosses_retry = crosses_retry or (
+                lease._response_attempts_started > allocation_attempt_index
+            )
+
+        parent_decision = (
+            parent
+            if isinstance(parent, AdaptiveMemoryReservationDecision)
+            else None
+        )
+        parent_snapshot = (
+            parent if isinstance(parent, AdaptiveMemorySnapshot) else None
+        )
+        parent_reserved_before = (
+            parent_decision.reserved_before_bytes
+            if parent_decision is not None
+            else getattr(parent_snapshot, "reserved_bytes", None)
+        )
+        parent_projected = (
+            parent_decision.projected_reserved_bytes
+            if parent_decision is not None
+            else (
+                int(parent_reserved_before)
+                + (0 if event == "attempt_summary" else requested_bytes)
+                if parent_reserved_before is not None
+                else None
+            )
+        )
+        parent_reserved_after = (
+            parent_decision.reserved_after_bytes
+            if parent_decision is not None
+            else parent_reserved_before
+        )
+        parent_available_before = (
+            parent_decision.available_before_bytes
+            if parent_decision is not None
+            else getattr(parent_snapshot, "available_bytes", None)
+        )
+        parent_available_after = (
+            parent_decision.available_after_bytes
+            if parent_decision is not None
+            else parent_available_before
+        )
+        request_body = lease._reserved_body_bytes
+        global_body = self._reserved_body_bytes
+        created = ResponseBufferEvent(
+            schema_version=1,
+            sequence=self._response_event_sequence,
+            event=str(event),
+            outcome=str(outcome),
+            admission_branch=admission_branch,
+            occurred_at_unix_ms=self._safe_decision_wall_time_ms(),
+            request_self_lease_id=lease._lease_id,
+            request_self_request_id=lease._body_observation.request_id,
+            request_self_trace_id=lease._body_observation.trace_id,
+            routing_attempt_id=(
+                str(attempt.get("routing_attempt_id") or "")[:128] or None
+            ),
+            routing_attempt_index=attempt_index,
+            provider=str(attempt.get("provider") or "")[:256] or None,
+            request_model=(
+                str(attempt.get("request_model") or "")[:256] or None
+            ),
+            actual_model=(
+                str(attempt.get("actual_model") or "")[:256] or None
+            ),
+            allocation_id=str(allocation_id)[:128],
+            allocation_kind=str(allocation_kind)[:64],
+            requested_bytes=int(requested_bytes),
+            allocation_reserved_before_bytes=int(allocation_reserved_before),
+            allocation_reserved_after_bytes=int(allocation_reserved_after),
+            allocation_reserve_call_count=int(allocation_reserve_call_count),
+            request_response_reserved_before_bytes=int(request_response_before),
+            request_response_reserved_projected_bytes=int(
+                request_response_projected
+            ),
+            request_response_reserved_after_bytes=int(request_response_after),
+            request_retained_reserved_before_bytes=(
+                request_body + int(request_response_before)
+            ),
+            request_retained_reserved_projected_bytes=(
+                request_body + int(request_response_projected)
+            ),
+            request_retained_reserved_after_bytes=(
+                request_body + int(request_response_after)
+            ),
+            runtime_global_response_reserved_before_bytes=int(
+                global_response_before
+            ),
+            runtime_global_response_reserved_projected_bytes=int(
+                global_response_projected
+            ),
+            runtime_global_response_reserved_after_bytes=int(
+                global_response_after
+            ),
+            runtime_global_retained_reserved_before_bytes=(
+                global_body + int(global_response_before)
+            ),
+            runtime_global_retained_reserved_projected_bytes=(
+                global_body + int(global_response_projected)
+            ),
+            runtime_global_retained_reserved_after_bytes=(
+                global_body + int(global_response_after)
+            ),
+            retained_from_prior_attempts_bytes=retained_from_prior,
+            crosses_retry_boundary=crosses_retry,
+            request_response_limit_bytes=self.max_response_bytes,
+            request_retained_limit_bytes=self.max_retained_bytes_per_request,
+            runtime_global_hard_budget_bytes=self.body_budget_bytes,
+            parent_governor_allowed=(
+                parent_decision.allowed if parent_decision is not None else None
+            ),
+            parent_governor_reserved_before_bytes=parent_reserved_before,
+            parent_governor_projected_reserved_bytes=parent_projected,
+            parent_governor_reserved_after_bytes=parent_reserved_after,
+            parent_governor_available_before_bytes=parent_available_before,
+            parent_governor_available_after_bytes=parent_available_after,
+            cgroup_memory_source=getattr(parent, "source", None),
+            cgroup_memory_current_bytes_sampled=getattr(
+                parent, "current_bytes", None
+            ),
+            cgroup_memory_limit_bytes_sampled=getattr(
+                parent, "limit_bytes", None
+            ),
+            cgroup_memory_high_bytes_sampled=getattr(
+                parent, "high_bytes", None
+            ),
+            cgroup_memory_soft_limit_bytes_sampled=getattr(
+                parent, "soft_limit_bytes", None
+            ),
+            cgroup_memory_guard_bytes_sampled=getattr(
+                parent, "guard_bytes", None
+            ),
+            cgroup_memory_capacity_bytes_sampled=getattr(
+                parent, "capacity_bytes", None
+            ),
+            cgroup_memory_sample_sequence=getattr(
+                parent, "sample_sequence", None
+            ),
+            cgroup_memory_sample_age_ms_at_decision=getattr(
+                parent, "sample_age_ms", None
+            ),
+            cgroup_memory_sample_error=getattr(parent, "sample_error", None),
+            reserve_started_count=int(reserve_started_count),
+            commit_count=int(commit_count),
+            committed_bytes=int(committed_bytes),
+            rollback_count=int(rollback_count),
+            rolled_back_bytes=int(rolled_back_bytes),
+            release_count=int(release_count),
+            released_bytes=int(released_bytes),
+            rejection_count=int(rejection_count),
+        )
+        if len(self._response_event_history) == self._response_event_history.maxlen:
+            self._response_event_history_overwritten += 1
+        self._response_event_history.append(created)
+        return created
+
+    def _publish_response_buffer_events(
+        self,
+        events: list[ResponseBufferEvent],
+    ) -> None:
+        observer = self._response_buffer_observer
+        if observer is None:
+            return
+        for event in events:
+            try:
+                accepted = observer(event)
+            except Exception:
+                self._response_event_observer_errors += 1
+                continue
+            if accepted is False:
+                self._response_event_observer_enqueue_failures += 1
+
+    def recent_response_buffer_events(self) -> tuple[ResponseBufferEvent, ...]:
+        return tuple(self._response_event_history)
+
     async def _reserve_response_additional(
         self,
         lease: RequestAdmissionLease,
         additional_bytes: int,
     ) -> None:
-        async with self._body_lock:
-            if lease._release_requested or lease._released:
-                raise RuntimeError("cannot reserve bytes on a released request lease")
-            next_request_bytes = lease._reserved_response_bytes + additional_bytes
-            if next_request_bytes > self.max_response_bytes:
-                self._response_rejected["upstream_response_too_large"] += 1
-                raise UpstreamResponseBudgetExhausted()
-            if (
-                lease._reserved_body_bytes + next_request_bytes
-                > self.max_retained_bytes_per_request
-            ):
-                self._response_rejected[
-                    "upstream_response_budget_exhausted"
-                ] += 1
-                raise UpstreamResponseBudgetExhausted()
-            if (
-                self._reserved_body_bytes
-                + self._reserved_response_bytes
-                + additional_bytes
-                > self.body_budget_bytes
-            ):
-                self._response_rejected[
-                    "upstream_response_budget_exhausted"
-                ] += 1
-                raise UpstreamResponseBudgetExhausted()
-            if not self._reserve_parent_memory("buffered_response", additional_bytes):
-                self._response_rejected[
-                    "upstream_response_budget_exhausted"
-                ] += 1
-                raise UpstreamResponseBudgetExhausted()
-            lease._reserved_response_bytes = next_request_bytes
-            self._reserved_response_bytes += additional_bytes
+        events: list[ResponseBufferEvent] = []
+        try:
+            async with self._body_lock:
+                if lease._release_requested or lease._released:
+                    raise RuntimeError(
+                        "cannot reserve bytes on a released request lease"
+                    )
+                attempt = dict(lease._response_attempt or {})
+                lifecycle = self._response_lifecycle_locked(lease, attempt)
+                ledger_key = f"direct:{lifecycle['lifecycle_key']}"
+                allocation = lease._response_committed_allocations.get(
+                    ledger_key
+                )
+                allocation_id = (
+                    str(allocation.get("allocation_id"))
+                    if isinstance(allocation, dict)
+                    else self._new_response_allocation_id()
+                )
+                allocation_reserved_before = (
+                    int(allocation.get("bytes") or 0)
+                    if isinstance(allocation, dict)
+                    else 0
+                )
+                allocation_reserve_call_count = (
+                    int(allocation.get("reserve_call_count") or 0) + 1
+                    if isinstance(allocation, dict)
+                    else 1
+                )
+                self._admit_response_bytes_locked(
+                    lease,
+                    additional_bytes,
+                    allocation_id=allocation_id,
+                    allocation_kind="request_committed",
+                    allocation_reserved_before=allocation_reserved_before,
+                    allocation_reserve_call_count=(
+                        allocation_reserve_call_count
+                    ),
+                    attempt=attempt,
+                    events=events,
+                )
+                request_response_before = lease._reserved_response_bytes
+                global_response_before = self._reserved_response_bytes
+                lease._reserved_response_bytes += additional_bytes
+                self._reserved_response_bytes += additional_bytes
+                if not isinstance(allocation, dict):
+                    allocation = {
+                        **attempt,
+                        "allocation_id": allocation_id,
+                        "allocation_kind": "request_committed",
+                        "bytes": 0,
+                        "reserve_call_count": 0,
+                    }
+                    lease._response_committed_allocations[ledger_key] = allocation
+                allocation["bytes"] = int(allocation.get("bytes") or 0) + (
+                    additional_bytes
+                )
+                allocation["reserve_call_count"] = int(
+                    allocation.get("reserve_call_count") or 0
+                ) + 1
+                self._update_response_lifecycle_locked(
+                    lease,
+                    attempt,
+                    reserve_started=1,
+                    reserve_calls=1,
+                    requested_bytes=additional_bytes,
+                    commits=1,
+                    committed_bytes=additional_bytes,
+                    request_response_projected=(
+                        request_response_before + additional_bytes
+                    ),
+                    request_response_after=lease._reserved_response_bytes,
+                    global_response_projected=(
+                        global_response_before + additional_bytes
+                    ),
+                    global_response_after=self._reserved_response_bytes,
+                )
+        finally:
+            self._publish_response_buffer_events(events)
 
     async def _activate_temporary_response(
         self,
@@ -1116,41 +1755,50 @@ class RequestAdmissionController:
         additional_bytes: int,
     ) -> None:
         lease = reservation._lease
-        async with self._body_lock:
-            if lease._release_requested or lease._released:
-                raise RuntimeError("cannot reserve bytes on a released request lease")
-            next_request_bytes = lease._reserved_response_bytes + additional_bytes
-            if next_request_bytes > self.max_response_bytes:
-                self._response_rejected["upstream_response_too_large"] += 1
-                raise UpstreamResponseBudgetExhausted()
-            if (
-                lease._reserved_body_bytes + next_request_bytes
-                > self.max_retained_bytes_per_request
-            ):
-                self._response_rejected[
-                    "upstream_response_budget_exhausted"
-                ] += 1
-                raise UpstreamResponseBudgetExhausted()
-            if (
-                self._reserved_body_bytes
-                + self._reserved_response_bytes
-                + additional_bytes
-                > self.body_budget_bytes
-            ):
-                self._response_rejected[
-                    "upstream_response_budget_exhausted"
-                ] += 1
-                raise UpstreamResponseBudgetExhausted()
-            if not self._reserve_parent_memory("buffered_response", additional_bytes):
-                self._response_rejected[
-                    "upstream_response_budget_exhausted"
-                ] += 1
-                raise UpstreamResponseBudgetExhausted()
-            lease._reserved_response_bytes = next_request_bytes
-            self._reserved_response_bytes += additional_bytes
-            lease._memory_owner_count += 1
-            reservation.size = additional_bytes
-            reservation._active = True
+        events: list[ResponseBufferEvent] = []
+        try:
+            async with self._body_lock:
+                if lease._release_requested or lease._released:
+                    raise RuntimeError(
+                        "cannot reserve bytes on a released request lease"
+                    )
+                attempt = dict(lease._response_attempt or {})
+                self._admit_response_bytes_locked(
+                    lease,
+                    additional_bytes,
+                    allocation_id=reservation._allocation_id,
+                    allocation_kind="temporary",
+                    allocation_reserved_before=0,
+                    allocation_reserve_call_count=1,
+                    attempt=attempt,
+                    events=events,
+                )
+                request_response_before = lease._reserved_response_bytes
+                global_response_before = self._reserved_response_bytes
+                lease._reserved_response_bytes += additional_bytes
+                self._reserved_response_bytes += additional_bytes
+                lease._memory_owner_count += 1
+                reservation.size = additional_bytes
+                reservation._reserve_call_count = 1
+                reservation._attempt = attempt
+                reservation._active = True
+                self._update_response_lifecycle_locked(
+                    lease,
+                    attempt,
+                    reserve_started=1,
+                    reserve_calls=1,
+                    requested_bytes=additional_bytes,
+                    request_response_projected=(
+                        request_response_before + additional_bytes
+                    ),
+                    request_response_after=lease._reserved_response_bytes,
+                    global_response_projected=(
+                        global_response_before + additional_bytes
+                    ),
+                    global_response_after=self._reserved_response_bytes,
+                )
+        finally:
+            self._publish_response_buffer_events(events)
 
     async def _grow_temporary_response(
         self,
@@ -1158,39 +1806,52 @@ class RequestAdmissionController:
         additional_bytes: int,
     ) -> None:
         lease = reservation._lease
-        async with self._body_lock:
-            if not reservation._active or reservation._released or reservation._committed:
-                raise RuntimeError("temporary response reservation is closed")
-            next_request_bytes = lease._reserved_response_bytes + additional_bytes
-            if next_request_bytes > self.max_response_bytes:
-                self._response_rejected["upstream_response_too_large"] += 1
-                raise UpstreamResponseBudgetExhausted()
-            if (
-                lease._reserved_body_bytes + next_request_bytes
-                > self.max_retained_bytes_per_request
-            ):
-                self._response_rejected[
-                    "upstream_response_budget_exhausted"
-                ] += 1
-                raise UpstreamResponseBudgetExhausted()
-            if (
-                self._reserved_body_bytes
-                + self._reserved_response_bytes
-                + additional_bytes
-                > self.body_budget_bytes
-            ):
-                self._response_rejected[
-                    "upstream_response_budget_exhausted"
-                ] += 1
-                raise UpstreamResponseBudgetExhausted()
-            if not self._reserve_parent_memory("buffered_response", additional_bytes):
-                self._response_rejected[
-                    "upstream_response_budget_exhausted"
-                ] += 1
-                raise UpstreamResponseBudgetExhausted()
-            lease._reserved_response_bytes = next_request_bytes
-            self._reserved_response_bytes += additional_bytes
-            reservation.size += additional_bytes
+        events: list[ResponseBufferEvent] = []
+        try:
+            async with self._body_lock:
+                if (
+                    not reservation._active
+                    or reservation._released
+                    or reservation._committed
+                ):
+                    raise RuntimeError("temporary response reservation is closed")
+                request_response_before = lease._reserved_response_bytes
+                global_response_before = self._reserved_response_bytes
+                self._admit_response_bytes_locked(
+                    lease,
+                    additional_bytes,
+                    allocation_id=reservation._allocation_id,
+                    allocation_kind="temporary",
+                    allocation_reserved_before=reservation.size,
+                    allocation_reserve_call_count=(
+                        reservation._reserve_call_count + 1
+                    ),
+                    attempt=reservation._attempt,
+                    events=events,
+                )
+                lease._reserved_response_bytes += additional_bytes
+                self._reserved_response_bytes += additional_bytes
+                reservation.size += additional_bytes
+                reservation._reserve_call_count += 1
+                self._update_response_lifecycle_locked(
+                    lease,
+                    reservation._attempt,
+                    reserve_calls=1,
+                    requested_bytes=additional_bytes,
+                    request_response_projected=(
+                        request_response_before + additional_bytes
+                    ),
+                    request_response_after=lease._reserved_response_bytes,
+                    global_response_projected=(
+                        global_response_before + additional_bytes
+                    ),
+                    global_response_after=self._reserved_response_bytes,
+                )
+                # Successful chunk growth is aggregated into the bounded
+                # per-attempt summary. Rejections are always emitted at the
+                # exact failing call by _admit_response_bytes_locked().
+        finally:
+            self._publish_response_buffer_events(events)
 
     async def _activate_memory_deferral(
         self,
@@ -1205,6 +1866,7 @@ class RequestAdmissionController:
 
     async def _release_request(self, lease: RequestAdmissionLease) -> None:
         decision_events: list[LargeBodyAdmissionDecision] = []
+        response_events: list[ResponseBufferEvent] = []
         ownership_cleanup_complete = False
         try:
             async with self._body_lock:
@@ -1214,6 +1876,7 @@ class RequestAdmissionController:
                     self._finalize_request_memory_locked(
                         lease,
                         decision_events=decision_events,
+                        response_events=response_events,
                         release_finalizer="request_release",
                     )
             ownership_cleanup_complete = True
@@ -1224,33 +1887,55 @@ class RequestAdmissionController:
                     await lease._active_lease.release()
                 finally:
                     self._publish_decision_events(decision_events)
+                    self._publish_response_buffer_events(response_events)
             else:
                 self._publish_decision_events(decision_events)
+                self._publish_response_buffer_events(response_events)
 
     async def _release_response_bytes(
         self,
         lease: RequestAdmissionLease,
-        released_bytes: int,
+        reservation: TemporaryResponseBytesReservation,
     ) -> None:
         decision_events: list[LargeBodyAdmissionDecision] = []
+        response_events: list[ResponseBufferEvent] = []
         try:
             async with self._body_lock:
+                released_bytes = reservation.size
                 if released_bytes < 0:
                     raise ValueError("released_bytes cannot be negative")
                 if released_bytes > lease._reserved_response_bytes:
                     raise RuntimeError("request response reservation underflow")
                 if released_bytes > self._reserved_response_bytes:
                     raise RuntimeError("upstream response reservation underflow")
+                request_response_before = lease._reserved_response_bytes
+                global_response_before = self._reserved_response_bytes
                 lease._reserved_response_bytes -= released_bytes
                 self._reserved_response_bytes -= released_bytes
                 self._release_parent_memory("buffered_response", released_bytes)
+                self._update_response_lifecycle_locked(
+                    lease,
+                    reservation._attempt,
+                    rollbacks=1,
+                    rolled_back_bytes=released_bytes,
+                    request_response_projected=(
+                        request_response_before - released_bytes
+                    ),
+                    request_response_after=lease._reserved_response_bytes,
+                    global_response_projected=(
+                        global_response_before - released_bytes
+                    ),
+                    global_response_after=self._reserved_response_bytes,
+                )
                 self._finish_memory_owner_locked(
                     lease,
                     decision_events=decision_events,
+                    response_events=response_events,
                     release_finalizer="temporary_response_release",
                 )
         finally:
             self._publish_decision_events(decision_events)
+            self._publish_response_buffer_events(response_events)
 
     async def _commit_temporary_response(
         self,
@@ -1258,6 +1943,7 @@ class RequestAdmissionController:
     ) -> None:
         lease = reservation._lease
         decision_events: list[LargeBodyAdmissionDecision] = []
+        response_events: list[ResponseBufferEvent] = []
         try:
             async with self._body_lock:
                 if not reservation._active or reservation._released:
@@ -1265,34 +1951,60 @@ class RequestAdmissionController:
                 if reservation._committed:
                     return
                 reservation._committed = True
+                allocation = {
+                    **(reservation._attempt or {}),
+                    "allocation_id": reservation._allocation_id,
+                    "allocation_kind": "temporary_committed",
+                    "bytes": reservation.size,
+                    "reserve_call_count": reservation._reserve_call_count,
+                }
+                lease._response_committed_allocations[
+                    reservation._allocation_id
+                ] = allocation
+                self._update_response_lifecycle_locked(
+                    lease,
+                    reservation._attempt,
+                    commits=1,
+                    committed_bytes=reservation.size,
+                    request_response_projected=lease._reserved_response_bytes,
+                    request_response_after=lease._reserved_response_bytes,
+                    global_response_projected=self._reserved_response_bytes,
+                    global_response_after=self._reserved_response_bytes,
+                )
                 self._finish_memory_owner_locked(
                     lease,
                     decision_events=decision_events,
+                    response_events=response_events,
                     release_finalizer="temporary_response_commit",
                 )
         finally:
             self._publish_decision_events(decision_events)
+            self._publish_response_buffer_events(response_events)
 
     async def _finish_memory_owner(
         self,
         lease: RequestAdmissionLease,
     ) -> None:
         decision_events: list[LargeBodyAdmissionDecision] = []
+        response_events: list[ResponseBufferEvent] = []
         try:
             async with self._body_lock:
                 self._finish_memory_owner_locked(
                     lease,
                     decision_events=decision_events,
+                    response_events=response_events,
                     release_finalizer="deferred_memory_release",
                 )
         finally:
             self._publish_decision_events(decision_events)
+            self._publish_response_buffer_events(response_events)
 
     def _finish_memory_owner_locked(
         self,
         lease: RequestAdmissionLease,
         *,
         decision_events: list[LargeBodyAdmissionDecision],
+        response_events: list[ResponseBufferEvent],
         release_finalizer: str,
     ) -> None:
         if lease._memory_owner_count <= 0:
@@ -1302,6 +2014,7 @@ class RequestAdmissionController:
             self._finalize_request_memory_locked(
                 lease,
                 decision_events=decision_events,
+                response_events=response_events,
                 release_finalizer=release_finalizer,
             )
 
@@ -1310,6 +2023,7 @@ class RequestAdmissionController:
         lease: RequestAdmissionLease,
         *,
         decision_events: list[LargeBodyAdmissionDecision],
+        response_events: list[ResponseBufferEvent],
         release_finalizer: str,
     ) -> None:
         if lease._memory_finalized:
@@ -1323,9 +2037,111 @@ class RequestAdmissionController:
         if reserved_response_bytes > self._reserved_response_bytes:
             raise RuntimeError("upstream response reservation underflow")
         self._reserved_body_bytes -= reserved_body_bytes
-        self._reserved_response_bytes -= reserved_response_bytes
         self._release_parent_memory("request_body", reserved_body_bytes)
-        self._release_parent_memory("buffered_response", reserved_response_bytes)
+        lease._reserved_body_bytes = 0
+        allocation_total = sum(
+            int(allocation.get("bytes") or 0)
+            for allocation in lease._response_committed_allocations.values()
+        )
+        if allocation_total != reserved_response_bytes:
+            missing = reserved_response_bytes - allocation_total
+            if missing < 0:
+                raise RuntimeError("response allocation ledger overflow")
+            if missing:
+                synthetic_id = self._new_response_allocation_id()
+                lease._response_committed_allocations[synthetic_id] = {
+                    **(lease._response_attempt or {}),
+                    "allocation_id": synthetic_id,
+                    "allocation_kind": "legacy_unattributed",
+                    "bytes": missing,
+                    "reserve_call_count": 1,
+                }
+        for allocation in tuple(
+            lease._response_committed_allocations.values()
+        ):
+            released = int(allocation.get("bytes") or 0)
+            if released < 0 or released > lease._reserved_response_bytes:
+                raise RuntimeError("response allocation ledger underflow")
+            request_response_before = lease._reserved_response_bytes
+            current_global_response = self._reserved_response_bytes
+            lease._reserved_response_bytes -= released
+            self._reserved_response_bytes -= released
+            self._release_parent_memory("buffered_response", released)
+            self._update_response_lifecycle_locked(
+                lease,
+                allocation,
+                releases=1,
+                released_bytes=released,
+                request_response_projected=(
+                    request_response_before - released
+                ),
+                request_response_after=lease._reserved_response_bytes,
+                global_response_projected=(
+                    current_global_response - released
+                ),
+                global_response_after=self._reserved_response_bytes,
+            )
+        if lease._reserved_response_bytes:
+            raise RuntimeError("response allocation ledger did not fully release")
+        lease._response_committed_allocations.clear()
+        parent_after = (
+            self._memory_governor.snapshot_cached()
+            if self._memory_governor is not None
+            else None
+        )
+        for lifecycle in lease._response_lifecycle_by_attempt.values():
+            committed_bytes = int(lifecycle.get("committed_bytes") or 0)
+            released_bytes = int(lifecycle.get("released_bytes") or 0)
+            self._record_response_buffer_event_locked(
+                response_events,
+                lease,
+                event="attempt_summary",
+                outcome=str(lifecycle.get("outcome") or "finished")[:80],
+                admission_branch=None,
+                allocation_id=(
+                    f"{lease._lease_id}:"
+                    f"{lifecycle.get('lifecycle_key') or 'unattributed'}"
+                )[:128],
+                allocation_kind="attempt_aggregate",
+                requested_bytes=int(lifecycle.get("requested_bytes") or 0),
+                allocation_reserved_before=0,
+                allocation_reserved_after=max(
+                    0,
+                    committed_bytes - released_bytes,
+                ),
+                allocation_reserve_call_count=int(
+                    lifecycle.get("reserve_call_count") or 0
+                ),
+                request_response_before=int(
+                    lifecycle.get("request_response_before") or 0
+                ),
+                request_response_projected=int(
+                    lifecycle.get("request_response_projected") or 0
+                ),
+                request_response_after=0,
+                global_response_before=int(
+                    lifecycle.get("global_response_before") or 0
+                ),
+                global_response_projected=int(
+                    lifecycle.get("global_response_projected") or 0
+                ),
+                global_response_after=self._reserved_response_bytes,
+                parent=parent_after,
+                attempt=lifecycle,
+                reserve_started_count=int(
+                    lifecycle.get("reserve_started_count") or 0
+                ),
+                commit_count=int(lifecycle.get("commit_count") or 0),
+                committed_bytes=committed_bytes,
+                rollback_count=int(lifecycle.get("rollback_count") or 0),
+                rolled_back_bytes=int(
+                    lifecycle.get("rolled_back_bytes") or 0
+                ),
+                release_count=int(lifecycle.get("release_count") or 0),
+                released_bytes=released_bytes,
+                rejection_count=int(lifecycle.get("rejection_count") or 0),
+            )
+        lease._response_lifecycle_by_attempt.clear()
         self._release_large_body_slot_locked(
             lease,
             request_before=reserved_body_bytes,
@@ -1335,8 +2151,6 @@ class RequestAdmissionController:
             release_finalizer=release_finalizer,
             decision_events=decision_events,
         )
-        lease._reserved_body_bytes = 0
-        lease._reserved_response_bytes = 0
         lease._memory_finalized = True
         self._deferred_memory_leases.discard(lease)
 
@@ -1723,6 +2537,12 @@ class RequestAdmissionController:
                 parent_snapshot.capacity_bytes,
             )
         now_monotonic = self._clock()
+        rejection_cutoff = now_monotonic - 60.0
+        while (
+            self._response_rejection_timestamps
+            and self._response_rejection_timestamps[0] < rejection_cutoff
+        ):
+            self._response_rejection_timestamps.popleft()
         holder_ages_ms = [
             max(
                 0,
@@ -1731,6 +2551,14 @@ class RequestAdmissionController:
             for holder in self._large_body_holders.values()
         ]
         rejection_decision_total = sum(int(value or 0) for value in rejected.values())
+        retained_reserved = self._reserved_body_bytes + self._reserved_response_bytes
+        soft_remaining = max(0, effective_body_budget - retained_reserved)
+        soft_remaining_ratio = (
+            soft_remaining / effective_body_budget
+            if effective_body_budget > 0
+            else 0.0
+        )
+        response_rejections_1m = len(self._response_rejection_timestamps)
         return {
             **gate_snapshot,
             "reserved_body_bytes": self._reserved_body_bytes,
@@ -1774,6 +2602,37 @@ class RequestAdmissionController:
             "rejected": dict(rejected),
             "rejection_decisions": dict(rejected),
             "rejection_decision_total": rejection_decision_total,
+            "response_rejection_decisions_by_branch": dict(
+                self._response_rejected_by_branch
+            ),
+            "response_rejection_decision_total": sum(
+                self._response_rejected_by_branch.values()
+            ),
+            "response_rejections_1m": response_rejections_1m,
+            "response_rejection_rate_per_second_1m": (
+                response_rejections_1m / 60.0
+            ),
+            "response_budget_soft_remaining_bytes": soft_remaining,
+            "response_budget_soft_remaining_ratio": soft_remaining_ratio,
+            "response_budget_soft_headroom_alert": bool(
+                effective_body_budget > 0 and soft_remaining_ratio <= 0.10
+            ),
+            "response_rejection_rate_alert": response_rejections_1m >= 5,
+            "response_buffer_events_recorded_total": (
+                self._response_event_sequence
+            ),
+            "response_buffer_event_history_overwritten_total": (
+                self._response_event_history_overwritten
+            ),
+            "response_buffer_event_record_failures_total": (
+                self._response_event_record_failures
+            ),
+            "response_buffer_event_observer_errors_total": (
+                self._response_event_observer_errors
+            ),
+            "response_buffer_event_observer_enqueue_failures_total": (
+                self._response_event_observer_enqueue_failures
+            ),
         }
 
 

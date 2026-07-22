@@ -393,16 +393,16 @@ def finalize_latest_routing_attempt(
     response_memory_lease: Any = None,
     **kwargs: Any,
 ) -> None:
+    finalize_response_memory_attempt(
+        outcome=str(kwargs.get("outcome") or "finished"),
+        lease=response_memory_lease,
+    )
     if not isinstance(current_info, dict):
         return
     attempts = current_info.get("routing_attempts")
     if not isinstance(attempts, list) or not attempts:
         return
     finalize_routing_attempt_entry(attempts[-1], **kwargs)
-    finalize_response_memory_attempt(
-        outcome=str(kwargs.get("outcome") or "finished"),
-        lease=response_memory_lease,
-    )
 
 
 def finalize_response_memory_attempt(

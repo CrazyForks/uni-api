@@ -815,6 +815,16 @@ def test_legacy_stream_channel_result_is_finalized_only_at_terminal_outcome(
         assert completed_info["routing_attempts"][0]["success"] is True
         assert response_attempt_outcomes[-1] == ("stream_completed", False)
 
+        upstream_module.finalize_latest_routing_attempt(
+            {},
+            response_memory_lease=response_memory_lease,
+            outcome="stream_completed_without_routing_entry",
+        )
+        assert response_attempt_outcomes[-1] == (
+            "stream_completed_without_routing_entry",
+            False,
+        )
+
         async def failed_source():
             yield b"first"
             raise RuntimeError("midstream abort")

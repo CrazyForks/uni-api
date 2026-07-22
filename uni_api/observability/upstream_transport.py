@@ -294,23 +294,38 @@ class UpstreamTransportDiagnostics:
                 row["stream_id"] = self._stream_id
             exc = info.get("exception")
             if isinstance(exc, BaseException):
-                diagnostics = exception_diagnostics(exc)
-                row.update(
-                    {
-                        "exception_type": diagnostics["exception_type"],
-                        "exception_module": diagnostics["exception_module"],
-                        "exception_repr": diagnostics["exception_repr"],
-                        "protocol_error_reason": diagnostics[
-                            "protocol_error_reason"
-                        ],
-                    }
-                )
-                self._capture_exception(
-                    diagnostics,
-                    prefix="httpcore_",
-                    stage=stage,
-                )
-                self._raw_exception_captured = True
+                if isinstance(
+                    exc,
+                    (
+                        asyncio.CancelledError,
+                        GeneratorExit,
+                        KeyboardInterrupt,
+                        SystemExit,
+                    ),
+                ):
+                    # httpcore reports GeneratorExit when Ember deliberately
+                    # closes a fully-consumed streaming response. Preserve the
+                    # trace fact without turning normal cleanup into a provider
+                    # transport failure.
+                    row["control_flow_exception_type"] = type(exc).__name__
+                else:
+                    diagnostics = exception_diagnostics(exc)
+                    row.update(
+                        {
+                            "exception_type": diagnostics["exception_type"],
+                            "exception_module": diagnostics["exception_module"],
+                            "exception_repr": diagnostics["exception_repr"],
+                            "protocol_error_reason": diagnostics[
+                                "protocol_error_reason"
+                            ],
+                        }
+                    )
+                    self._capture_exception(
+                        diagnostics,
+                        prefix="httpcore_",
+                        stage=stage,
+                    )
+                    self._raw_exception_captured = True
             if self._client is not None and (
                 name.endswith("send_request_headers.started")
                 or name.endswith(".failed")

@@ -2,6 +2,7 @@ import asyncio
 
 import pytest
 
+import uni_api.admission.core as admission_core
 from uni_api.admission import (
     AdmissionRejected,
     BoundedAdmissionGate,
@@ -520,6 +521,57 @@ def test_response_buffer_lifecycle_records_cross_retry_ownership():
 def test_response_buffer_lifecycle_is_bounded_per_attempt_for_stream_frames():
     async def run():
         events = []
+        transport_outcomes = []
+
+        class Diagnostics:
+            def finalize(self, outcome):
+                transport_outcomes.append(outcome)
+
+        controller = RequestAdmissionController(
+            capacity=1,
+            waiter_limit=0,
+            wait_timeout_seconds=1,
+            max_body_bytes=1_024,
+            body_budget_bytes=1_024,
+            max_response_bytes=1_024,
+            response_buffer_observer=lambda event: events.append(event) or True,
+        )
+        lease = await controller.acquire()
+        lease.begin_response_attempt(
+            {},
+            routing_attempt_id="stream-attempt",
+            routing_attempt_index=1,
+            provider="provider-a",
+            request_model="model-x",
+            actual_model="model-x",
+            transport_diagnostics=Diagnostics(),
+        )
+        lease.finish_response_attempt(
+            outcome="stream_pending",
+            keep_active=True,
+        )
+        for _ in range(100):
+            reservation = await lease.reserve_temporary_response_bytes(1)
+            await reservation.release()
+        lease.finish_response_attempt(outcome="stream_completed")
+        await lease.release()
+
+        assert len(events) == 1
+        summary = events[0]
+        assert summary.event == "attempt_summary"
+        assert summary.outcome == "stream_completed"
+        assert summary.reserve_started_count == 100
+        assert summary.allocation_reserve_call_count == 100
+        assert summary.rollback_count == 100
+        assert summary.rolled_back_bytes == 100
+        assert transport_outcomes == ["stream_pending", "stream_completed"]
+
+    asyncio.run(run())
+
+
+def test_stream_terminal_outcome_wins_after_request_release_is_deferred():
+    async def run():
+        events = []
         controller = RequestAdmissionController(
             capacity=1,
             waiter_limit=0,
@@ -538,19 +590,61 @@ def test_response_buffer_lifecycle_is_bounded_per_attempt_for_stream_frames():
             request_model="model-x",
             actual_model="model-x",
         )
-        for _ in range(100):
-            reservation = await lease.reserve_temporary_response_bytes(1)
-            await reservation.release()
-        lease.finish_response_attempt(outcome="stream_completed")
+        lease.finish_response_attempt(
+            outcome="stream_pending",
+            keep_active=True,
+        )
+        reservation = await lease.reserve_temporary_response_bytes(1)
+
         await lease.release()
+        await reservation.release()
+        lease.finish_response_attempt(outcome="stream_completed")
 
         assert len(events) == 1
-        summary = events[0]
-        assert summary.event == "attempt_summary"
-        assert summary.reserve_started_count == 100
-        assert summary.allocation_reserve_call_count == 100
-        assert summary.rollback_count == 100
-        assert summary.rolled_back_bytes == 100
+        assert events[0].outcome == "stream_completed"
+
+    asyncio.run(run())
+
+
+def test_stream_summary_timeout_is_reported_explicitly(monkeypatch):
+    monkeypatch.setattr(
+        admission_core,
+        "_STREAM_RESPONSE_SUMMARY_FALLBACK_SECONDS",
+        0,
+    )
+
+    async def run():
+        events = []
+        controller = RequestAdmissionController(
+            capacity=1,
+            waiter_limit=0,
+            wait_timeout_seconds=1,
+            max_body_bytes=1_024,
+            body_budget_bytes=1_024,
+            max_response_bytes=1_024,
+            response_buffer_observer=lambda event: events.append(event) or True,
+        )
+        lease = await controller.acquire()
+        lease.begin_response_attempt(
+            {},
+            routing_attempt_id="stream-attempt",
+            routing_attempt_index=1,
+            provider="provider-a",
+            request_model="model-x",
+            actual_model="model-x",
+        )
+        lease.finish_response_attempt(
+            outcome="stream_pending",
+            keep_active=True,
+        )
+        reservation = await lease.reserve_temporary_response_bytes(1)
+
+        await lease.release()
+        await reservation.release()
+        await asyncio.sleep(0)
+
+        assert len(events) == 1
+        assert events[0].outcome == "stream_terminal_unobserved"
 
     asyncio.run(run())
 

@@ -169,6 +169,24 @@ def test_composed_trace_is_fail_open_and_keeps_existing_callback():
     asyncio.run(run())
 
 
+def test_httpcore_control_flow_close_is_not_reported_as_transport_failure():
+    async def run():
+        entry = {}
+        diagnostics = UpstreamTransportDiagnostics(entry)
+
+        await diagnostics.httpcore_trace(
+            "http11.receive_response_body.failed",
+            {"exception": GeneratorExit()},
+        )
+        diagnostics.finalize("stream_completed")
+
+        assert entry["outcome"] == "stream_completed"
+        assert "httpcore_exception_type" not in entry
+        assert "control_flow_exception_type" in entry["httpcore_events_json"]
+
+    asyncio.run(run())
+
+
 def test_managed_client_records_real_http11_connection_metadata():
     async def handle(reader, writer):
         try:

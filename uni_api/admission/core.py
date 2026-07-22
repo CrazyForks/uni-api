@@ -23,6 +23,9 @@ from uni_api.admission.observability import (
 )
 
 
+_STREAM_RESPONSE_SUMMARY_FALLBACK_SECONDS = 5.0
+
+
 class AdmissionRejected(RuntimeError):
     """A bounded admission decision that callers can translate to HTTP."""
 
@@ -462,6 +465,10 @@ class RequestAdmissionLease:
         self._response_attempts_started = 0
         self._response_committed_allocations: dict[str, dict[str, Any]] = {}
         self._response_lifecycle_by_attempt: dict[str, dict[str, Any]] = {}
+        self._deferred_response_summaries: dict[
+            str,
+            tuple[ResponseBufferEvent, asyncio.TimerHandle],
+        ] = {}
 
     @property
     def wait_ms(self) -> float:
@@ -497,6 +504,7 @@ class RequestAdmissionLease:
         provider: str,
         request_model: str,
         actual_model: str,
+        transport_diagnostics: Any = None,
     ) -> None:
         """Bind response-memory ownership to the currently executing retry."""
 
@@ -529,6 +537,7 @@ class RequestAdmissionLease:
             "retained_before_bytes": retained_before,
             "lifecycle_key": lifecycle_key,
             "entry": entry,
+            "transport_diagnostics": transport_diagnostics,
         }
         self._response_attempt = attempt
         self._response_lifecycle_by_attempt.setdefault(
@@ -600,7 +609,21 @@ class RequestAdmissionLease:
             lifecycle["global_response_after"] = (
                 self._controller._reserved_response_bytes
             )
+        diagnostics = attempt.get("transport_diagnostics")
+        finalize_diagnostics = getattr(diagnostics, "finalize", None)
+        if callable(finalize_diagnostics):
+            try:
+                finalize_diagnostics(str(outcome)[:80])
+            except Exception:
+                # Transport diagnostics are strictly fail-open and must never
+                # alter response-memory ownership or the downstream response.
+                pass
         if not keep_active:
+            self._controller._complete_deferred_response_summary(
+                self,
+                lifecycle_key,
+                outcome=str(outcome)[:80],
+            )
             self._response_attempt = None
 
     async def reserve_body_bytes(
@@ -1662,6 +1685,75 @@ class RequestAdmissionController:
             if accepted is False:
                 self._response_event_observer_enqueue_failures += 1
 
+    def _replace_response_event_history(
+        self,
+        original: ResponseBufferEvent,
+        updated: ResponseBufferEvent,
+    ) -> None:
+        for index, event in enumerate(self._response_event_history):
+            if event.sequence == original.sequence:
+                self._response_event_history[index] = updated
+                return
+        if len(self._response_event_history) == self._response_event_history.maxlen:
+            self._response_event_history_overwritten += 1
+        self._response_event_history.append(updated)
+
+    def _defer_response_summary_locked(
+        self,
+        lease: RequestAdmissionLease,
+        lifecycle_key: str,
+        event: ResponseBufferEvent,
+    ) -> bool:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        handle = loop.call_later(
+            _STREAM_RESPONSE_SUMMARY_FALLBACK_SECONDS,
+            self._expire_deferred_response_summary,
+            lease,
+            lifecycle_key,
+        )
+        lease._deferred_response_summaries[lifecycle_key] = (event, handle)
+        return True
+
+    def _complete_deferred_response_summary(
+        self,
+        lease: RequestAdmissionLease,
+        lifecycle_key: str,
+        *,
+        outcome: str,
+    ) -> None:
+        pending = lease._deferred_response_summaries.pop(
+            lifecycle_key,
+            None,
+        )
+        if pending is None:
+            return
+        event, handle = pending
+        handle.cancel()
+        finalized = replace(event, outcome=str(outcome)[:80])
+        self._replace_response_event_history(event, finalized)
+        lease._response_lifecycle_by_attempt.pop(lifecycle_key, None)
+        self._publish_response_buffer_events([finalized])
+
+    def _expire_deferred_response_summary(
+        self,
+        lease: RequestAdmissionLease,
+        lifecycle_key: str,
+    ) -> None:
+        pending = lease._deferred_response_summaries.pop(
+            lifecycle_key,
+            None,
+        )
+        if pending is None:
+            return
+        event, _handle = pending
+        finalized = replace(event, outcome="stream_terminal_unobserved")
+        self._replace_response_event_history(event, finalized)
+        lease._response_lifecycle_by_attempt.pop(lifecycle_key, None)
+        self._publish_response_buffer_events([finalized])
+
     def recent_response_buffer_events(self) -> tuple[ResponseBufferEvent, ...]:
         return tuple(self._response_event_history)
 
@@ -2089,11 +2181,15 @@ class RequestAdmissionController:
             if self._memory_governor is not None
             else None
         )
-        for lifecycle in lease._response_lifecycle_by_attempt.values():
+        completed_lifecycle_keys: list[str] = []
+        for lifecycle_key, lifecycle in tuple(
+            lease._response_lifecycle_by_attempt.items()
+        ):
             committed_bytes = int(lifecycle.get("committed_bytes") or 0)
             released_bytes = int(lifecycle.get("released_bytes") or 0)
+            summary_events: list[ResponseBufferEvent] = []
             self._record_response_buffer_event_locked(
-                response_events,
+                summary_events,
                 lease,
                 event="attempt_summary",
                 outcome=str(lifecycle.get("outcome") or "finished")[:80],
@@ -2141,7 +2237,35 @@ class RequestAdmissionController:
                 released_bytes=released_bytes,
                 rejection_count=int(lifecycle.get("rejection_count") or 0),
             )
-        lease._response_lifecycle_by_attempt.clear()
+            summary_event = summary_events[0]
+            active_attempt = lease._response_attempt
+            is_active_stream_pending = bool(
+                summary_event.outcome == "stream_pending"
+                and isinstance(active_attempt, dict)
+                and str(active_attempt.get("lifecycle_key") or "")
+                == lifecycle_key
+            )
+            if is_active_stream_pending and self._defer_response_summary_locked(
+                lease,
+                lifecycle_key,
+                summary_event,
+            ):
+                continue
+            if is_active_stream_pending:
+                fallback_event = replace(
+                    summary_event,
+                    outcome="stream_terminal_unobserved",
+                )
+                self._replace_response_event_history(
+                    summary_event,
+                    fallback_event,
+                )
+                response_events.append(fallback_event)
+            else:
+                response_events.append(summary_event)
+            completed_lifecycle_keys.append(lifecycle_key)
+        for lifecycle_key in completed_lifecycle_keys:
+            lease._response_lifecycle_by_attempt.pop(lifecycle_key, None)
         self._release_large_body_slot_locked(
             lease,
             request_before=reserved_body_bytes,

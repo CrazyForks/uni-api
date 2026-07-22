@@ -66,6 +66,7 @@ from upstream import (
     UpstreamRunner,
     build_upstream_error_response,
     finalize_latest_routing_attempt,
+    finalize_response_memory_attempt,
     finalize_routing_attempt,
 )
 from fugue_observability import (
@@ -7382,6 +7383,10 @@ class ResponsesRequestExecution:
                                     outcome="consumer_or_shutdown_unknown",
                                     success=None,
                                 )
+                                finalize_response_memory_attempt(
+                                    attempt=attempt,
+                                    outcome="consumer_or_shutdown_unknown",
+                                )
                         terminal_or_usage_missing = (
                             not (completed_seen or incomplete_seen)
                             or not usage_seen
@@ -7442,6 +7447,10 @@ class ResponsesRequestExecution:
             status_code=int(attempt.state.get("stream_upstream_status_code") or 200),
             success=True,
         )
+        finalize_response_memory_attempt(
+            attempt=attempt,
+            outcome="stream_completed",
+        )
         self._mark_success(
             attempt.state["channel_id"],
             attempt.provider_api_key_raw,
@@ -7469,6 +7478,10 @@ class ResponsesRequestExecution:
             error_code=error_code,
             error_message=exc,
         )
+        finalize_response_memory_attempt(
+            attempt=attempt,
+            outcome="stream_failed",
+        )
         if attempt.state.get("track_channel_stats"):
             self._schedule_channel_stats(
                 attempt.state["channel_id"],
@@ -7495,6 +7508,14 @@ class ResponsesRequestExecution:
             status_code=499,
             success=False,
             error_type="DownstreamDisconnected",
+        )
+        finalize_response_memory_attempt(
+            attempt=attempt,
+            outcome=(
+                "downstream_disconnected"
+                if downstream_disconnected
+                else "cancelled_or_consumer_closed"
+            ),
         )
 
     def _downstream_disconnected(self, attempt: Any, *, stage: str) -> bool:

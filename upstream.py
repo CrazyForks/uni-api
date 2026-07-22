@@ -397,6 +397,31 @@ def finalize_latest_routing_attempt(
     if not isinstance(attempts, list) or not attempts:
         return
     finalize_routing_attempt_entry(attempts[-1], **kwargs)
+    finalize_response_memory_attempt(
+        outcome=str(kwargs.get("outcome") or "finished"),
+    )
+
+
+def finalize_response_memory_attempt(
+    *,
+    outcome: str,
+    attempt: Any = None,
+) -> None:
+    """Finalize the response-buffer attempt when a stream really terminates."""
+
+    lease = None
+    state = getattr(attempt, "state", None)
+    if isinstance(state, dict):
+        lease = state.get("_response_memory_lease")
+    if lease is None:
+        lease = get_request_admission_lease()
+    if lease is None:
+        return
+    try:
+        lease.finish_response_attempt(outcome=str(outcome)[:80])
+    except Exception:
+        # Observability finalization is fail-open by contract.
+        return
 
 
 class UpstreamRunner:
@@ -449,6 +474,7 @@ class UpstreamRunner:
                         getattr(self.plan, "request_model_name", "") or ""
                     ),
                     actual_model=attempt.original_model,
+                    transport_diagnostics=transport_diagnostics,
                 )
             return None
 
@@ -503,6 +529,7 @@ class UpstreamRunner:
                     getattr(self.plan, "request_model_name", "") or ""
                 ),
                 actual_model=attempt.original_model,
+                transport_diagnostics=transport_diagnostics,
             )
         return entry
 

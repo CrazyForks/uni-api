@@ -36,6 +36,7 @@ from uni_api.upstream.client_pool import UpstreamAdmissionRejected
 from uni_api.upstream.responses_errors import responses_failure_error
 import uni_api.runtime as runtime
 import uni_api.streaming.cleanup as stream_cleanup
+import upstream as upstream_module
 
 
 def _scope(*, method: str = "GET", path: str = "/v1/test") -> dict:
@@ -771,6 +772,17 @@ def test_legacy_stream_channel_result_is_finalized_only_at_terminal_outcome(
 ):
     async def scenario():
         recorded = []
+        response_attempt_outcomes = []
+
+        class ResponseMemoryLease:
+            def finish_response_attempt(self, *, outcome, keep_active=False):
+                response_attempt_outcomes.append((outcome, keep_active))
+
+        monkeypatch.setattr(
+            upstream_module,
+            "get_request_admission_lease",
+            lambda: ResponseMemoryLease(),
+        )
 
         def record(*args, success, **kwargs):
             recorded.append(success)
@@ -799,6 +811,7 @@ def test_legacy_stream_channel_result_is_finalized_only_at_terminal_outcome(
         assert completed_info["success"] is True
         assert completed_info["routing_attempts"][0]["outcome"] == "stream_completed"
         assert completed_info["routing_attempts"][0]["success"] is True
+        assert response_attempt_outcomes[-1] == ("stream_completed", False)
 
         async def failed_source():
             yield b"first"
@@ -825,6 +838,7 @@ def test_legacy_stream_channel_result_is_finalized_only_at_terminal_outcome(
         assert failed_info["stream_outcome"] == "upstream_stream_abort"
         assert failed_info["routing_attempts"][0]["outcome"] == "stream_failed"
         assert failed_info["routing_attempts"][0]["semantic_status_code"] == 502
+        assert response_attempt_outcomes[-1] == ("stream_failed", False)
 
         async def protocol_failed_source():
             yield b"event: image_edit.partial_image\ndata: {}\n\n"

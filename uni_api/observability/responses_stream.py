@@ -11,10 +11,10 @@ import re
 import secrets
 import weakref
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _MAX_CAUSE_DEPTH = 16
 _MAX_TRACE_EVENTS = 32
 _MAX_CLEANUP_ACTIONS = 8
@@ -25,6 +25,13 @@ _ENDPOINT_HMAC_KEY = secrets.token_bytes(32)
 _TrackerRef = weakref.ReferenceType[Any]
 _SOCKET_TRACKERS: dict[str, set[_TrackerRef]] = {}
 _NETWORK_STREAM_TRACKERS: dict[int, set[_TrackerRef]] = {}
+
+OAIX_TERMINAL_FLUSH_MARKER_HEADER = "x-oaix-terminal-flush-marker"
+OAIX_TERMINAL_FLUSH_MARKER_CONTRACT = "sse-comment-v1"
+OAIX_TERMINAL_FLUSH_MARKER_PREFIX = ": oaix-terminal-flush-v1 "
+_OAIX_TERMINAL_FLUSH_MARKER_MAX_BYTES = 1024
+_TERMINAL_HOP_MAX_MS = 5 * 60 * 1000
+_TERMINAL_HOP_NEGATIVE_TOLERANCE_MS = 5.0
 
 _EVENT_LINE_RE = re.compile(r"(?m)^event:[ \t]?(?P<event>[^\r\n]*)$")
 _SAFE_RESPONSES_EVENT_TYPES = frozenset(
@@ -117,6 +124,53 @@ def _safe_text(value: Any, *, max_bytes: int = 512) -> str | None:
     if len(encoded) > max_bytes:
         candidate = encoded[:max_bytes].decode("utf-8", errors="ignore")
     return candidate
+
+
+def is_oaix_terminal_flush_marker(raw_event: str) -> bool:
+    if not isinstance(raw_event, str):
+        return False
+    return raw_event.startswith(OAIX_TERMINAL_FLUSH_MARKER_PREFIX)
+
+
+def _parse_oaix_terminal_flush_marker(raw_event: str) -> dict[str, Any] | None:
+    if not is_oaix_terminal_flush_marker(raw_event):
+        return None
+    encoded = raw_event.encode("utf-8", errors="replace")
+    if len(encoded) > _OAIX_TERMINAL_FLUSH_MARKER_MAX_BYTES:
+        return None
+    if "\n" in raw_event or "\r" in raw_event:
+        return None
+    payload_text = raw_event[len(OAIX_TERMINAL_FLUSH_MARKER_PREFIX) :].strip()
+    try:
+        payload = json.loads(payload_text)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        schema_version = int(payload.get("schema_version") or 0)
+    except (TypeError, ValueError):
+        return None
+    if schema_version != 1:
+        return None
+    digest = str(payload.get("terminal_wire_sha256") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        return None
+    try:
+        flush_attempted_ns = int(payload.get("flush_attempted_unix_nano"))
+        flush_completed_ns = int(payload.get("flush_completed_unix_nano"))
+    except (TypeError, ValueError):
+        return None
+    if flush_attempted_ns <= 0 or flush_completed_ns < flush_attempted_ns:
+        return None
+    connection_id = _safe_text(payload.get("connection_id"), max_bytes=256)
+    return {
+        "schema_version": 1,
+        "connection_id": connection_id,
+        "terminal_wire_sha256": digest,
+        "flush_attempted_unix_nano": flush_attempted_ns,
+        "flush_completed_unix_nano": flush_completed_ns,
+    }
 
 
 def _redacted_error_text(exc: BaseException) -> str | None:
@@ -436,12 +490,28 @@ class ResponsesStreamDiagnostics:
         attempt_index: int | None,
         logical_authority: str | None,
         proxy_configured: bool,
+        sse_chunk_observer: Callable[[int], Any] | None = None,
+        sse_event_observer: Callable[[int], Any] | None = None,
+        terminal_hop_observer: Callable[[dict[str, Any]], Any] | None = None,
+        terminal_marker_missing_observer: Callable[[], Any] | None = None,
     ) -> None:
         self._socket_inode: str | None = None
         self._network_stream_id: int | None = None
         self._cleanup_claimed = False
         self._cleanup_owner_claimed = False
         self._observed_event_facts: dict[int, tuple[int, int, str]] = {}
+        self._sse_chunk_observer = sse_chunk_observer
+        self._sse_event_observer = sse_event_observer
+        self._terminal_hop_observer = terminal_hop_observer
+        self._terminal_marker_missing_observer = (
+            terminal_marker_missing_observer
+        )
+        self._request_id = _safe_text(current_info.get("request_id"), max_bytes=256)
+        self._trace_id = _safe_text(current_info.get("trace_id"), max_bytes=256)
+        self._declared_terminal_received_at: datetime | None = None
+        self._oaix_terminal_flush_marker: dict[str, Any] | None = None
+        self._terminal_hop_emitted = False
+        self._terminal_marker_missing_recorded = False
         self._facts: dict[str, Any] = {
             "schema_version": _SCHEMA_VERSION,
             "hash_scope": "ember_normalized_sse_event_lf_v1",
@@ -467,6 +537,9 @@ class ResponsesStreamDiagnostics:
             "usage_seen": False,
             "downstream_terminal_seen": False,
             "downstream_terminal_asgi_write_completed": False,
+            "oaix_terminal_flush_marker_expected": False,
+            "oaix_terminal_flush_marker_seen": False,
+            "oaix_terminal_flush_to_ember_receive_observed": False,
             "error_event_seen": False,
             "diagnosis": "responses_stream_in_progress",
             "phase": "upstream_headers",
@@ -488,6 +561,38 @@ class ResponsesStreamDiagnostics:
     def facts(self) -> dict[str, Any]:
         return self._facts
 
+    @property
+    def expects_oaix_terminal_flush_marker(self) -> bool:
+        return bool(self._facts.get("oaix_terminal_flush_marker_expected"))
+
+    @property
+    def terminal_hop_observed(self) -> bool:
+        return bool(
+            self._facts.get(
+                "oaix_terminal_flush_to_ember_receive_observed"
+            )
+        )
+
+    def mark_terminal_flush_marker_missing(self, reason: str) -> None:
+        if not self.expects_oaix_terminal_flush_marker:
+            return
+        if self.terminal_hop_observed or self._terminal_marker_missing_recorded:
+            return
+        self._terminal_marker_missing_recorded = True
+        self._facts["oaix_terminal_flush_marker_missing"] = True
+        self._facts["oaix_terminal_flush_marker_missing_reason"] = (
+            _safe_text(reason, max_bytes=80) or "unknown"
+        )
+        self._facts["oaix_terminal_flush_marker_missing_at"] = _utc_now()
+        observer = self._terminal_marker_missing_observer
+        if observer is not None:
+            try:
+                observer()
+            except Exception as exc:
+                self._facts["terminal_marker_missing_observer_error"] = (
+                    type(exc).__name__
+                )
+
     def capture_response(self, response: Any) -> None:
         try:
             extensions = getattr(response, "extensions", None)
@@ -506,11 +611,18 @@ class ResponsesStreamDiagnostics:
 
             headers = getattr(response, "headers", None)
             connection_id = None
+            terminal_flush_marker_contract = None
             if headers is not None:
                 try:
                     connection_id = headers.get("x-oaix-connection-id")
                 except Exception:
                     connection_id = None
+                try:
+                    terminal_flush_marker_contract = headers.get(
+                        OAIX_TERMINAL_FLUSH_MARKER_HEADER
+                    )
+                except Exception:
+                    terminal_flush_marker_contract = None
                 if connection_id is None:
                     try:
                         connection_id = next(
@@ -520,9 +632,29 @@ class ResponsesStreamDiagnostics:
                         )
                     except (AttributeError, StopIteration, TypeError):
                         connection_id = None
+                if terminal_flush_marker_contract is None:
+                    try:
+                        terminal_flush_marker_contract = next(
+                            value
+                            for name, value in headers.items()
+                            if str(name).lower()
+                            == OAIX_TERMINAL_FLUSH_MARKER_HEADER
+                        )
+                    except (AttributeError, StopIteration, TypeError):
+                        terminal_flush_marker_contract = None
             connection_id = _safe_text(connection_id, max_bytes=256)
             if connection_id:
                 self._facts["oaix_connection_id"] = connection_id
+            marker_contract = _safe_text(
+                terminal_flush_marker_contract,
+                max_bytes=64,
+            )
+            if marker_contract:
+                self._facts["oaix_terminal_flush_marker_contract"] = (
+                    marker_contract
+                )
+            if marker_contract == OAIX_TERMINAL_FLUSH_MARKER_CONTRACT:
+                self._facts["oaix_terminal_flush_marker_expected"] = True
 
             network_stream = extensions.get("network_stream")
             get_extra_info = getattr(network_stream, "get_extra_info", None)
@@ -594,6 +726,12 @@ class ResponsesStreamDiagnostics:
             self._facts.get("upstream_chunk_count") or 0
         ) + 1
         self._facts.setdefault("first_upstream_body_at", _utc_now())
+        observer = self._sse_chunk_observer
+        if observer is not None:
+            try:
+                observer(max(0, int(size)))
+            except Exception as exc:
+                self._facts["sse_chunk_observer_error"] = type(exc).__name__
 
     def observe_complete_event(
         self,
@@ -602,12 +740,23 @@ class ResponsesStreamDiagnostics:
         has_data_field: bool = True,
     ) -> None:
         try:
+            if is_oaix_terminal_flush_marker(raw_event):
+                self._observe_oaix_terminal_flush_marker(raw_event)
+                return
             encoded = raw_event.encode("utf-8")
             digest = hashlib.sha256()
             digest.update(encoded)
             digest.update(b"\n\n")
             ordinal = int(self._facts.get("complete_event_count") or 0) + 1
             event_type = _event_type(raw_event)
+            received_at = datetime.now(timezone.utc)
+            received_at_text = received_at.isoformat()
+            observer = self._sse_event_observer
+            if observer is not None:
+                try:
+                    observer(len(encoded) + 2)
+                except Exception as exc:
+                    self._facts["sse_event_observer_error"] = type(exc).__name__
             if has_data_field:
                 if len(self._observed_event_facts) >= _MAX_EVENT_FACT_CACHE:
                     self._observed_event_facts.pop(
@@ -626,7 +775,7 @@ class ResponsesStreamDiagnostics:
                     "last_event_type": event_type,
                     "last_event_bytes": len(encoded) + 2,
                     "last_event_sha256": digest.hexdigest(),
-                    "last_event_received_at": _utc_now(),
+                    "last_event_received_at": received_at_text,
                 }
             )
             if has_data_field and event_type in {
@@ -640,10 +789,134 @@ class ResponsesStreamDiagnostics:
                 self._facts["declared_terminal_ordinal"] = ordinal
                 self._facts["declared_terminal_bytes"] = len(encoded) + 2
                 self._facts["declared_terminal_sha256"] = digest.hexdigest()
-                self._facts["declared_terminal_received_at"] = _utc_now()
+                self._facts["declared_terminal_received_at"] = received_at_text
+                self._declared_terminal_received_at = received_at
+                self._try_emit_terminal_hop_observation()
             self._refresh_diagnosis()
         except Exception as exc:
             self._facts["event_observer_error"] = type(exc).__name__
+
+    def _observe_oaix_terminal_flush_marker(self, raw_event: str) -> None:
+        self._facts["oaix_terminal_flush_marker_seen"] = True
+        self._facts["oaix_terminal_flush_marker_received_at"] = _utc_now()
+        marker = _parse_oaix_terminal_flush_marker(raw_event)
+        if marker is None:
+            self._facts["oaix_terminal_flush_marker_valid"] = False
+            self._facts["oaix_terminal_flush_marker_invalid_reason"] = (
+                "invalid_payload"
+            )
+            return
+        expected_connection = _safe_text(
+            self._facts.get("oaix_connection_id"),
+            max_bytes=256,
+        )
+        marker_connection = _safe_text(
+            marker.get("connection_id"),
+            max_bytes=256,
+        )
+        if expected_connection and marker_connection != expected_connection:
+            self._facts["oaix_terminal_flush_marker_valid"] = False
+            self._facts["oaix_terminal_flush_marker_invalid_reason"] = (
+                "connection_id_mismatch"
+            )
+            return
+        self._facts["oaix_terminal_flush_marker_valid"] = True
+        self._facts["oaix_terminal_flush_marker_schema_version"] = 1
+        self._facts["oaix_terminal_flush_marker_wire_sha256"] = marker[
+            "terminal_wire_sha256"
+        ]
+        self._facts["oaix_terminal_flush_attempted_unix_nano"] = marker[
+            "flush_attempted_unix_nano"
+        ]
+        self._facts["oaix_terminal_flush_completed_unix_nano"] = marker[
+            "flush_completed_unix_nano"
+        ]
+        self._oaix_terminal_flush_marker = marker
+        self._try_emit_terminal_hop_observation()
+
+    def _try_emit_terminal_hop_observation(self) -> None:
+        if self._terminal_hop_emitted:
+            return
+        marker = self._oaix_terminal_flush_marker
+        terminal_received_at = self._declared_terminal_received_at
+        if marker is None or terminal_received_at is None:
+            return
+        marker_digest = str(marker.get("terminal_wire_sha256") or "")
+        terminal_digest = str(
+            self._facts.get("declared_terminal_sha256") or ""
+        )
+        if not terminal_digest or marker_digest != terminal_digest:
+            self._facts["oaix_terminal_flush_marker_hash_matched"] = False
+            self._facts["oaix_terminal_flush_marker_invalid_reason"] = (
+                "terminal_hash_mismatch"
+            )
+            return
+        self._facts["oaix_terminal_flush_marker_hash_matched"] = True
+        attempted_ns = int(marker["flush_attempted_unix_nano"])
+        completed_ns = int(marker["flush_completed_unix_nano"])
+        attempted_at = datetime.fromtimestamp(
+            attempted_ns / 1_000_000_000,
+            tz=timezone.utc,
+        )
+        completed_at = datetime.fromtimestamp(
+            completed_ns / 1_000_000_000,
+            tz=timezone.utc,
+        )
+        signed_lag_ms = (
+            terminal_received_at - completed_at
+        ).total_seconds() * 1000.0
+        attempted_lag_ms = (
+            terminal_received_at - attempted_at
+        ).total_seconds() * 1000.0
+        flush_duration_ms = (completed_at - attempted_at).total_seconds() * 1000.0
+        self._facts["oaix_terminal_flush_attempted_at"] = attempted_at.isoformat()
+        self._facts["oaix_terminal_flush_completed_at"] = completed_at.isoformat()
+        self._facts["oaix_terminal_flush_duration_ms"] = flush_duration_ms
+        self._facts[
+            "oaix_terminal_flush_to_ember_receive_signed_ms"
+        ] = signed_lag_ms
+        self._facts[
+            "oaix_terminal_flush_attempt_to_ember_receive_ms"
+        ] = attempted_lag_ms
+        if signed_lag_ms < -_TERMINAL_HOP_NEGATIVE_TOLERANCE_MS:
+            self._facts["oaix_terminal_flush_marker_invalid_reason"] = (
+                "negative_cross_clock_lag"
+            )
+            return
+        if signed_lag_ms > _TERMINAL_HOP_MAX_MS:
+            self._facts["oaix_terminal_flush_marker_invalid_reason"] = (
+                "lag_exceeds_bound"
+            )
+            return
+        lag_ms = max(0.0, signed_lag_ms)
+        if signed_lag_ms < 0:
+            self._facts["oaix_terminal_flush_lag_clamped_for_clock_order"] = True
+        self._facts[
+            "oaix_terminal_flush_to_ember_receive_ms"
+        ] = lag_ms
+        self._facts[
+            "oaix_terminal_flush_to_ember_receive_observed"
+        ] = True
+        self._terminal_hop_emitted = True
+        observation = {
+            "schema_version": 1,
+            "request_id": self._request_id,
+            "trace_id": self._trace_id,
+            "oaix_connection_id": self._facts.get("oaix_connection_id"),
+            "terminal_wire_sha256": terminal_digest,
+            "flush_attempted_at": attempted_at.isoformat(),
+            "flush_completed_at": completed_at.isoformat(),
+            "terminal_received_at": terminal_received_at.isoformat(),
+            "flush_duration_ms": flush_duration_ms,
+            "lag_ms": lag_ms,
+            "signed_lag_ms": signed_lag_ms,
+        }
+        observer = self._terminal_hop_observer
+        if observer is not None:
+            try:
+                observer(observation)
+            except Exception as exc:
+                self._facts["terminal_hop_observer_error"] = type(exc).__name__
 
     def observe_normalization(self, rule: str, event_type: Any) -> None:
         safe_event_type = safe_responses_event_type(event_type)

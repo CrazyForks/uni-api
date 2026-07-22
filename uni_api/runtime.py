@@ -145,13 +145,18 @@ from uni_api.observability.telemetry import (
     emit_large_body_admission_decision,
     emit_request_observability,
     emit_response_buffer_event,
+    emit_terminal_hop_observation,
+    emit_worker_cpu_profile,
+    emit_worker_runtime_snapshot,
     observability_exporter_snapshot,
 )
 from uni_api.observability.responses_stream import (
     ObservedResponseByteIterator,
     ResponsesStreamDiagnostics,
+    is_oaix_terminal_flush_marker,
     observe_pool_sweeper_connection_close,
 )
+from uni_api.observability.worker_runtime import WorkerRuntimeObserver
 from uni_api.observability.middleware import (
     StatsMiddleware,
     StatsMiddlewareDependencies,
@@ -603,6 +608,9 @@ class RuntimeGauges:
         self._observability_exporter_snapshot: Optional[
             Callable[[], dict[str, int]]
         ] = None
+        self._worker_runtime_snapshot: Optional[
+            Callable[[], dict[str, Any]]
+        ] = None
         self._network_sampler_task: Optional[asyncio.Task[None]] = None
         self._stream_queues: dict[int, ByteBoundedQueue] = {}
         self._retired_stream_queue_blocked_puts = 0
@@ -645,6 +653,12 @@ class RuntimeGauges:
         snapshot: Callable[[], dict[str, int]],
     ) -> None:
         self._observability_exporter_snapshot = snapshot
+
+    def attach_worker_runtime(
+        self,
+        snapshot: Callable[[], dict[str, Any]],
+    ) -> None:
+        self._worker_runtime_snapshot = snapshot
 
 
     def register_stream_queue(self, queue: ByteBoundedQueue) -> None:
@@ -838,6 +852,9 @@ class RuntimeGauges:
         observability_exporter: dict[str, int] = {}
         if self._observability_exporter_snapshot is not None:
             observability_exporter = self._observability_exporter_snapshot()
+        worker_runtime: dict[str, Any] = {}
+        if self._worker_runtime_snapshot is not None:
+            worker_runtime = self._worker_runtime_snapshot()
         stream_queue_blocked_puts = self._retired_stream_queue_blocked_puts + sum(
             snapshot.blocked_puts for snapshot in queue_snapshots
         )
@@ -849,6 +866,8 @@ class RuntimeGauges:
         )
         return {
             "service": "uni-api-ember",
+            "worker_runtime": worker_runtime,
+            **worker_runtime,
             # Keep the established name, but source it from the outer ASGI
             # lease so streaming requests remain active until their final byte.
             "inflight_requests": request_active,
@@ -1081,6 +1100,42 @@ class RuntimeGauges:
             "runtime_global_response_buffer_event_export_errors_total": observability_exporter.get(
                 "response_buffer_event_export_errors_total"
             ),
+            "runtime_global_worker_runtime_snapshot_export_enqueued_total": observability_exporter.get(
+                "worker_runtime_snapshot_enqueued_total"
+            ),
+            "runtime_global_worker_runtime_snapshot_export_enqueue_dropped_total": observability_exporter.get(
+                "worker_runtime_snapshot_enqueue_dropped_total"
+            ),
+            "runtime_global_worker_runtime_snapshot_export_build_errors_total": observability_exporter.get(
+                "worker_runtime_snapshot_build_errors_total"
+            ),
+            "runtime_global_worker_runtime_snapshot_export_errors_total": observability_exporter.get(
+                "worker_runtime_snapshot_export_errors_total"
+            ),
+            "runtime_global_worker_cpu_profile_export_enqueued_total": observability_exporter.get(
+                "worker_cpu_profile_enqueued_total"
+            ),
+            "runtime_global_worker_cpu_profile_export_enqueue_dropped_total": observability_exporter.get(
+                "worker_cpu_profile_enqueue_dropped_total"
+            ),
+            "runtime_global_worker_cpu_profile_export_build_errors_total": observability_exporter.get(
+                "worker_cpu_profile_build_errors_total"
+            ),
+            "runtime_global_worker_cpu_profile_export_errors_total": observability_exporter.get(
+                "worker_cpu_profile_export_errors_total"
+            ),
+            "runtime_global_terminal_hop_observation_export_enqueued_total": observability_exporter.get(
+                "terminal_hop_observation_enqueued_total"
+            ),
+            "runtime_global_terminal_hop_observation_export_enqueue_dropped_total": observability_exporter.get(
+                "terminal_hop_observation_enqueue_dropped_total"
+            ),
+            "runtime_global_terminal_hop_observation_export_build_errors_total": observability_exporter.get(
+                "terminal_hop_observation_build_errors_total"
+            ),
+            "runtime_global_terminal_hop_observation_export_errors_total": observability_exporter.get(
+                "terminal_hop_observation_export_errors_total"
+            ),
             "middleware_inflight_requests": self.inflight_requests,
             "waiting_first_byte": len(self.waiting_first_byte_requests) + self.waiting_first_byte_untracked,
             "event_loop_lag_ms": self.event_loop_lag_ms,
@@ -1202,6 +1257,13 @@ class RuntimeGauges:
 runtime_gauges = RuntimeGauges()
 runtime_gauges.attach_memory_parent(process_memory_governor.snapshot)
 runtime_gauges.attach_observability_exporter(observability_exporter_snapshot)
+worker_runtime_observer = WorkerRuntimeObserver(
+    inflight_supplier=lambda: runtime_gauges.inflight_requests,
+    snapshot_emitter=emit_worker_runtime_snapshot,
+    profile_emitter=emit_worker_cpu_profile,
+    terminal_hop_emitter=emit_terminal_hop_observation,
+)
+runtime_gauges.attach_worker_runtime(worker_runtime_observer.snapshot)
 
 _startup_memory_snapshot = process_memory_governor.snapshot(force=True)
 _startup_memory_available = (
@@ -2297,6 +2359,10 @@ async def lifespan(app: FastAPI):
     await runtime_gauges.start_network_sampler()
     await _start_responses_stream_stats_workers()
     await start_fugue_observability_from_env(service_version=VERSION)
+    try:
+        await worker_runtime_observer.start()
+    except Exception:
+        logger.exception("Worker runtime observability failed to start")
 
     yield
     # 关闭时的代码
@@ -2309,6 +2375,10 @@ async def lifespan(app: FastAPI):
         json.dumps(stream_cleanup_snapshot, ensure_ascii=False, default=str),
     )
     await _stop_responses_stream_stats_workers(timeout=5.0)
+    try:
+        await worker_runtime_observer.stop()
+    except Exception:
+        logger.exception("Worker runtime observability failed to stop cleanly")
     await stop_fugue_observability()
     await runtime_gauges.stop_network_sampler()
     if hasattr(app.state, 'client_manager'):
@@ -5220,6 +5290,65 @@ def _observed_responses_stream_chunk(
         semantic_outcome=semantic_outcome,
     )
 
+
+async def _consume_expected_oaix_terminal_flush_marker(
+    source: Any,
+    diagnostics: ResponsesStreamDiagnostics,
+    *,
+    timeout_seconds: float = 0.25,
+    max_frames: int = 4,
+) -> None:
+    """Consume OAIX's post-terminal diagnostic comment without forwarding it.
+
+    The terminal has already been handed to the downstream queue. OAIX writes
+    this marker immediately after its successful terminal flush. A strict,
+    short bound keeps a missing observability marker from extending a business
+    request or holding an upstream connection indefinitely.
+    """
+
+    if not diagnostics.expects_oaix_terminal_flush_marker:
+        return
+    if diagnostics.terminal_hop_observed:
+        return
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.01, float(timeout_seconds))
+    for _ in range(max(1, int(max_frames))):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            diagnostics.mark_terminal_flush_marker_missing("timeout")
+            return
+        raw_event = None
+        reservation = None
+        try:
+            raw_event, reservation, _from_precommit = await asyncio.wait_for(
+                source.__anext__(),
+                timeout=remaining,
+            )
+        except StopAsyncIteration:
+            diagnostics.mark_terminal_flush_marker_missing("upstream_eof")
+            return
+        except asyncio.TimeoutError:
+            diagnostics.mark_terminal_flush_marker_missing("timeout")
+            return
+        try:
+            if is_oaix_terminal_flush_marker(raw_event):
+                if not diagnostics.terminal_hop_observed:
+                    diagnostics.mark_terminal_flush_marker_missing(
+                        "invalid_marker"
+                    )
+                return
+            if not is_sse_comment_frame(raw_event):
+                diagnostics.mark_terminal_flush_marker_missing(
+                    "unexpected_post_terminal_event"
+                )
+                return
+        finally:
+            raw_event = None
+            if reservation is not None:
+                await reservation.release()
+                reservation = None
+    diagnostics.mark_terminal_flush_marker_missing("frame_limit")
+
 def _build_responses_stream_keepalive_event() -> bytes:
     return _encode_responses_sse_event(
         "keepalive",
@@ -6700,6 +6829,12 @@ class ResponsesRequestExecution:
                 attempt.state.get("upstream_url")
             ),
             proxy_configured=bool(attempt.state.get("proxy")),
+            sse_chunk_observer=worker_runtime_observer.record_sse_chunk,
+            sse_event_observer=worker_runtime_observer.record_sse_event,
+            terminal_hop_observer=worker_runtime_observer.record_terminal_hop,
+            terminal_marker_missing_observer=(
+                worker_runtime_observer.record_terminal_marker_missing
+            ),
         )
         attempt.state["responses_stream_diagnostics_tracker"] = diagnostics
         first_byte_timeout = _optional_positive_timeout(attempt.state.get("first_byte_timeout"))
@@ -7079,6 +7214,10 @@ class ResponsesRequestExecution:
                         continue
                     event_bytes = _raw_responses_sse_event_bytes(raw_event)
                     if is_sse_comment_frame(raw_event):
+                        if is_oaix_terminal_flush_marker(raw_event):
+                            # This hop-local marker is consumed by diagnostics
+                            # and must never change the downstream SSE contract.
+                            continue
                         if reservation is None:
                             yield event_bytes
                         else:
@@ -7271,6 +7410,13 @@ class ResponsesRequestExecution:
                             diagnostics.mark_local_end(
                                 origin="upstream_failure_terminal"
                             )
+                            await event_owner.aclose()
+                            event_owner = None
+                            event_payload = None
+                            await _consume_expected_oaix_terminal_flush_marker(
+                                source,
+                                diagnostics,
+                            )
                             return
 
                         terminal_success = event_type in {
@@ -7302,13 +7448,23 @@ class ResponsesRequestExecution:
                             yield ReservedStreamChunk(event_bytes, transferred)
 
                         if terminal_success:
-                            # The semantic terminal ends the response.  Do not
-                            # wait for EOF/[DONE] on a keep-alive connection.
+                            # The semantic terminal ends the business response.
+                            # Do not wait for EOF/[DONE] on a keep-alive
+                            # connection. When OAIX explicitly advertises its
+                            # marker contract, consume only that immediate,
+                            # bounded diagnostic comment.
                             self._finalize_stream_attempt_success(attempt)
                             terminal_queue_handoff_completed = True
                             diagnostics.mark_terminal_queue_handoff_completed()
                             diagnostics.mark_local_end(
                                 origin=f"semantic_{event_type}"
+                            )
+                            await event_owner.aclose()
+                            event_owner = None
+                            event_payload = None
+                            await _consume_expected_oaix_terminal_flush_marker(
+                                source,
+                                diagnostics,
                             )
                             return
                     finally:
@@ -7316,7 +7472,8 @@ class ResponsesRequestExecution:
                         semantic_failure = None
                         event_payload = None
                         event_type = None
-                        await event_owner.aclose()
+                        if event_owner is not None:
+                            await event_owner.aclose()
                 finally:
                     failure = None
                     transferred = None

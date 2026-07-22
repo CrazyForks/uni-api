@@ -4,6 +4,7 @@ import gc
 import hashlib
 import json
 import socket
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import httpcore
@@ -16,6 +17,7 @@ from starlette.responses import StreamingResponse
 from starlette.routing import Route
 
 from uni_api.observability.responses_stream import (
+    OAIX_TERMINAL_FLUSH_MARKER_CONTRACT,
     ObservedResponseByteIterator,
     ResponsesStreamDiagnostics,
 )
@@ -82,6 +84,178 @@ def test_missing_http_version_and_network_metadata_remain_unknown():
 
     assert "http_version" not in tracker.facts
     assert tracker.facts["transport_metadata_available"] is False
+
+
+def test_oaix_terminal_flush_marker_produces_hash_bound_exact_hop_observation():
+    observations = []
+    chunks = []
+    events = []
+    current_info = {
+        "request_id": "request-hop-1",
+        "trace_id": "trace-hop-1",
+        "upstream_attempts": [{}],
+    }
+    tracker = ResponsesStreamDiagnostics(
+        current_info=current_info,
+        attempt_index=0,
+        logical_authority="oaix.example",
+        proxy_configured=False,
+        sse_chunk_observer=chunks.append,
+        sse_event_observer=events.append,
+        terminal_hop_observer=observations.append,
+    )
+    tracker.capture_response(
+        httpx.Response(
+            200,
+            headers={
+                "X-OAIX-Connection-ID": "oaixc-hop-1",
+                "X-OAIX-Terminal-Flush-Marker": (
+                    OAIX_TERMINAL_FLUSH_MARKER_CONTRACT
+                ),
+            },
+        )
+    )
+    tracker.observe_upstream_chunk(b"12345")
+    terminal = (
+        "event: response.completed\n"
+        'data: {"type":"response.completed","response":{"status":"completed"}}'
+    )
+    tracker.observe_complete_event(terminal)
+    terminal_received = datetime.fromisoformat(
+        tracker.facts["declared_terminal_received_at"]
+    )
+    flush_completed = terminal_received - timedelta(milliseconds=7654.25)
+    flush_attempted = flush_completed - timedelta(milliseconds=0.25)
+    wire_sha256 = hashlib.sha256(
+        terminal.encode("utf-8") + b"\n\n"
+    ).hexdigest()
+    marker_payload = {
+        "schema_version": 1,
+        "connection_id": "oaixc-hop-1",
+        "terminal_wire_sha256": wire_sha256,
+        "flush_attempted_unix_nano": int(flush_attempted.timestamp() * 1e9),
+        "flush_completed_unix_nano": int(flush_completed.timestamp() * 1e9),
+    }
+    marker = ": oaix-terminal-flush-v1 " + json.dumps(
+        marker_payload,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    tracker.observe_complete_event(marker, has_data_field=False)
+
+    assert tracker.expects_oaix_terminal_flush_marker is True
+    assert tracker.terminal_hop_observed is True
+    assert tracker.facts["oaix_terminal_flush_marker_hash_matched"] is True
+    assert abs(
+        tracker.facts["oaix_terminal_flush_to_ember_receive_ms"] - 7654.25
+    ) < 0.01
+    assert chunks == [5]
+    assert events == [len(terminal.encode("utf-8")) + 2]
+    assert len(observations) == 1
+    assert observations[0]["request_id"] == "request-hop-1"
+    assert observations[0]["terminal_wire_sha256"] == wire_sha256
+
+
+def test_oaix_terminal_flush_marker_rejects_hash_mismatch_without_metric():
+    observations = []
+    tracker = ResponsesStreamDiagnostics(
+        current_info={"upstream_attempts": [{}]},
+        attempt_index=0,
+        logical_authority="oaix.example",
+        proxy_configured=False,
+        terminal_hop_observer=observations.append,
+    )
+    tracker.capture_response(
+        httpx.Response(
+            200,
+            headers={
+                "X-OAIX-Connection-ID": "oaixc-hop-2",
+                "X-OAIX-Terminal-Flush-Marker": (
+                    OAIX_TERMINAL_FLUSH_MARKER_CONTRACT
+                ),
+            },
+        )
+    )
+    terminal = (
+        "event: response.completed\n"
+        'data: {"type":"response.completed","response":{"status":"completed"}}'
+    )
+    tracker.observe_complete_event(terminal)
+    now_ns = int(datetime.now(timezone.utc).timestamp() * 1e9)
+    marker = ": oaix-terminal-flush-v1 " + json.dumps(
+        {
+            "schema_version": 1,
+            "connection_id": "oaixc-hop-2",
+            "terminal_wire_sha256": "f" * 64,
+            "flush_attempted_unix_nano": now_ns - 1_000_000,
+            "flush_completed_unix_nano": now_ns,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    tracker.observe_complete_event(marker, has_data_field=False)
+
+    assert tracker.terminal_hop_observed is False
+    assert tracker.facts["oaix_terminal_flush_marker_hash_matched"] is False
+    assert tracker.facts["oaix_terminal_flush_marker_invalid_reason"] == (
+        "terminal_hash_mismatch"
+    )
+    assert observations == []
+
+
+@pytest.mark.parametrize("schema_version", [[], {}, "not-an-integer"])
+def test_oaix_terminal_flush_marker_rejects_malformed_schema_without_raising(
+    schema_version,
+):
+    tracker, _current_info = _tracker()
+    marker = ": oaix-terminal-flush-v1 " + json.dumps(
+        {
+            "schema_version": schema_version,
+            "terminal_wire_sha256": "a" * 64,
+            "flush_attempted_unix_nano": 1,
+            "flush_completed_unix_nano": 2,
+        },
+        separators=(",", ":"),
+    )
+
+    tracker.observe_complete_event(marker, has_data_field=False)
+
+    assert tracker.facts["oaix_terminal_flush_marker_valid"] is False
+    assert tracker.facts["oaix_terminal_flush_marker_invalid_reason"] == (
+        "invalid_payload"
+    )
+    assert "event_observer_error" not in tracker.facts
+
+
+def test_oaix_terminal_flush_marker_requires_advertised_connection_identity():
+    tracker, _current_info = _tracker()
+    tracker.capture_response(
+        httpx.Response(
+            200,
+            headers={
+                "X-OAIX-Connection-ID": "oaixc-required",
+                "X-OAIX-Terminal-Flush-Marker": (
+                    OAIX_TERMINAL_FLUSH_MARKER_CONTRACT
+                ),
+            },
+        )
+    )
+    marker = ": oaix-terminal-flush-v1 " + json.dumps(
+        {
+            "schema_version": 1,
+            "terminal_wire_sha256": "a" * 64,
+            "flush_attempted_unix_nano": 1,
+            "flush_completed_unix_nano": 2,
+        },
+        separators=(",", ":"),
+    )
+
+    tracker.observe_complete_event(marker, has_data_field=False)
+
+    assert tracker.facts["oaix_terminal_flush_marker_valid"] is False
+    assert tracker.facts["oaix_terminal_flush_marker_invalid_reason"] == (
+        "connection_id_mismatch"
+    )
 
 
 def _chained_read_error() -> httpx.ReadError:

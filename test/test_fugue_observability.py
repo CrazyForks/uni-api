@@ -9,6 +9,9 @@ from fugue_observability import (
     build_uni_api_ember_admission_503_response_write_event,
     build_uni_api_ember_large_body_admission_event,
     build_uni_api_ember_request_telemetry,
+    build_uni_api_ember_terminal_hop_metric_event,
+    build_uni_api_ember_worker_cpu_profile_event,
+    build_uni_api_ember_worker_metric_events,
     fugue_observability_config_from_env,
 )
 from uni_api.admission import (
@@ -25,6 +28,120 @@ def test_fugue_observability_disabled_without_endpoint(monkeypatch):
     config = fugue_observability_config_from_env(service_version="test")
 
     assert config.enabled is False
+
+
+def test_worker_metrics_export_rates_cpu_per_mib_and_named_histogram_buckets():
+    events = build_uni_api_ember_worker_metric_events(
+        service_name="uni-api-ember",
+        service_version="1.2.3",
+        identity_attrs={"app_id": "app_123", "runtime_id": "runtime_123"},
+        snapshot={
+            "worker_id": "pod-1:33",
+            "worker_cpu_seconds_total": 123.5,
+            "worker_cpu_cores": 0.97,
+            "worker_single_core_saturation_ratio": 0.97,
+            "worker_sse_events_total": 500,
+            "worker_sse_bytes_total": 2_000_000,
+            "worker_sse_events_per_second": 25.5,
+            "worker_sse_bytes_per_second": 500_000.25,
+            "worker_inflight_requests": 74,
+            "worker_cpu_seconds_per_sse_mebibyte": 1.25,
+            "worker_cpu_profile_running": True,
+            "worker_cpu_profile_trigger_total": 2,
+            "worker_cpu_profile_completed_total": 1,
+            "worker_cpu_profile_failed_total": 0,
+            "oaix_terminal_flush_to_ember_receive_invalid_total": 0,
+            "oaix_terminal_flush_marker_missing_total": 1,
+            "oaix_terminal_flush_to_ember_receive_histogram": {
+                "count": 3,
+                "sum_ms": 8120.5,
+                "cumulative_buckets": {"100": 1, "10000": 3},
+                "infinite_bucket": 3,
+            },
+        },
+    )
+    metrics = {event["metric"]: event for event in events}
+
+    assert metrics["uniapi_ember_worker_cpu_cores"]["value"] == 0.97
+    assert metrics["uniapi_ember_worker_inflight_requests"]["value"] == 74
+    assert metrics[
+        "uniapi_ember_worker_cpu_seconds_per_sse_mebibyte"
+    ]["value"] == 1.25
+    assert metrics[
+        "uniapi_ember_oaix_terminal_flush_to_receive_"
+        "milliseconds_bucket_le_10000"
+    ]["value"] == 3
+    assert all(
+        event["attributes"]["component"] == "uni-api-ember-worker"
+        for event in events
+    )
+
+
+def test_terminal_hop_raw_metric_has_no_request_id_label():
+    event = build_uni_api_ember_terminal_hop_metric_event(
+        service_name="uni-api-ember",
+        service_version="test",
+        identity_attrs={"app_id": "app_123"},
+        observation={
+            "lag_ms": 7654.25,
+            "request_id": "must-not-be-a-label",
+            "trace_id": "must-not-be-a-label",
+            "terminal_received_at": "2026-07-22T10:00:00+00:00",
+        },
+    )
+
+    assert event["value"] == 7654.25
+    assert event["metric"].endswith("flush_to_receive_milliseconds")
+    assert "request_id" not in event["attributes"]
+    assert "trace_id" not in event["attributes"]
+
+
+def test_worker_cpu_profile_event_only_exports_bounded_code_locations():
+    event = build_uni_api_ember_worker_cpu_profile_event(
+        service_name="uni-api-ember",
+        service_version="test",
+        identity_attrs={"app_id": "app_123"},
+        profile={
+            "schema_version": 1,
+            "profile_id": "profile-1",
+            "worker_id": "pod-1:33",
+            "source_revision": "abc123",
+            "status": "completed",
+            "trigger_cpu_cores": 0.99,
+            "started_at": "2026-07-22T10:00:00+00:00",
+            "finished_at": "2026-07-22T10:00:10+00:00",
+            "sample_rounds": 50,
+            "profiled_cpu_seconds": 9.4,
+            "top_leaf_functions": [
+                {
+                    "function": "uni_api/runtime.py:_proxy_responses_stream:7300",
+                    "cpu_ticks": 900,
+                    "cpu_seconds": 9,
+                    "locals": "never-export-request-data",
+                }
+            ],
+            "top_stacks": [
+                {
+                    "stack": [
+                        "uni_api/runtime.py:_stream_worker:6020",
+                        "uni_api/runtime.py:_proxy_responses_stream:7300",
+                    ],
+                    "cpu_ticks": 900,
+                    "cpu_seconds": 9,
+                    "samples": 45,
+                    "request_body": "never-export-request-data",
+                }
+            ],
+            "authorization": "Bearer never-export",
+        },
+    )
+
+    serialized = json.dumps(event, sort_keys=True)
+    assert event["event_type"] == "worker_on_cpu_profile"
+    assert event["attributes"]["fugue_table"] == "app_events"
+    assert "uni_api/runtime.py:_proxy_responses_stream:7300" in serialized
+    assert "never-export-request-data" not in serialized
+    assert "Bearer never-export" not in serialized
 
 
 def test_large_body_admission_decision_is_a_body_free_clickhouse_app_event():

@@ -6,6 +6,7 @@ import json
 import os
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import httpx
@@ -1871,6 +1872,96 @@ def test_responses_stream_records_channel_success_only_after_protocol_terminal(
     assert callable(
         main.app.state.client_manager.stream_calls[0]["extensions"]["trace"]
     )
+
+
+def test_responses_stream_consumes_exact_oaix_terminal_flush_marker(monkeypatch):
+    _configure_responses_test(monkeypatch, engine="codex")
+    hop_observations = []
+    monkeypatch.setattr(
+        main.worker_runtime_observer,
+        "record_terminal_hop",
+        hop_observations.append,
+    )
+    completed_event = _responses_sse(
+        "response.completed",
+        {
+            "type": "response.completed",
+            "sequence_number": 9,
+            "response": {
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 2,
+                    "total_tokens": 3,
+                },
+            },
+        },
+    )
+    now_ns = int(datetime.now(timezone.utc).timestamp() * 1e9)
+    marker = (
+        ": oaix-terminal-flush-v1 "
+        + json.dumps(
+            {
+                "schema_version": 1,
+                "connection_id": "oaixc-terminal-marker",
+                "terminal_wire_sha256": hashlib.sha256(
+                    completed_event
+                ).hexdigest(),
+                "flush_attempted_unix_nano": now_ns - 2_001_000_000,
+                "flush_completed_unix_nano": now_ns - 2_000_000_000,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n\n"
+    ).encode("utf-8")
+    main.app.state.client_manager = DummyClientManager(
+        DummyStreamingUpstreamResponse(
+            chunks=[
+                _responses_sse(
+                    "response.created",
+                    {"type": "response.created"},
+                ),
+                _responses_sse(
+                    "response.output_text.delta",
+                    {"type": "response.output_text.delta", "delta": "ok"},
+                ),
+                completed_event,
+                # A distinct transport chunk exercises the bounded
+                # post-terminal marker read rather than same-chunk coalescing.
+                marker,
+            ],
+            headers={
+                "X-OAIX-Connection-ID": "oaixc-terminal-marker",
+                "X-OAIX-Terminal-Flush-Marker": "sse-comment-v1",
+            },
+        )
+    )
+    current_info = {
+        "request_id": "terminal-marker",
+        "trace_id": "trace-terminal-marker",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+
+    _response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info=current_info,
+    )
+
+    assert "response.completed" in body
+    assert "oaix-terminal-flush-v1" not in body
+    diagnostics = current_info["responses_stream_diagnostics"]
+    assert diagnostics["oaix_terminal_flush_marker_expected"] is True
+    assert diagnostics["oaix_terminal_flush_marker_seen"] is True
+    assert diagnostics["oaix_terminal_flush_marker_hash_matched"] is True
+    assert diagnostics[
+        "oaix_terminal_flush_to_ember_receive_observed"
+    ] is True
+    assert diagnostics["oaix_terminal_flush_to_ember_receive_ms"] >= 1900
+    assert "oaix_terminal_flush_marker_missing" not in diagnostics
+    assert len(hop_observations) == 1
+    assert hop_observations[0]["request_id"] == "terminal-marker"
 
 
 @pytest.mark.parametrize(

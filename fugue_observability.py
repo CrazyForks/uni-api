@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 from dataclasses import asdict, dataclass, field
@@ -85,6 +86,21 @@ class _DeferredResponseBufferEvent:
     event: Any
 
 
+@dataclass(frozen=True)
+class _DeferredWorkerRuntimeSnapshot:
+    snapshot: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _DeferredWorkerCPUProfile:
+    profile: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _DeferredTerminalHopObservation:
+    observation: dict[str, Any]
+
+
 class FugueObservabilityClient:
     def __init__(self, config: FugueObservabilityConfig) -> None:
         self.config = config
@@ -93,6 +109,9 @@ class FugueObservabilityClient:
             | _DeferredLargeBodyAdmissionDecision
             | _DeferredAdmission503ResponseWriteOutcome
             | _DeferredResponseBufferEvent
+            | _DeferredWorkerRuntimeSnapshot
+            | _DeferredWorkerCPUProfile
+            | _DeferredTerminalHopObservation
         ] | None = None
         self._tasks: list[asyncio.Task[None]] = []
         self._client: httpx.AsyncClient | None = None
@@ -110,6 +129,18 @@ class FugueObservabilityClient:
         self._response_buffer_event_enqueue_dropped = 0
         self._response_buffer_event_build_errors = 0
         self._response_buffer_event_export_errors = 0
+        self._worker_runtime_snapshot_enqueued = 0
+        self._worker_runtime_snapshot_enqueue_dropped = 0
+        self._worker_runtime_snapshot_build_errors = 0
+        self._worker_runtime_snapshot_export_errors = 0
+        self._worker_cpu_profile_enqueued = 0
+        self._worker_cpu_profile_enqueue_dropped = 0
+        self._worker_cpu_profile_build_errors = 0
+        self._worker_cpu_profile_export_errors = 0
+        self._terminal_hop_observation_enqueued = 0
+        self._terminal_hop_observation_enqueue_dropped = 0
+        self._terminal_hop_observation_build_errors = 0
+        self._terminal_hop_observation_export_errors = 0
 
     async def start(self) -> None:
         if not self.config.enabled or self._tasks:
@@ -224,6 +255,54 @@ class FugueObservabilityClient:
             self._response_buffer_event_enqueue_dropped += 1
         return accepted
 
+    def emit_worker_runtime_snapshot(
+        self,
+        snapshot: dict[str, Any],
+    ) -> bool | None:
+        if not self.config.enabled:
+            return None
+        accepted = self._enqueue(
+            _DeferredWorkerRuntimeSnapshot(dict(snapshot)),
+            event_count=1,
+        )
+        if accepted:
+            self._worker_runtime_snapshot_enqueued += 1
+        else:
+            self._worker_runtime_snapshot_enqueue_dropped += 1
+        return accepted
+
+    def emit_worker_cpu_profile(
+        self,
+        profile: dict[str, Any],
+    ) -> bool | None:
+        if not self.config.enabled:
+            return None
+        accepted = self._enqueue(
+            _DeferredWorkerCPUProfile(dict(profile)),
+            event_count=1,
+        )
+        if accepted:
+            self._worker_cpu_profile_enqueued += 1
+        else:
+            self._worker_cpu_profile_enqueue_dropped += 1
+        return accepted
+
+    def emit_terminal_hop_observation(
+        self,
+        observation: dict[str, Any],
+    ) -> bool | None:
+        if not self.config.enabled:
+            return None
+        accepted = self._enqueue(
+            _DeferredTerminalHopObservation(dict(observation)),
+            event_count=1,
+        )
+        if accepted:
+            self._terminal_hop_observation_enqueued += 1
+        else:
+            self._terminal_hop_observation_enqueue_dropped += 1
+        return accepted
+
     def _emit_events(
         self,
         path: str,
@@ -261,6 +340,18 @@ class FugueObservabilityClient:
             response_buffer_event = isinstance(
                 item,
                 _DeferredResponseBufferEvent,
+            )
+            worker_runtime_snapshot = isinstance(
+                item,
+                _DeferredWorkerRuntimeSnapshot,
+            )
+            worker_cpu_profile = isinstance(
+                item,
+                _DeferredWorkerCPUProfile,
+            )
+            terminal_hop_observation = isinstance(
+                item,
+                _DeferredTerminalHopObservation,
             )
             build_failed = False
             try:
@@ -306,9 +397,52 @@ class FugueObservabilityClient:
                         self._response_buffer_event_build_errors += 1
                         raise
                     path, payload = _LOG_ENDPOINT, {"events": [event]}
+                elif worker_runtime_snapshot:
+                    try:
+                        events = build_uni_api_ember_worker_metric_events(
+                            service_name=self.config.service_name,
+                            service_version=self.config.service_version,
+                            identity_attrs=self.config.identity_attrs,
+                            snapshot=item.snapshot,
+                        )
+                    except Exception:
+                        build_failed = True
+                        self._export_errors += 1
+                        self._worker_runtime_snapshot_build_errors += 1
+                        raise
+                    path, payload = _METRIC_ENDPOINT, {"events": events}
+                elif worker_cpu_profile:
+                    try:
+                        event = build_uni_api_ember_worker_cpu_profile_event(
+                            service_name=self.config.service_name,
+                            service_version=self.config.service_version,
+                            identity_attrs=self.config.identity_attrs,
+                            profile=item.profile,
+                        )
+                    except Exception:
+                        build_failed = True
+                        self._export_errors += 1
+                        self._worker_cpu_profile_build_errors += 1
+                        raise
+                    path, payload = _LOG_ENDPOINT, {"events": [event]}
+                elif terminal_hop_observation:
+                    try:
+                        event = build_uni_api_ember_terminal_hop_metric_event(
+                            service_name=self.config.service_name,
+                            service_version=self.config.service_version,
+                            identity_attrs=self.config.identity_attrs,
+                            observation=item.observation,
+                        )
+                    except Exception:
+                        build_failed = True
+                        self._export_errors += 1
+                        self._terminal_hop_observation_build_errors += 1
+                        raise
+                    path, payload = _METRIC_ENDPOINT, {"events": [event]}
                 else:
                     path, payload = item
-                await self._post_json(path, payload)
+                if payload.get("events"):
+                    await self._post_json(path, payload)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -320,6 +454,12 @@ class FugueObservabilityClient:
                     self._admission_503_outcome_export_errors += 1
                 if response_buffer_event and not build_failed:
                     self._response_buffer_event_export_errors += 1
+                if worker_runtime_snapshot and not build_failed:
+                    self._worker_runtime_snapshot_export_errors += 1
+                if worker_cpu_profile and not build_failed:
+                    self._worker_cpu_profile_export_errors += 1
+                if terminal_hop_observation and not build_failed:
+                    self._terminal_hop_observation_export_errors += 1
                 if self._export_errors == 1 or self._export_errors % 100 == 0:
                     logger.warning("Fugue observability export failed: %s", type(exc).__name__)
             finally:
@@ -374,6 +514,42 @@ class FugueObservabilityClient:
             ),
             "response_buffer_event_export_errors_total": (
                 self._response_buffer_event_export_errors
+            ),
+            "worker_runtime_snapshot_enqueued_total": (
+                self._worker_runtime_snapshot_enqueued
+            ),
+            "worker_runtime_snapshot_enqueue_dropped_total": (
+                self._worker_runtime_snapshot_enqueue_dropped
+            ),
+            "worker_runtime_snapshot_build_errors_total": (
+                self._worker_runtime_snapshot_build_errors
+            ),
+            "worker_runtime_snapshot_export_errors_total": (
+                self._worker_runtime_snapshot_export_errors
+            ),
+            "worker_cpu_profile_enqueued_total": (
+                self._worker_cpu_profile_enqueued
+            ),
+            "worker_cpu_profile_enqueue_dropped_total": (
+                self._worker_cpu_profile_enqueue_dropped
+            ),
+            "worker_cpu_profile_build_errors_total": (
+                self._worker_cpu_profile_build_errors
+            ),
+            "worker_cpu_profile_export_errors_total": (
+                self._worker_cpu_profile_export_errors
+            ),
+            "terminal_hop_observation_enqueued_total": (
+                self._terminal_hop_observation_enqueued
+            ),
+            "terminal_hop_observation_enqueue_dropped_total": (
+                self._terminal_hop_observation_enqueue_dropped
+            ),
+            "terminal_hop_observation_build_errors_total": (
+                self._terminal_hop_observation_build_errors
+            ),
+            "terminal_hop_observation_export_errors_total": (
+                self._terminal_hop_observation_export_errors
             ),
         }
 
@@ -467,9 +643,362 @@ def emit_uni_api_ember_response_buffer_event(event: Any) -> bool | None:
         return False
 
 
+def emit_uni_api_ember_worker_runtime_snapshot(
+    snapshot: dict[str, Any],
+) -> bool | None:
+    client = _client
+    if client is None:
+        return None
+    try:
+        return client.emit_worker_runtime_snapshot(snapshot)
+    except Exception:
+        logger.exception("Failed to enqueue Fugue worker runtime snapshot")
+        return False
+
+
+def emit_uni_api_ember_worker_cpu_profile(
+    profile: dict[str, Any],
+) -> bool | None:
+    client = _client
+    if client is None:
+        return None
+    try:
+        return client.emit_worker_cpu_profile(profile)
+    except Exception:
+        logger.exception("Failed to enqueue Fugue worker CPU profile")
+        return False
+
+
+def emit_uni_api_ember_terminal_hop_observation(
+    observation: dict[str, Any],
+) -> bool | None:
+    client = _client
+    if client is None:
+        return None
+    try:
+        return client.emit_terminal_hop_observation(observation)
+    except Exception:
+        logger.exception("Failed to enqueue Fugue terminal hop observation")
+        return False
+
+
 def fugue_observability_delivery_snapshot() -> dict[str, int]:
     client = _client
     return client.delivery_snapshot() if client is not None else {}
+
+
+def build_uni_api_ember_worker_metric_events(
+    *,
+    service_name: str,
+    service_version: str | None,
+    identity_attrs: dict[str, str] | None,
+    snapshot: dict[str, Any],
+) -> list[dict[str, Any]]:
+    timestamp = datetime.now(timezone.utc)
+    attributes = _drop_empty(
+        {
+            **(identity_attrs or {}),
+            "component": f"{service_name}-worker",
+            "service_version": _safe_text(service_version),
+            "metric_scope": "worker_process",
+            # Fugue's remote-write processor may intentionally drop this
+            # high-cardinality label. It remains available in direct payload
+            # inspection and the runtime endpoint; one process is currently
+            # enforced per pod.
+            "worker_id": _safe_text(snapshot.get("worker_id"), max_len=192),
+        }
+    )
+    values: dict[str, Any] = {
+        "uniapi_ember_worker_cpu_seconds_total": snapshot.get(
+            "worker_cpu_seconds_total"
+        ),
+        "uniapi_ember_worker_cpu_cores": snapshot.get("worker_cpu_cores"),
+        "uniapi_ember_worker_single_core_saturation_ratio": snapshot.get(
+            "worker_single_core_saturation_ratio"
+        ),
+        "uniapi_ember_worker_sse_events_total": snapshot.get(
+            "worker_sse_events_total"
+        ),
+        "uniapi_ember_worker_sse_bytes_total": snapshot.get(
+            "worker_sse_bytes_total"
+        ),
+        "uniapi_ember_worker_sse_events_per_second": snapshot.get(
+            "worker_sse_events_per_second"
+        ),
+        "uniapi_ember_worker_sse_bytes_per_second": snapshot.get(
+            "worker_sse_bytes_per_second"
+        ),
+        "uniapi_ember_worker_inflight_requests": snapshot.get(
+            "worker_inflight_requests"
+        ),
+        "uniapi_ember_worker_cpu_seconds_per_sse_mebibyte": snapshot.get(
+            "worker_cpu_seconds_per_sse_mebibyte"
+        ),
+        "uniapi_ember_worker_cpu_profile_running": (
+            1 if _safe_bool(snapshot.get("worker_cpu_profile_running")) else 0
+        ),
+        "uniapi_ember_worker_cpu_profile_trigger_total": snapshot.get(
+            "worker_cpu_profile_trigger_total"
+        ),
+        "uniapi_ember_worker_cpu_profile_completed_total": snapshot.get(
+            "worker_cpu_profile_completed_total"
+        ),
+        "uniapi_ember_worker_cpu_profile_failed_total": snapshot.get(
+            "worker_cpu_profile_failed_total"
+        ),
+        "uniapi_ember_oaix_terminal_flush_to_receive_invalid_total": (
+            snapshot.get("oaix_terminal_flush_to_ember_receive_invalid_total")
+        ),
+        "uniapi_ember_oaix_terminal_flush_marker_missing_total": snapshot.get(
+            "oaix_terminal_flush_marker_missing_total"
+        ),
+    }
+    histogram = snapshot.get(
+        "oaix_terminal_flush_to_ember_receive_histogram"
+    )
+    if isinstance(histogram, dict):
+        values[
+            "uniapi_ember_oaix_terminal_flush_to_receive_milliseconds_count"
+        ] = histogram.get("count")
+        values[
+            "uniapi_ember_oaix_terminal_flush_to_receive_milliseconds_sum"
+        ] = histogram.get("sum_ms")
+        buckets = histogram.get("cumulative_buckets")
+        if isinstance(buckets, dict):
+            for raw_bound, count in buckets.items():
+                bound = _safe_metric_bucket_suffix(raw_bound)
+                if bound:
+                    values[
+                        "uniapi_ember_oaix_terminal_flush_to_receive_"
+                        f"milliseconds_bucket_le_{bound}"
+                    ] = count
+        values[
+            "uniapi_ember_oaix_terminal_flush_to_receive_"
+            "milliseconds_bucket_le_inf"
+        ] = histogram.get("infinite_bucket")
+
+    events: list[dict[str, Any]] = []
+    for metric, raw_value in values.items():
+        value = _finite_metric_value(raw_value)
+        if value is None:
+            continue
+        events.append(
+            {
+                "timestamp": _iso_timestamp(timestamp),
+                "kind": "metric",
+                "source": service_name,
+                "message": metric,
+                "metric": metric,
+                "value": value,
+                "attributes": attributes,
+            }
+        )
+    return events
+
+
+def build_uni_api_ember_terminal_hop_metric_event(
+    *,
+    service_name: str,
+    service_version: str | None,
+    identity_attrs: dict[str, str] | None,
+    observation: dict[str, Any],
+) -> dict[str, Any]:
+    lag_ms = _finite_metric_value(observation.get("lag_ms"))
+    if lag_ms is None or lag_ms < 0:
+        raise ValueError("terminal hop lag must be a finite non-negative value")
+    timestamp = _parse_observation_timestamp(
+        observation.get("terminal_received_at")
+    )
+    metric = "uniapi_ember_oaix_terminal_flush_to_receive_milliseconds"
+    return {
+        "timestamp": _iso_timestamp(timestamp),
+        "kind": "metric",
+        "source": service_name,
+        "message": metric,
+        "metric": metric,
+        "value": lag_ms,
+        "attributes": _drop_empty(
+            {
+                **(identity_attrs or {}),
+                "component": f"{service_name}-worker",
+                "service_version": _safe_text(service_version),
+                "metric_scope": "request_hop",
+            }
+        ),
+    }
+
+
+def build_uni_api_ember_worker_cpu_profile_event(
+    *,
+    service_name: str,
+    service_version: str | None,
+    identity_attrs: dict[str, str] | None,
+    profile: dict[str, Any],
+) -> dict[str, Any]:
+    summary = _bounded_cpu_profile_summary(profile)
+    status = _safe_text(summary.get("status"), max_len=32) or "unknown"
+    level = "info" if status == "completed" else "warning"
+    summary_json = json.dumps(summary, separators=(",", ":"), sort_keys=True)
+    return {
+        "timestamp": _safe_text(summary.get("finished_at"))
+        or _iso_timestamp(datetime.now(timezone.utc)),
+        "kind": "log",
+        "level": level,
+        "service": service_name,
+        "source": service_name,
+        "event": "worker_on_cpu_profile",
+        "event_type": "worker_on_cpu_profile",
+        "message": f"worker on-CPU profile {status}",
+        "app_id": _safe_text((identity_attrs or {}).get("app_id")),
+        "attributes": _drop_empty(
+            {
+                **(identity_attrs or {}),
+                "component": f"{service_name}-worker",
+                "service_version": _safe_text(service_version),
+                "fugue_table": "app_events",
+                "severity": level,
+                "profile_id": _safe_text(summary.get("profile_id")),
+                "worker_id": _safe_text(summary.get("worker_id")),
+                "source_revision": _safe_text(summary.get("source_revision")),
+                "profile_status": status,
+                "trigger_cpu_cores": _optional_float_text(
+                    summary.get("trigger_cpu_cores")
+                ),
+                "profiled_cpu_seconds": _optional_float_text(
+                    summary.get("profiled_cpu_seconds")
+                ),
+                "sample_rounds": _optional_int_text(
+                    summary.get("sample_rounds")
+                ),
+            }
+        ),
+        "summary": summary,
+        "summary_json": summary_json,
+    }
+
+
+def _bounded_cpu_profile_summary(profile: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "schema_version": _safe_int(profile.get("schema_version"), 1),
+        "profile_id": _safe_text(profile.get("profile_id"), max_len=64),
+        "worker_id": _safe_text(profile.get("worker_id"), max_len=192),
+        "source_revision": _safe_text(
+            profile.get("source_revision"), max_len=64
+        ),
+        "status": _safe_text(profile.get("status"), max_len=32),
+        "error_type": _safe_text(profile.get("error_type"), max_len=96),
+        "started_at": _safe_text(profile.get("started_at"), max_len=64),
+        "finished_at": _safe_text(profile.get("finished_at"), max_len=64),
+    }
+    for key in (
+        "trigger_cpu_cores",
+        "configured_duration_seconds",
+        "observed_duration_seconds",
+        "sample_hz",
+        "profiled_cpu_seconds",
+    ):
+        value = _finite_metric_value(profile.get(key))
+        if value is not None:
+            summary[key] = value
+    for key in (
+        "sample_rounds",
+        "active_thread_samples",
+        "profiled_cpu_ticks",
+        "proc_read_errors",
+    ):
+        if profile.get(key) is not None:
+            summary[key] = max(0, _safe_int(profile.get(key), 0))
+
+    leaf_rows = []
+    raw_leaves = profile.get("top_leaf_functions")
+    if isinstance(raw_leaves, list):
+        for raw in raw_leaves[:20]:
+            if not isinstance(raw, dict):
+                continue
+            leaf_rows.append(
+                _drop_empty(
+                    {
+                        "function": _safe_text(
+                            raw.get("function"), max_len=320
+                        ),
+                        "cpu_ticks": max(0, _safe_int(raw.get("cpu_ticks"), 0)),
+                        "cpu_seconds": _finite_metric_value(
+                            raw.get("cpu_seconds")
+                        ),
+                    }
+                )
+            )
+    summary["top_leaf_functions"] = leaf_rows
+
+    stack_rows = []
+    raw_stacks = profile.get("top_stacks")
+    if isinstance(raw_stacks, list):
+        for raw in raw_stacks[:20]:
+            if not isinstance(raw, dict):
+                continue
+            stack = raw.get("stack")
+            safe_stack = []
+            if isinstance(stack, list):
+                safe_stack = [
+                    text
+                    for value in stack[:24]
+                    if (text := _safe_text(value, max_len=320))
+                ]
+            stack_rows.append(
+                {
+                    "stack": safe_stack,
+                    "cpu_ticks": max(0, _safe_int(raw.get("cpu_ticks"), 0)),
+                    "cpu_seconds": _finite_metric_value(raw.get("cpu_seconds")),
+                    "samples": max(0, _safe_int(raw.get("samples"), 0)),
+                }
+            )
+    summary["top_stacks"] = stack_rows
+    return {
+        key: value
+        for key, value in summary.items()
+        if value is not None and value != ""
+    }
+
+
+def _finite_metric_value(value: Any) -> float | int | None:
+    if isinstance(value, bool):
+        return 1 if value else 0
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    if number.is_integer() and abs(number) <= (1 << 53):
+        return int(number)
+    return number
+
+
+def _optional_float_text(value: Any) -> str | None:
+    number = _finite_metric_value(value)
+    return None if number is None else str(number)
+
+
+def _safe_metric_bucket_suffix(value: Any) -> str | None:
+    text = str(value or "").strip().lower().replace(".", "_")
+    if not text or len(text) > 24:
+        return None
+    if not all(character.isdigit() or character == "_" for character in text):
+        return None
+    return text
+
+
+def _parse_observation_timestamp(value: Any) -> datetime:
+    text = str(value or "").strip()
+    if text:
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except ValueError:
+            pass
+    return datetime.now(timezone.utc)
 
 
 def build_uni_api_ember_response_buffer_event(
@@ -2705,6 +3234,13 @@ def _responses_diagnostic_attrs(
         "cleanup_failure",
         "pool_sweeper_close_observed",
         "pool_sweeper_close_succeeded",
+        "oaix_terminal_flush_marker_expected",
+        "oaix_terminal_flush_marker_seen",
+        "oaix_terminal_flush_marker_valid",
+        "oaix_terminal_flush_marker_hash_matched",
+        "oaix_terminal_flush_to_ember_receive_observed",
+        "oaix_terminal_flush_marker_missing",
+        "oaix_terminal_flush_lag_clamped_for_clock_order",
     )
     for key in bool_fields:
         attrs[key] = _bool_text(_safe_bool(diagnostics.get(key)))
@@ -2724,6 +3260,9 @@ def _responses_diagnostic_attrs(
         "exception_errno",
         "exception_chain_depth",
         "cleanup_attempt_count",
+        "oaix_terminal_flush_marker_schema_version",
+        "oaix_terminal_flush_attempted_unix_nano",
+        "oaix_terminal_flush_completed_unix_nano",
     )
     for key in int_fields:
         attrs[key] = _optional_int_text(diagnostics.get(key))
@@ -2763,9 +3302,25 @@ def _responses_diagnostic_attrs(
         "cleanup_completed_at",
         "pool_sweeper_close_started_at",
         "pool_sweeper_close_completed_at",
+        "oaix_terminal_flush_marker_contract",
+        "oaix_terminal_flush_marker_wire_sha256",
+        "oaix_terminal_flush_marker_received_at",
+        "oaix_terminal_flush_marker_invalid_reason",
+        "oaix_terminal_flush_marker_missing_reason",
+        "oaix_terminal_flush_marker_missing_at",
+        "oaix_terminal_flush_attempted_at",
+        "oaix_terminal_flush_completed_at",
     )
     for key in text_fields:
         attrs[key] = _safe_text(diagnostics.get(key))
+
+    for key in (
+        "oaix_terminal_flush_duration_ms",
+        "oaix_terminal_flush_to_ember_receive_signed_ms",
+        "oaix_terminal_flush_attempt_to_ember_receive_ms",
+        "oaix_terminal_flush_to_ember_receive_ms",
+    ):
+        attrs[key] = _optional_float_text(diagnostics.get(key))
 
     attrs.update(
         _diagnostic_json_attrs(

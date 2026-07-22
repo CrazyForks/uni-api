@@ -7,6 +7,9 @@ from fugue_observability import (
     emit_uni_api_ember_large_body_admission_decision,
     emit_uni_api_ember_request_observability,
     emit_uni_api_ember_response_buffer_event,
+    emit_uni_api_ember_terminal_hop_observation,
+    emit_uni_api_ember_worker_cpu_profile,
+    emit_uni_api_ember_worker_runtime_snapshot,
     fugue_observability_delivery_snapshot,
 )
 from uni_api.admission.observability import (
@@ -41,3 +44,17 @@ def emit_admission_503_response_write_outcome(
     outcome: Admission503ResponseWriteOutcome,
 ) -> bool | None:
     return emit_uni_api_ember_admission_503_response_write_outcome(outcome)
+
+
+def emit_worker_runtime_snapshot(snapshot: dict[str, Any]) -> bool | None:
+    return emit_uni_api_ember_worker_runtime_snapshot(snapshot)
+
+
+def emit_worker_cpu_profile(profile: dict[str, Any]) -> bool | None:
+    return emit_uni_api_ember_worker_cpu_profile(profile)
+
+
+def emit_terminal_hop_observation(
+    observation: dict[str, Any],
+) -> bool | None:
+    return emit_uni_api_ember_terminal_hop_observation(observation)

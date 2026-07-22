@@ -13,6 +13,10 @@ from fastapi import HTTPException
 from starlette.responses import Response, StreamingResponse
 from core.models import RequestModel
 from routing import RoutingPlan, build_api_key_models_map, get_right_order_providers
+from uni_api.admission import (
+    bind_request_admission_lease,
+    reset_request_admission_lease,
+)
 from uni_api.upstream.responses_errors import responses_failure_error
 
 
@@ -322,6 +326,15 @@ def test_process_request_uses_http1_client_for_codex_chat(monkeypatch):
 def test_model_request_handler_passes_selected_provider_key(monkeypatch):
     provider_name = "provider-a"
 
+    class DummyResponseMemoryLease:
+        def begin_response_attempt(self, *_args, **_kwargs):
+            return None
+
+        def finish_response_attempt(self, *_args, **_kwargs):
+            return None
+
+    response_memory_lease = DummyResponseMemoryLease()
+
     class DummyCircularList:
         async def is_all_rate_limited(self, model):
             return False
@@ -354,10 +367,14 @@ def test_model_request_handler_passes_selected_provider_key(monkeypatch):
         provider_api_key_raw=None,
         current_info=None,
         http_request=None,
+        response_memory_lease=None,
     ):
         _ = current_info, http_request
         assert provider_api_key_raw == "provider-key-1"
+        assert response_memory_lease is response_memory_lease_expected
         return Response(content=b"ok", media_type="application/json")
+
+    response_memory_lease_expected = response_memory_lease
 
     monkeypatch.setitem(main.provider_api_circular_list, provider_name, DummyCircularList())
     monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
@@ -377,16 +394,20 @@ def test_model_request_handler_passes_selected_provider_key(monkeypatch):
 
     async def run_test():
         handler = main.ModelRequestHandler()
-        response = await handler.request_model(
-            RequestModel(
-                model="gpt-4.1",
-                messages=[{"role": "user", "content": "hello"}],
-                stream=False,
-            ),
-            0,
-            BackgroundTasks(),
-        )
-        assert response.status_code == 200
+        token = bind_request_admission_lease(response_memory_lease)
+        try:
+            response = await handler.request_model(
+                RequestModel(
+                    model="gpt-4.1",
+                    messages=[{"role": "user", "content": "hello"}],
+                    stream=False,
+                ),
+                0,
+                BackgroundTasks(),
+            )
+            assert response.status_code == 200
+        finally:
+            reset_request_admission_lease(token)
 
     asyncio.run(run_test())
 
@@ -463,6 +484,7 @@ def test_model_request_semantic_context_error_returns_400_without_retry_or_coold
         provider_api_key_raw=None,
         current_info=None,
         http_request=None,
+        response_memory_lease=None,
     ):
         _ = (
             request,
@@ -474,6 +496,7 @@ def test_model_request_semantic_context_error_returns_400_without_retry_or_coold
             provider_api_key_raw,
             current_info,
             http_request,
+            response_memory_lease,
         )
         process_calls.append(provider["provider"])
         error = responses_failure_error(
@@ -679,8 +702,9 @@ def test_model_request_handler_error_log_includes_request_and_actual_model(monke
         provider_api_key_raw=None,
         current_info=None,
         http_request=None,
+        response_memory_lease=None,
     ):
-        _ = current_info, http_request
+        _ = current_info, http_request, response_memory_lease
         raise HTTPException(status_code=502, detail="bad gateway")
 
     error_logs = []

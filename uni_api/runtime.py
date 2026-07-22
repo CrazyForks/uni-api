@@ -3356,6 +3356,7 @@ async def process_request(
     provider_api_key_raw: Optional[str] = None,
     current_info: Optional[dict[str, Any]] = None,
     http_request: Optional[Request] = None,
+    response_memory_lease: Any = None,
 ):
     timeout_value = int(timeout_value)
     provider_registry = getattr(app.state, "provider_registry", None)
@@ -3459,7 +3460,7 @@ async def process_request(
                     model=request.model,
                     provider_api_key=provider_api_key_raw,
                     fallback_background_tasks=background_tasks,
-                    response_memory_lease=get_request_admission_lease(),
+                    response_memory_lease=response_memory_lease,
                 )
                 defer_channel_result = True
                 response = StarletteStreamingResponse(wrapped_generator, media_type="text/event-stream", headers=upstream_response_headers)
@@ -3770,6 +3771,9 @@ class ModelRequestHandler:
                     provider_api_key_raw=attempt.provider_api_key_raw,
                     current_info=current_info,
                     http_request=http_request,
+                    response_memory_lease=attempt.state.get(
+                        "_response_memory_lease"
+                    ),
                 )
             )
             disconnect_task: Optional[asyncio.Task] = None

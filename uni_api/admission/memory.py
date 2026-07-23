@@ -20,6 +20,7 @@ _DEFAULT_FALLBACK_BUDGET_BYTES = 256 * _MIB
 _DEFAULT_GUARD_BYTES = 512 * _MIB
 _DEFAULT_GUARD_RATIO = 0.25
 _DEFAULT_SAMPLE_CACHE_SECONDS = 0.05
+_CGROUP_FILE_READ_LIMIT_BYTES = 64 * 1024
 
 
 def _env_int(name: str, default: int) -> int:
@@ -34,42 +35,6 @@ def _env_float(name: str, default: float) -> float:
         return float(os.getenv(name, str(default)) or str(default))
     except (TypeError, ValueError):
         return default
-
-
-def _read_int(path: Path) -> int | None:
-    try:
-        value = path.read_text(encoding="ascii").strip()
-    except OSError:
-        return None
-    if not value or value == "max":
-        return None
-    try:
-        parsed = int(value)
-    except ValueError:
-        return None
-    return parsed if parsed >= 0 else None
-
-
-def _read_events(path: Path) -> dict[str, int]:
-    events: dict[str, int] = {}
-    try:
-        lines = path.read_text(encoding="ascii").splitlines()
-    except OSError:
-        return events
-    for line in lines:
-        name, separator, value = line.partition(" ")
-        if not separator:
-            continue
-        try:
-            events[name] = int(value)
-        except ValueError:
-            continue
-    return events
-
-
-def _read_failcnt(path: Path) -> dict[str, int]:
-    value = _read_int(path)
-    return {"max": value} if value is not None else {}
 
 
 def _proc_rss_bytes() -> int | None:
@@ -88,6 +53,83 @@ def _proc_rss_bytes() -> int | None:
         except ValueError:
             return None
     return None
+
+
+class _CgroupFileReader:
+    """Reuse tiny cgroup file descriptors while reading fresh values.
+
+    Cgroup membership is fixed for a container process, while memory.current,
+    memory.max, memory.high, and memory.events remain live kernel files. Keeping
+    those descriptors open removes repeated pathlib/open/close work without
+    caching any admission value or extending the governor's sample interval.
+    """
+
+    def __init__(self) -> None:
+        self._descriptors: dict[Path, int] = {}
+
+    def read_text(self, path: Path) -> str | None:
+        descriptor = self._descriptors.get(path)
+        if descriptor is None:
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            try:
+                descriptor = os.open(path, flags)
+            except OSError:
+                return None
+            self._descriptors[path] = descriptor
+        try:
+            payload = os.pread(
+                descriptor,
+                _CGROUP_FILE_READ_LIMIT_BYTES,
+                0,
+            )
+        except OSError:
+            self._close_path(path)
+            return None
+        return payload.decode("ascii").strip()
+
+    def read_int(self, path: Path) -> int | None:
+        value = self.read_text(path)
+        if not value or value == "max":
+            return None
+        try:
+            parsed = int(value)
+        except ValueError:
+            return None
+        return parsed if parsed >= 0 else None
+
+    def read_events(self, path: Path) -> dict[str, int]:
+        events: dict[str, int] = {}
+        content = self.read_text(path)
+        if content is None:
+            return events
+        for line in content.splitlines():
+            name, separator, value = line.partition(" ")
+            if not separator:
+                continue
+            try:
+                events[name] = int(value)
+            except ValueError:
+                continue
+        return events
+
+    def _close_path(self, path: Path) -> None:
+        descriptor = self._descriptors.pop(path, None)
+        if descriptor is None:
+            return
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        for path in tuple(self._descriptors):
+            self._close_path(path)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,36 +151,46 @@ class CgroupMemorySource:
     ) -> None:
         self.root = Path(root)
         self.proc_cgroup = Path(proc_cgroup)
+        self._v2_root = current_cgroup_v2_root(self.root, self.proc_cgroup)
+        self._v1_root = current_cgroup_v1_root(
+            "memory",
+            self.root,
+            self.proc_cgroup,
+        )
+        self._reader = _CgroupFileReader()
 
     def sample(self) -> ProcessMemorySample:
-        v2_root = current_cgroup_v2_root(self.root, self.proc_cgroup)
-        current = _read_int(v2_root / "memory.current")
-        limit = _read_int(v2_root / "memory.max")
-        high = _read_int(v2_root / "memory.high")
+        current = self._reader.read_int(self._v2_root / "memory.current")
+        limit = self._reader.read_int(self._v2_root / "memory.max")
+        high = self._reader.read_int(self._v2_root / "memory.high")
         if current is not None or limit is not None:
             return ProcessMemorySample(
                 current_bytes=current,
                 limit_bytes=limit,
                 high_bytes=high,
-                events=_read_events(v2_root / "memory.events"),
+                events=self._reader.read_events(
+                    self._v2_root / "memory.events"
+                ),
                 source="cgroup-v2",
             )
 
-        v1_root = current_cgroup_v1_root(
-            "memory",
-            self.root,
-            self.proc_cgroup,
+        current = self._reader.read_int(
+            self._v1_root / "memory.usage_in_bytes"
         )
-        current = _read_int(v1_root / "memory.usage_in_bytes")
-        limit = _read_int(v1_root / "memory.limit_in_bytes")
+        limit = self._reader.read_int(
+            self._v1_root / "memory.limit_in_bytes"
+        )
         if current is not None or limit is not None:
             # cgroup v1 commonly reports an enormous sentinel for unlimited.
             if limit is not None and limit >= (1 << 60):
                 limit = None
+            fail_count = self._reader.read_int(
+                self._v1_root / "memory.failcnt"
+            )
             return ProcessMemorySample(
                 current_bytes=current,
                 limit_bytes=limit,
-                events=_read_failcnt(v1_root / "memory.failcnt"),
+                events={"max": fail_count} if fail_count is not None else {},
                 source="cgroup-v1",
             )
 
@@ -147,6 +199,9 @@ class CgroupMemorySource:
             limit_bytes=None,
             source="procfs",
         )
+
+    def close(self) -> None:
+        self._reader.close()
 
 
 @dataclass(frozen=True, slots=True)

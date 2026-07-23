@@ -1,4 +1,6 @@
 import asyncio
+import os
+from pathlib import Path
 
 from uni_api.admission.memory import (
     AdaptiveMemoryGovernor,
@@ -249,6 +251,59 @@ def test_resolves_nested_cgroup_v1_memory_controller(tmp_path):
     assert sample.events == {"max": 7}
     assert sample.source == "cgroup-v1"
 
+
+def test_cgroup_v2_source_reuses_descriptors_but_reads_fresh_values(
+    tmp_path,
+    monkeypatch,
+):
+    nested = tmp_path / "kubepods.slice" / "pod.scope"
+    nested.mkdir(parents=True)
+    proc_cgroup = tmp_path / "self.cgroup"
+    proc_cgroup.write_text(
+        "0::/kubepods.slice/pod.scope\n",
+        encoding="ascii",
+    )
+    paths = {
+        "memory.current": "100\n",
+        "memory.max": "1000\n",
+        "memory.high": "900\n",
+        "memory.events": "high 1\nmax 2\n",
+    }
+    for name, content in paths.items():
+        (nested / name).write_text(content, encoding="ascii")
+
+    opened = []
+    real_open = os.open
+
+    def recording_open(path, flags):
+        opened.append(Path(path))
+        return real_open(path, flags)
+
+    monkeypatch.setattr("uni_api.admission.memory.os.open", recording_open)
+    source = CgroupMemorySource(tmp_path, proc_cgroup)
+    try:
+        first = source.sample()
+        assert first.current_bytes == 100
+        assert first.limit_bytes == 1000
+        assert first.high_bytes == 900
+        assert first.events == {"high": 1, "max": 2}
+
+        (nested / "memory.current").write_text("250\n", encoding="ascii")
+        (nested / "memory.max").write_text("1200\n", encoding="ascii")
+        (nested / "memory.high").write_text("1100\n", encoding="ascii")
+        (nested / "memory.events").write_text(
+            "high 3\nmax 4\n",
+            encoding="ascii",
+        )
+
+        second = source.sample()
+        assert second.current_bytes == 250
+        assert second.limit_bytes == 1200
+        assert second.high_bytes == 1100
+        assert second.events == {"high": 3, "max": 4}
+        assert opened == [nested / name for name in paths]
+    finally:
+        source.close()
 
 
 def test_unlimited_environment_preserves_finite_fallback_budget():

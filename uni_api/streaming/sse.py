@@ -68,7 +68,9 @@ class _StreamParserRetainedBudget:
         self.used_bytes = 0
         self.peak_bytes = 0
         self.rejected = 0
-        self._lock = threading.Lock()
+        # Releasing the last _RetainedTextFrame reference can invoke its
+        # finalizer while snapshot() already holds this lock.
+        self._lock = threading.RLock()
 
     def reserve(self, size: int) -> None:
         if size <= 0:

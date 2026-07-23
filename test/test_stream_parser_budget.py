@@ -1,5 +1,7 @@
 import asyncio
 import gc
+import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +20,45 @@ from uni_api.streaming.sse import (
     parse_owned_sse_event,
     sse_event_has_data_field,
 )
+
+
+def test_parser_budget_snapshot_allows_frame_finalizer_reentry():
+    budget = sse_module._StreamParserRetainedBudget(64)
+    budget.reserve(4)
+    holder = {
+        "frame": sse_module._RetainedTextFrame(
+            "data",
+            4,
+            budget,
+        )
+    }
+
+    class FinalizingMemoryGovernor:
+        def snapshot(self):
+            frame = holder.pop("frame")
+            del frame
+            return SimpleNamespace(capacity_bytes=64)
+
+        def release(self, _category, _size):
+            return None
+
+    budget.memory_governor = FinalizingMemoryGovernor()
+    result = {}
+    errors = []
+
+    def take_snapshot():
+        try:
+            result.update(budget.snapshot())
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=take_snapshot, daemon=True)
+    worker.start()
+    worker.join(timeout=1)
+
+    assert not worker.is_alive(), "snapshot deadlocked during frame finalization"
+    assert errors == []
+    assert result["used_bytes"] == 0
 
 
 def test_incomplete_sse_frames_share_a_process_wide_byte_budget(monkeypatch):

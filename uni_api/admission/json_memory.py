@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -10,6 +11,8 @@ DEFAULT_JSON_MAX_DEPTH = 128
 DEFAULT_JSON_MAX_SCALAR_BYTES = 4096
 DEFAULT_JSON_MAX_ESTIMATED_BYTES = 256 * 1024 * 1024
 _TEXT_SCAN_CHUNK_CHARACTERS = 256 * 1024
+_JSON_STRING_SPECIAL = re.compile(br'["\\]')
+_JSON_OUTSIDE_SPECIAL = re.compile(br'["{}\[\]\x20\x09\x0a\x0d,:]')
 
 
 class JSONMemoryComplexityReason(StrEnum):
@@ -140,6 +143,7 @@ class IncrementalJSONMemoryEstimator:
 
     def feed(self, chunk: bytes | bytearray | memoryview) -> int:
         view = memoryview(chunk).cast("B")
+        scan_buffer = chunk if isinstance(chunk, (bytes, bytearray)) else view
         self.raw_bytes += len(view)
         if self.estimated_bytes > self.max_estimated_bytes:
             self._raise_complexity(
@@ -153,16 +157,64 @@ class IncrementalJSONMemoryEstimator:
                 ),
             )
 
-        for value in view:
+        position = 0
+        length = len(view)
+        while position < length:
             if self._in_string:
                 if self._escaped:
                     self._escaped = False
-                elif value == 0x5C:  # backslash
-                    self._escaped = True
-                elif value == 0x22:  # quote
+                    position += 1
+                    continue
+
+                # Prompt bodies are dominated by long JSON strings. Let the
+                # C regex engine skip directly to the next quote or escape
+                # instead of dispatching one Python loop iteration per byte.
+                match = _JSON_STRING_SPECIAL.search(scan_buffer, position)
+                if match is None:
+                    break
+                position = match.start()
+                value = view[position]
+                position += 1
+                if value == 0x5C:  # backslash
+                    if position < length:
+                        # The escaped byte has no structural meaning, including
+                        # when it is itself a quote or backslash.
+                        position += 1
+                    else:
+                        self._escaped = True
+                else:  # quote
                     self._in_string = False
                 continue
 
+            # Outside strings, only JSON structure and scalar delimiters need
+            # per-token handling. A scalar run can be charged in one step,
+            # while preserving the exact max_scalar_bytes rejection point.
+            match = _JSON_OUTSIDE_SPECIAL.search(scan_buffer, position)
+            run_end = length if match is None else match.start()
+            if run_end > position:
+                if not self._scalar_active:
+                    self._scalar_active = True
+                    self._scalar_bytes = 0
+                    self._count_token()
+                scalar_bytes = self._scalar_bytes + (run_end - position)
+                if scalar_bytes > self.max_scalar_bytes:
+                    self._scalar_bytes = self.max_scalar_bytes + 1
+                    self._raise_complexity(
+                        reason=JSONMemoryComplexityReason.MAX_SCALAR_BYTES,
+                        trigger_phase=(
+                            JSONMemoryComplexityTriggerPhase.SCALAR_SCAN
+                        ),
+                        message=(
+                            f"JSON scalar exceeds {self.max_scalar_bytes} bytes"
+                        ),
+                    )
+                self._scalar_bytes = scalar_bytes
+                position = run_end
+            if match is None:
+                break
+
+            value = view[position]
+            position += 1
             if value == 0x22:  # quote starts a key or value string
                 self._finish_scalar()
                 self._count_token()
@@ -191,20 +243,6 @@ class IncrementalJSONMemoryEstimator:
                 # JSON whitespace, comma, or colon terminates a scalar token.
                 self._finish_scalar()
                 continue
-
-            if not self._scalar_active:
-                self._scalar_active = True
-                self._scalar_bytes = 0
-                self._count_token()
-            self._scalar_bytes += 1
-            if self._scalar_bytes > self.max_scalar_bytes:
-                self._raise_complexity(
-                    reason=JSONMemoryComplexityReason.MAX_SCALAR_BYTES,
-                    trigger_phase=JSONMemoryComplexityTriggerPhase.SCALAR_SCAN,
-                    message=(
-                        f"JSON scalar exceeds {self.max_scalar_bytes} bytes"
-                    ),
-                )
 
         return self.estimated_bytes
 

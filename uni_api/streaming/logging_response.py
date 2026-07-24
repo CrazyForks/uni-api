@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import errno
-import math
 import os
 from contextlib import suppress
 from datetime import datetime, timezone
@@ -13,7 +12,6 @@ from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 
 from core.log_config import logger
-from core.utils import safe_get
 from uni_api.admission import AdmissionRejected, get_request_admission_lease
 from uni_api.admission.json_parsing import parse_owned_json_value
 from uni_api.observability.spans import merge_timing_spans
@@ -26,8 +24,15 @@ from uni_api.streaming.error_text import bounded_stream_error_text
 from uni_api.streaming.sse import (
     DEFAULT_MAX_PENDING_BYTES,
     IncrementalSSEParser,
+    SSEIncompleteEventError,
     SSEProtocolError,
     parse_owned_sse_event,
+)
+from uni_api.streaming.usage import (
+    StreamUsageSnapshot,
+    parse_usage_count,
+    stream_usage_snapshot,
+    stream_usage_snapshot_from_payload,
 )
 from uni_api.upstream.responses_errors import ResponsesSemanticError
 
@@ -36,7 +41,6 @@ AsyncCloseCallback = Callable[[dict[str, Any]], Awaitable[None]]
 _MAX_JSON_USAGE_TELEMETRY_BYTES = 64 * 1024
 _MAX_STATS_TEXT_BYTES = 64 * 1024
 _MAX_STATS_FIELD_BYTES = 4 * 1024
-_MAX_USAGE_COUNTER = (1 << 63) - 1
 _STATS_SNAPSHOT_FIELDS = frozenset(
     {
         "request_id",
@@ -405,6 +409,8 @@ class LoggingStreamingResponse(Response):
         self._usage_parser_disabled = False
         self._wire_sse_boundary_known = self._is_sse_response
         self._wire_sse_at_event_boundary = self._is_sse_response
+        self._metadata_sse_event_in_progress = False
+        self._metadata_sse_pending_bytes = 0
 
         self._body_closed = False
         self._body_close_lock = asyncio.Lock()
@@ -454,135 +460,43 @@ class LoggingStreamingResponse(Response):
 
     @staticmethod
     def _parse_usage_count(value: Any) -> tuple[int, bool]:
-        if isinstance(value, bool):
-            return 0, False
-        if isinstance(value, int):
-            return (value, 0 <= value <= _MAX_USAGE_COUNTER)
-        if isinstance(value, float):
-            if (
-                math.isfinite(value)
-                and 0 <= value <= _MAX_USAGE_COUNTER
-                and value.is_integer()
-            ):
-                return int(value), True
-            return 0, False
-        if isinstance(value, str):
-            rendered = value.strip()
-            if rendered and len(rendered) <= 20 and rendered.isdigit():
-                try:
-                    parsed = int(rendered)
-                except (ValueError, OverflowError):
-                    return 0, False
-                if parsed <= _MAX_USAGE_COUNTER:
-                    return parsed, True
-        return 0, False
+        return parse_usage_count(value)
 
     def _record_usage(self, usage_obj: Any) -> bool:
-        if not isinstance(usage_obj, dict):
+        return self._record_usage_snapshot(stream_usage_snapshot(usage_obj))
+
+    def _record_usage_snapshot(
+        self,
+        snapshot: StreamUsageSnapshot | None,
+    ) -> bool:
+        if snapshot is None:
             return False
         diagnostics = self.current_info.get("responses_stream_diagnostics")
         if isinstance(diagnostics, dict):
             diagnostics["downstream_usage_object_seen"] = True
-        if not any(
-            key in usage_obj
-            for key in (
-                "prompt_tokens",
-                "input_tokens",
-                "completion_tokens",
-                "output_tokens",
-                "total_tokens",
-            )
-        ):
+        if not snapshot.counters_seen:
             return False
         if isinstance(diagnostics, dict):
             diagnostics["downstream_usage_counters_seen"] = True
-
-        input_known = "prompt_tokens" in usage_obj or "input_tokens" in usage_obj
-        output_known = (
-            "completion_tokens" in usage_obj or "output_tokens" in usage_obj
-        )
-        explicit_total_known = "total_tokens" in usage_obj
-        total_known = explicit_total_known or (input_known and output_known)
-
-        prompt_raw = (
-            usage_obj.get("prompt_tokens")
-            if "prompt_tokens" in usage_obj
-            else usage_obj.get("input_tokens")
-        )
-        completion_raw = (
-            usage_obj.get("completion_tokens")
-            if "completion_tokens" in usage_obj
-            else usage_obj.get("output_tokens")
-        )
-        prompt_tokens, prompt_valid = self._parse_usage_count(prompt_raw)
-        completion_tokens, completion_valid = self._parse_usage_count(
-            completion_raw
-        )
-        if explicit_total_known:
-            total_tokens, total_valid = self._parse_usage_count(
-                usage_obj.get("total_tokens")
-            )
-        elif input_known and output_known and prompt_valid and completion_valid:
-            total_tokens = prompt_tokens + completion_tokens
-            total_valid = True
-        else:
-            total_tokens = 0
-            total_valid = False
-
-        observed_values_valid = all(
-            self._parse_usage_count(usage_obj[field])[1]
-            for field in (
-                "prompt_tokens",
-                "input_tokens",
-                "completion_tokens",
-                "output_tokens",
-                "total_tokens",
-            )
-            if field in usage_obj
-        )
-        values_valid = (
-            observed_values_valid
-            and (not input_known or prompt_valid)
-            and (not output_known or completion_valid)
-            and (not total_known or total_valid)
-        )
-        alias_consistent = True
-        for first, second in (
-            ("prompt_tokens", "input_tokens"),
-            ("completion_tokens", "output_tokens"),
-        ):
-            if first in usage_obj and second in usage_obj:
-                first_value, first_valid = self._parse_usage_count(
-                    usage_obj[first]
-                )
-                second_value, second_valid = self._parse_usage_count(
-                    usage_obj[second]
-                )
-                alias_consistent = alias_consistent and (
-                    first_valid
-                    and second_valid
-                    and first_value == second_value
-                )
         if isinstance(diagnostics, dict):
-            diagnostics["downstream_usage_input_known"] = input_known
-            diagnostics["downstream_usage_output_known"] = output_known
-            diagnostics["downstream_usage_total_known"] = total_known
-            diagnostics["downstream_usage_values_valid"] = values_valid
-            diagnostics["downstream_usage_alias_consistent"] = alias_consistent
-        if not values_valid:
-            self.current_info["usage_parse_error"] = "invalid_usage_counter"
-            return False
-        if not alias_consistent:
-            self.current_info["usage_parse_error"] = "conflicting_usage_aliases"
+            diagnostics["downstream_usage_input_known"] = snapshot.input_known
+            diagnostics["downstream_usage_output_known"] = snapshot.output_known
+            diagnostics["downstream_usage_total_known"] = snapshot.total_known
+            diagnostics["downstream_usage_values_valid"] = snapshot.values_valid
+            diagnostics["downstream_usage_alias_consistent"] = (
+                snapshot.alias_consistent
+            )
+        if snapshot.parse_error is not None:
+            self.current_info["usage_parse_error"] = snapshot.parse_error
             return False
 
-        if input_known:
-            self.current_info["prompt_tokens"] = prompt_tokens
-        if output_known:
-            self.current_info["completion_tokens"] = completion_tokens
-        if total_known:
-            self.current_info["total_tokens"] = total_tokens
-        if not (input_known and output_known and total_known):
+        if snapshot.input_known and snapshot.prompt_tokens is not None:
+            self.current_info["prompt_tokens"] = snapshot.prompt_tokens
+        if snapshot.output_known and snapshot.completion_tokens is not None:
+            self.current_info["completion_tokens"] = snapshot.completion_tokens
+        if snapshot.total_known and snapshot.total_tokens is not None:
+            self.current_info["total_tokens"] = snapshot.total_tokens
+        if not snapshot.complete:
             if isinstance(diagnostics, dict):
                 diagnostics["downstream_usage_completeness"] = "incomplete"
             return False
@@ -593,14 +507,9 @@ class LoggingStreamingResponse(Response):
         return True
 
     def _record_usage_from_payload(self, payload: Any) -> bool:
-        if not isinstance(payload, dict):
-            return False
-        usage_obj = payload.get("usage")
-        if not isinstance(usage_obj, dict):
-            usage_obj = safe_get(payload, "response", "usage", default=None)
-        if not isinstance(usage_obj, dict):
-            usage_obj = safe_get(payload, "message", "usage", default=None)
-        return self._record_usage(usage_obj)
+        return self._record_usage_snapshot(
+            stream_usage_snapshot_from_payload(payload)
+        )
 
     async def _record_usage_from_data(self, data: str) -> bool:
         data = data.strip()
@@ -753,6 +662,13 @@ class LoggingStreamingResponse(Response):
         if not self._usage_observation_enabled or self._usage_parser_disabled:
             return
         if self._usage_sse_parser is not None:
+            if self._metadata_sse_event_in_progress:
+                await self._disable_usage_parser(
+                    SSEIncompleteEventError(
+                        pending_bytes=self._metadata_sse_pending_bytes
+                    )
+                )
+                return
             try:
                 for raw_event in self._usage_sse_parser.finish():
                     await self._record_sse_usage_event(raw_event)
@@ -993,12 +909,18 @@ class LoggingStreamingResponse(Response):
             observed_event_type = None
             observed_semantic_outcome = None
             observed_final_event_segment = False
+            observed_sse_metadata_complete = False
+            observed_usage_snapshot = None
             try:
                 self._mark_first_byte_observed(self.current_info)
                 if isinstance(chunk, ObservedStreamChunk):
                     observed_event_type = chunk.event_type
                     observed_semantic_outcome = chunk.semantic_outcome
                     observed_final_event_segment = chunk.final_event_segment
+                    observed_sse_metadata_complete = (
+                        chunk.sse_metadata_complete
+                    )
+                    observed_usage_snapshot = chunk.usage_snapshot
                     chunk = chunk.data
                 if isinstance(chunk, str):
                     chunk = chunk.encode("utf-8")
@@ -1029,11 +951,47 @@ class LoggingStreamingResponse(Response):
                     segment = chunk[
                         offset : offset + self._downstream_chunk_bytes
                     ]
-                    await self._observe_usage_chunk(segment)
+                    metadata_event_complete = bool(
+                        observed_final_event_segment
+                        and offset + len(segment) >= len(chunk)
+                    )
+                    parser = self._usage_sse_parser
+                    use_sse_metadata = bool(
+                        observed_sse_metadata_complete
+                        and (
+                            self._metadata_sse_event_in_progress
+                            or (
+                                parser is not None
+                                and parser.pending_bytes == 0
+                            )
+                            or (
+                                parser is None
+                                and self._wire_sse_boundary_known
+                                and self._wire_sse_at_event_boundary
+                            )
+                        )
+                    )
+                    if use_sse_metadata:
+                        self._metadata_sse_pending_bytes += len(segment)
+                        if (
+                            self._usage_observation_enabled
+                            and not self._usage_parser_disabled
+                            and metadata_event_complete
+                            and observed_usage_snapshot is not None
+                        ):
+                            self._record_usage_snapshot(
+                                observed_usage_snapshot
+                            )
+                    else:
+                        await self._observe_usage_chunk(segment)
                     candidate_sse_boundary: bool | None = None
                     if self._is_sse_response:
-                        parser = self._usage_sse_parser
-                        if not self._usage_parser_disabled and parser is not None:
+                        if use_sse_metadata:
+                            candidate_sse_boundary = metadata_event_complete
+                        elif (
+                            not self._usage_parser_disabled
+                            and parser is not None
+                        ):
                             candidate_sse_boundary = parser.pending_bytes == 0
                         # An ASGI adapter may raise after a partial socket
                         # write.  Until the await returns successfully the
@@ -1047,6 +1005,12 @@ class LoggingStreamingResponse(Response):
                             "more_body": True,
                         },
                     )
+                    if use_sse_metadata:
+                        self._metadata_sse_event_in_progress = (
+                            not metadata_event_complete
+                        )
+                        if metadata_event_complete:
+                            self._metadata_sse_pending_bytes = 0
                     if (
                         observed_final_event_segment
                         and offset + len(segment) >= len(chunk)
@@ -1075,6 +1039,8 @@ class LoggingStreamingResponse(Response):
                 observed_event_type = None
                 observed_semantic_outcome = None
                 observed_final_event_segment = False
+                observed_sse_metadata_complete = False
+                observed_usage_snapshot = None
         await self._finish_usage_observation()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:

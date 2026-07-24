@@ -167,7 +167,11 @@ from uni_api.admission import (
     RequestAdmissionController,
     get_request_admission_lease,
 )
-from uni_api.admission.json_parsing import JSON_PARSE_CPU_WORKERS, run_json_cpu
+from uni_api.admission.json_parsing import (
+    JSON_PARSE_CPU_WORKERS,
+    ReusableJSONParseWorkspace,
+    run_json_cpu,
+)
 from uni_api.admission.json_memory import DEFAULT_JSON_RAW_MEMORY_MULTIPLIER
 from uni_api.admission.memory import process_memory_governor
 from uni_api.admission.resources import (
@@ -234,6 +238,10 @@ from uni_api.streaming.sse import (
     sse_event_has_data_field,
     stream_parser_retained_budget_snapshot,
     validate_sse_event_type_consistency,
+)
+from uni_api.streaming.usage import (
+    StreamUsageSnapshot,
+    stream_usage_snapshot_from_payload,
 )
 from uni_api.server import build_bounded_h11_protocol
 from uni_api.upstream.client_pool import ClientPool
@@ -5276,6 +5284,7 @@ def _observed_responses_stream_chunk(
     *,
     event_type: str,
     semantic_outcome: str,
+    usage_snapshot: StreamUsageSnapshot | None = None,
 ) -> ObservedStreamChunk | ReservedStreamChunk:
     if reservation is not None:
         return ReservedStreamChunk(
@@ -5283,11 +5292,15 @@ def _observed_responses_stream_chunk(
             reservation,
             event_type=event_type,
             semantic_outcome=semantic_outcome,
+            sse_metadata_complete=True,
+            usage_snapshot=usage_snapshot,
         )
     return ObservedStreamChunk(
         data,
         event_type=event_type,
         semantic_outcome=semantic_outcome,
+        sse_metadata_complete=True,
+        usage_snapshot=usage_snapshot,
     )
 
 
@@ -5319,8 +5332,15 @@ async def _consume_expected_oaix_terminal_flush_marker(
             return
         raw_event = None
         reservation = None
+        received_at = None
         try:
-            raw_event, reservation, _from_precommit = await asyncio.wait_for(
+            (
+                raw_event,
+                reservation,
+                _from_precommit,
+                already_observed,
+                received_at,
+            ) = await asyncio.wait_for(
                 source.__anext__(),
                 timeout=remaining,
             )
@@ -5331,6 +5351,13 @@ async def _consume_expected_oaix_terminal_flush_marker(
             diagnostics.mark_terminal_flush_marker_missing("timeout")
             return
         try:
+            if not already_observed:
+                diagnostics.observe_complete_event(
+                    raw_event,
+                    has_data_field=sse_event_has_data_field(raw_event),
+                    wire_bytes=_raw_responses_sse_event_bytes(raw_event),
+                    received_at=received_at,
+                )
             if is_oaix_terminal_flush_marker(raw_event):
                 if not diagnostics.terminal_hop_observed:
                     diagnostics.mark_terminal_flush_marker_missing(
@@ -5393,6 +5420,7 @@ def _observed_responses_stream_error_event(
         _build_responses_stream_error_event(status_code, error_message),
         event_type="error",
         semantic_outcome="error",
+        sse_metadata_complete=True,
     )
 
 def _stream_error_event_from_response(response: Any) -> ObservedStreamChunk:
@@ -6301,14 +6329,20 @@ class ResponsesRequestExecution:
         reservation = None
         event_type = None
         semantic_outcome = None
+        sse_metadata_complete = False
+        usage_snapshot = None
         if isinstance(chunk, ReservedStreamChunk):
             reservation = chunk.reservation
             event_type = chunk.event_type
             semantic_outcome = chunk.semantic_outcome
+            sse_metadata_complete = chunk.sse_metadata_complete
+            usage_snapshot = chunk.usage_snapshot
             chunk = chunk.data
         elif isinstance(chunk, ObservedStreamChunk):
             event_type = chunk.event_type
             semantic_outcome = chunk.semantic_outcome
+            sse_metadata_complete = chunk.sse_metadata_complete
+            usage_snapshot = chunk.usage_snapshot
             chunk = chunk.data
         if isinstance(chunk, str):
             chunk = chunk.encode("utf-8")
@@ -6324,7 +6358,11 @@ class ResponsesRequestExecution:
             for offset in range(0, len(chunk_bytes), segment_bytes):
                 segment = chunk_bytes[offset : offset + segment_bytes]
                 queue_item: Any = segment
-                if event_type is not None or semantic_outcome is not None:
+                if (
+                    event_type is not None
+                    or semantic_outcome is not None
+                    or sse_metadata_complete
+                ):
                     queue_item = ObservedStreamChunk(
                         segment,
                         event_type=event_type,
@@ -6332,6 +6370,8 @@ class ResponsesRequestExecution:
                         final_event_segment=(
                             offset + len(segment) >= len(chunk_bytes)
                         ),
+                        sse_metadata_complete=sse_metadata_complete,
+                        usage_snapshot=usage_snapshot,
                     )
                 transferred = (
                     reservation.split(len(segment))
@@ -7099,6 +7139,7 @@ class ResponsesRequestExecution:
             if self._custom_tool_call_id_normalization_enabled(attempt)
             else None
         )
+        parse_workspace = await ReusableJSONParseWorkspace.create()
 
         async def source_events():
             """Frame transport chunks before exposing any protocol event."""
@@ -7122,7 +7163,7 @@ class ResponsesRequestExecution:
                             transferred = reservation
                             reservation = None
                         try:
-                            yield raw_event, transferred, True
+                            yield raw_event, transferred, True, True, None
                         finally:
                             transferred = None
                             raw_event = None
@@ -7160,20 +7201,34 @@ class ResponsesRequestExecution:
                     raise DownstreamDisconnectedDuringWait()
                 raw_events = proxy_sse_parser.feed(bytes(chunk))
                 chunk = None
-                for observed_event in raw_events:
-                    if observed_event.strip():
-                        diagnostics.observe_complete_event(
-                            observed_event,
-                            has_data_field=sse_event_has_data_field(
-                                observed_event
-                            ),
-                        )
+                batch_observed = len(raw_events) > 1
+                if batch_observed:
+                    for observed_event in raw_events:
+                        if observed_event.strip():
+                            diagnostics.observe_complete_event(
+                                observed_event,
+                                has_data_field=sse_event_has_data_field(
+                                    observed_event
+                                ),
+                            )
                 try:
                     for event_index in range(len(raw_events)):
                         raw_event = raw_events[event_index]
+                        received_at = (
+                            None
+                            if batch_observed
+                            else datetime.now(timezone.utc)
+                        )
                         try:
-                            yield raw_event, None, False
+                            yield (
+                                raw_event,
+                                None,
+                                False,
+                                batch_observed,
+                                received_at,
+                            )
                         finally:
+                            received_at = None
                             raw_event = None
                             raw_events[event_index] = ""
                 finally:
@@ -7184,18 +7239,34 @@ class ResponsesRequestExecution:
                 proxy_sse_parser.pending_diagnostics()
             )
             raw_events = proxy_sse_parser.finish()
-            for observed_event in raw_events:
-                if observed_event.strip():
-                    diagnostics.observe_complete_event(
-                        observed_event,
-                        has_data_field=sse_event_has_data_field(observed_event),
-                    )
+            batch_observed = len(raw_events) > 1
+            if batch_observed:
+                for observed_event in raw_events:
+                    if observed_event.strip():
+                        diagnostics.observe_complete_event(
+                            observed_event,
+                            has_data_field=sse_event_has_data_field(
+                                observed_event
+                            ),
+                        )
             try:
                 for event_index in range(len(raw_events)):
                     raw_event = raw_events[event_index]
+                    received_at = (
+                        None
+                        if batch_observed
+                        else datetime.now(timezone.utc)
+                    )
                     try:
-                        yield raw_event, None, False
+                        yield (
+                            raw_event,
+                            None,
+                            False,
+                            batch_observed,
+                            received_at,
+                        )
                     finally:
+                        received_at = None
                         raw_event = None
                         raw_events[event_index] = ""
             finally:
@@ -7204,16 +7275,30 @@ class ResponsesRequestExecution:
 
         source = source_events()
         try:
-            async for raw_event, reservation, from_precommit_buffer in source:
+            async for (
+                raw_event,
+                reservation,
+                from_precommit_buffer,
+                already_observed,
+                received_at,
+            ) in source:
                 event_bytes = None
                 transferred = None
                 failure = None
                 event_owner = None
+                usage_snapshot = None
                 try:
                     if not raw_event.strip():
                         continue
                     event_bytes = _raw_responses_sse_event_bytes(raw_event)
                     if is_sse_comment_frame(raw_event):
+                        if not already_observed:
+                            diagnostics.observe_complete_event(
+                                raw_event,
+                                has_data_field=False,
+                                wire_bytes=event_bytes,
+                                received_at=received_at,
+                            )
                         if is_oaix_terminal_flush_marker(raw_event):
                             # This hop-local marker is consumed by diagnostics
                             # and must never change the downstream SSE contract.
@@ -7226,16 +7311,37 @@ class ResponsesRequestExecution:
                             yield ReservedStreamChunk(event_bytes, transferred)
                         continue
 
-                    event_owner = await parse_owned_sse_event(
-                        raw_event,
-                        max_event_bytes=(
-                            RESPONSES_CANONICAL_EVENT_MAX_BYTES
-                            if from_precommit_buffer
-                            else DEFAULT_MAX_EVENT_BYTES
-                        ),
-                    )
+                    try:
+                        event_owner = await parse_owned_sse_event(
+                            raw_event,
+                            max_event_bytes=(
+                                RESPONSES_CANONICAL_EVENT_MAX_BYTES
+                                if from_precommit_buffer
+                                else DEFAULT_MAX_EVENT_BYTES
+                            ),
+                            workspace=parse_workspace,
+                        )
+                    except BaseException:
+                        if not already_observed:
+                            diagnostics.observe_complete_event(
+                                raw_event,
+                                has_data_field=sse_event_has_data_field(
+                                    raw_event
+                                ),
+                                wire_bytes=event_bytes,
+                                received_at=received_at,
+                            )
+                        raise
                     event_type = event_owner.event_name
                     event_payload = event_owner.payload
+                    if not already_observed:
+                        diagnostics.observe_complete_event(
+                            raw_event,
+                            has_data_field=event_owner.has_data_field,
+                            event_type=event_type,
+                            wire_bytes=event_bytes,
+                            received_at=received_at,
+                        )
                     semantic_failure = None
                     terminal_success = False
                     try:
@@ -7336,6 +7442,14 @@ class ResponsesRequestExecution:
                             event_payload,
                             semantic_outcome=semantic_outcome,
                         )
+                        # The JSON graph is already materialized here.  Read
+                        # the bounded scalar metadata directly instead of
+                        # relying on a textual key prefilter: JSON object keys
+                        # may legally contain escapes (for example,
+                        # ``"\\u0075sage"``).
+                        usage_snapshot = stream_usage_snapshot_from_payload(
+                            event_payload
+                        )
                         if semantic_failure is not None:
                             downstream_event_type = event_type
                             if (
@@ -7404,6 +7518,7 @@ class ResponsesRequestExecution:
                                 transferred,
                                 event_type=downstream_event_type,
                                 semantic_outcome="failed",
+                                usage_snapshot=usage_snapshot,
                             )
                             terminal_queue_handoff_completed = True
                             diagnostics.mark_terminal_queue_handoff_completed()
@@ -7439,13 +7554,19 @@ class ResponsesRequestExecution:
                                 transferred,
                                 event_type=event_type,
                                 semantic_outcome=semantic_outcome,
+                                usage_snapshot=usage_snapshot,
                             )
-                        elif reservation is None:
-                            yield event_bytes
                         else:
-                            transferred = reservation
-                            reservation = None
-                            yield ReservedStreamChunk(event_bytes, transferred)
+                            if reservation is not None:
+                                transferred = reservation
+                                reservation = None
+                            yield _observed_responses_stream_chunk(
+                                event_bytes,
+                                transferred,
+                                event_type=event_type,
+                                semantic_outcome=semantic_outcome,
+                                usage_snapshot=usage_snapshot,
+                            )
 
                         if terminal_success:
                             # The semantic terminal ends the business response.
@@ -7480,7 +7601,10 @@ class ResponsesRequestExecution:
                     event_bytes = None
                     raw_event = None
                     event_owner = None
+                    usage_snapshot = None
                     from_precommit_buffer = False
+                    already_observed = False
+                    received_at = None
                     if reservation is not None:
                         await reservation.release()
             raise SSEProtocolError(
@@ -7523,7 +7647,10 @@ class ResponsesRequestExecution:
                 yield b"data: [DONE]\n\n"
         finally:
             try:
-                await source.aclose()
+                try:
+                    await source.aclose()
+                finally:
+                    await parse_workspace.aclose()
             finally:
                 pending_diagnostics = (
                     proxy_sse_parser.failure_pending_diagnostics

@@ -738,23 +738,27 @@ class ResponsesStreamDiagnostics:
         raw_event: str,
         *,
         has_data_field: bool = True,
+        event_type: str | None = None,
+        wire_bytes: bytes | None = None,
+        received_at: datetime | None = None,
     ) -> None:
         try:
             if is_oaix_terminal_flush_marker(raw_event):
                 self._observe_oaix_terminal_flush_marker(raw_event)
                 return
-            encoded = raw_event.encode("utf-8")
-            digest = hashlib.sha256()
-            digest.update(encoded)
-            digest.update(b"\n\n")
+            if wire_bytes is None:
+                wire_bytes = raw_event.encode("utf-8") + b"\n\n"
+            digest_hex = hashlib.sha256(wire_bytes).hexdigest()
             ordinal = int(self._facts.get("complete_event_count") or 0) + 1
-            event_type = _event_type(raw_event)
-            received_at = datetime.now(timezone.utc)
+            if event_type is None:
+                event_type = _event_type(raw_event)
+            if received_at is None:
+                received_at = datetime.now(timezone.utc)
             received_at_text = received_at.isoformat()
             observer = self._sse_event_observer
             if observer is not None:
                 try:
-                    observer(len(encoded) + 2)
+                    observer(len(wire_bytes))
                 except Exception as exc:
                     self._facts["sse_event_observer_error"] = type(exc).__name__
             if has_data_field:
@@ -765,16 +769,16 @@ class ResponsesStreamDiagnostics:
                     )
                 self._observed_event_facts[id(raw_event)] = (
                     ordinal,
-                    len(encoded) + 2,
-                    digest.hexdigest(),
+                    len(wire_bytes),
+                    digest_hex,
                 )
             self._facts.update(
                 {
                     "complete_event_count": ordinal,
                     "last_event_ordinal": ordinal,
                     "last_event_type": event_type,
-                    "last_event_bytes": len(encoded) + 2,
-                    "last_event_sha256": digest.hexdigest(),
+                    "last_event_bytes": len(wire_bytes),
+                    "last_event_sha256": digest_hex,
                     "last_event_received_at": received_at_text,
                 }
             )
@@ -787,12 +791,12 @@ class ResponsesStreamDiagnostics:
                 self._facts["terminal_frame_seen"] = True
                 self._facts["declared_terminal_type"] = event_type
                 self._facts["declared_terminal_ordinal"] = ordinal
-                self._facts["declared_terminal_bytes"] = len(encoded) + 2
-                self._facts["declared_terminal_sha256"] = digest.hexdigest()
+                self._facts["declared_terminal_bytes"] = len(wire_bytes)
+                self._facts["declared_terminal_sha256"] = digest_hex
                 self._facts["declared_terminal_received_at"] = received_at_text
                 self._declared_terminal_received_at = received_at
                 self._try_emit_terminal_hop_observation()
-            self._refresh_diagnosis()
+                self._refresh_diagnosis()
         except Exception as exc:
             self._facts["event_observer_error"] = type(exc).__name__
 
@@ -942,7 +946,6 @@ class ResponsesStreamDiagnostics:
         *,
         semantic_outcome: str,
     ) -> None:
-        safe_event_type = safe_responses_event_type(event_type)
         declared_terminal = event_type in {
             "response.completed",
             "response.incomplete",
@@ -950,6 +953,9 @@ class ResponsesStreamDiagnostics:
             "error",
         }
         cached_event = self._observed_event_facts.pop(id(raw_event), None)
+        if not declared_terminal and semantic_outcome == "nonterminal":
+            return
+        safe_event_type = safe_responses_event_type(event_type)
         if cached_event is None:
             encoded = raw_event.encode("utf-8")
             digest = hashlib.sha256()

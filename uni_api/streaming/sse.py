@@ -14,6 +14,7 @@ from uni_api.admission.memory import AdaptiveMemoryGovernor, process_memory_gove
 from uni_api.admission.json_memory import JSONMemoryComplexityError
 from uni_api.admission.json_parsing import (
     OwnedJSONValue,
+    ReusableJSONParseWorkspace,
     parse_owned_json_value,
 )
 from uni_api.serialization import json
@@ -360,7 +361,37 @@ class OwnedSSEEvent:
             return None
         return self._json_owner.take_reservation()
 
+    def _close_nowait(self) -> bool:
+        if (
+            self._closed
+            or self._closing
+            or self._workspace_reservation is not None
+            or self._close_task is not None
+            or self._lock.locked()
+        ):
+            return False
+        json_owner = self._json_owner
+        if json_owner is not None and not json_owner.can_close_nowait:
+            return False
+        self._closing = True
+        self._payload = None
+        self._event_name = None
+        self._declared_event_name = None
+        self._raw_event = None
+        self._json_owner = None
+        self._workspace_reservation = None
+        if json_owner is not None:
+            if not json_owner.close_nowait():
+                raise RuntimeError("unreserved JSON owner close became blocking")
+        self._closed = True
+        self._closing = False
+        return True
+
     async def aclose(self) -> None:
+        if self._closed:
+            return
+        if self._close_nowait():
+            return
         if self._close_task is None:
             self._closing = True
             self._close_task = asyncio.create_task(self._close_once())
@@ -708,57 +739,110 @@ class IncrementalSSEParser:
 
     def _extract_events(self, normalized_chunk: str) -> list[str]:
         events: list[str] = []
+        if not normalized_chunk:
+            return events
+        try:
+            normalized_bytes = normalized_chunk.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            self._failed = True
+            raise SSEProtocolError(
+                "SSE text contains an invalid Unicode scalar"
+            ) from exc
+
+        # A feed returns every complete frame at once, so all non-separator
+        # bytes in this decoded chunk remain retained either by a returned
+        # frame or by this parser. Reserve the same total in one governor call
+        # and transfer it incrementally instead of locking the global budget
+        # once for every SSE field and newline.
+        reserved_credit = len(normalized_bytes)
+        self._retained_budget.reserve(reserved_credit)
+        normalized_view = memoryview(normalized_bytes)
         cursor = 0
+        try:
+            # Search only normalized_bytes. The one pending newline needed to
+            # recognize a separator across chunk boundaries is already the
+            # last byte in _event, so old input is never concatenated or
+            # scanned again.
+            while True:
+                newline_index = normalized_bytes.find(b"\n", cursor)
+                segment_end = (
+                    len(normalized_bytes)
+                    if newline_index < 0
+                    else newline_index
+                )
+                segment_size = segment_end - cursor
+                if segment_size:
+                    self._pending_budget_bytes += segment_size
+                    reserved_credit -= segment_size
+                    try:
+                        self._event.extend(
+                            normalized_view[cursor:segment_end]
+                        )
+                    except BaseException:
+                        self._pending_budget_bytes -= segment_size
+                        reserved_credit += segment_size
+                        raise
+                    if len(self._event) > self.max_event_bytes:
+                        self._failed = True
+                        raise SSEBufferOverflowError(
+                            buffer_name="event",
+                            limit_bytes=self.max_event_bytes,
+                            observed_bytes=len(self._event),
+                        )
+                if newline_index < 0:
+                    break
 
-        # Search only normalized_chunk.  The one pending newline needed to
-        # recognize a separator across chunk boundaries is already the last
-        # byte in _event, so old input is never concatenated or scanned again.
-        while True:
-            newline_index = normalized_chunk.find("\n", cursor)
-            if newline_index < 0:
-                self._append_event_text(normalized_chunk[cursor:])
-                break
-
-            self._append_event_text(normalized_chunk[cursor:newline_index])
-            cursor = newline_index + 1
-
-            if self._event.endswith(b"\n"):
-                # The previous LF and this LF are the SSE blank-line
-                # separator.  Neither belongs to the raw event frame.
-                self._event.pop()
-                self._release_pending_bytes(1)
-                self._validate_complete_event()
-                if len(events) >= self.max_events_per_feed:
-                    self._failed = True
-                    raise SSEOutputLimitError(
-                        output_name="events",
-                        limit=self.max_events_per_feed,
-                        observed=self.max_events_per_feed + 1,
-                    )
-                retained_bytes = self._pending_budget_bytes
-                try:
-                    frame = _RetainedTextFrame(
-                        self._event.decode("utf-8"),
-                        retained_bytes,
-                        self._retained_budget,
-                    )
-                except BaseException:
-                    self._clear_pending_event()
-                    raise
-                self._pending_budget_bytes = 0
-                self._event = bytearray()
-                events.append(frame)
-            else:
-                self._reserve_pending_bytes(1)
-                try:
-                    self._event.append(0x0A)
-                except BaseException:
+                cursor = newline_index + 1
+                if self._event.endswith(b"\n"):
+                    # The previous LF and this LF are the SSE blank-line
+                    # separator. Neither belongs to the raw event frame. The
+                    # current LF remains in reserved_credit and is released
+                    # once when this decoded chunk is fully processed.
+                    self._event.pop()
                     self._release_pending_bytes(1)
-                    raise
+                    self._validate_complete_event()
+                    if len(events) >= self.max_events_per_feed:
+                        self._failed = True
+                        raise SSEOutputLimitError(
+                            output_name="events",
+                            limit=self.max_events_per_feed,
+                            observed=self.max_events_per_feed + 1,
+                        )
+                    retained_bytes = self._pending_budget_bytes
+                    try:
+                        frame = _RetainedTextFrame(
+                            self._event.decode("utf-8"),
+                            retained_bytes,
+                            self._retained_budget,
+                        )
+                    except BaseException:
+                        self._clear_pending_event()
+                        raise
+                    self._pending_budget_bytes = 0
+                    self._event = bytearray()
+                    events.append(frame)
+                else:
+                    self._pending_budget_bytes += 1
+                    reserved_credit -= 1
+                    try:
+                        self._event.append(0x0A)
+                    except BaseException:
+                        self._pending_budget_bytes -= 1
+                        reserved_credit += 1
+                        raise
+        finally:
+            normalized_view.release()
+            if reserved_credit:
+                self._retained_budget.release(reserved_credit)
 
         return events
 
     def _append_event_text(self, text: str) -> None:
+        """Append parser-owned text outside the batched feed reservation.
+
+        Kept as a private compatibility hook for focused tests and extensions;
+        the normal feed path reserves a whole decoded chunk in _extract_events.
+        """
         if not text:
             return
         try:
@@ -1389,6 +1473,7 @@ async def parse_owned_sse_event(
     raw_event: str,
     *,
     max_event_bytes: int = DEFAULT_MAX_EVENT_BYTES,
+    workspace: ReusableJSONParseWorkspace | None = None,
 ) -> OwnedSSEEvent:
     """Parse one bounded event and return explicit transferable ownership."""
 
@@ -1408,7 +1493,9 @@ async def parse_owned_sse_event(
                 limit_bytes=max_event_bytes,
                 observed_bytes=len(raw_event),
             )
-        if request_lease is not None:
+        if workspace is not None:
+            await workspace.ensure(workspace_bytes)
+        elif request_lease is not None:
             workspace_reservation = (
                 await request_lease.reserve_temporary_response_bytes(
                     workspace_bytes
@@ -1473,6 +1560,8 @@ async def parse_owned_sse_event(
             data_str,
             max_estimated_bytes=_SSE_JSON_MAX_ESTIMATED_BYTES,
             allow_invalid=True,
+            workspace=workspace,
+            workspace_extra_bytes=workspace_bytes,
         )
         parsed_payload = json_owner.value
         if not event_name and isinstance(parsed_payload, dict):

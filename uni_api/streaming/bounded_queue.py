@@ -7,6 +7,7 @@ from time import monotonic
 from typing import Any, Deque
 
 from uni_api.admission.memory import AdaptiveMemoryGovernor
+from uni_api.streaming.usage import StreamUsageSnapshot
 
 
 class StreamQueueClosed(Exception):
@@ -361,6 +362,8 @@ class ReservedStreamChunk:
     reservation: RetainedByteLease
     event_type: str | None = None
     semantic_outcome: str | None = None
+    sse_metadata_complete: bool = False
+    usage_snapshot: StreamUsageSnapshot | None = None
 
 
 class ObservedStreamChunk(bytes):
@@ -376,6 +379,8 @@ class ObservedStreamChunk(bytes):
     event_type: str | None
     semantic_outcome: str | None
     final_event_segment: bool
+    sse_metadata_complete: bool
+    usage_snapshot: StreamUsageSnapshot | None
 
     def __new__(
         cls,
@@ -383,11 +388,15 @@ class ObservedStreamChunk(bytes):
         event_type: str | None = None,
         semantic_outcome: str | None = None,
         final_event_segment: bool = True,
+        sse_metadata_complete: bool = False,
+        usage_snapshot: StreamUsageSnapshot | None = None,
     ) -> "ObservedStreamChunk":
         value = super().__new__(cls, data)
         value.event_type = event_type
         value.semantic_outcome = semantic_outcome
         value.final_event_segment = bool(final_event_segment)
+        value.sse_metadata_complete = bool(sse_metadata_complete)
+        value.usage_snapshot = usage_snapshot
         return value
 
     @property

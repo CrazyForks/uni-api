@@ -38,6 +38,52 @@ _JSON_PARSE_CPU_EXECUTOR = ThreadPoolExecutor(
 )
 
 
+class ReusableJSONParseWorkspace:
+    """One high-water temporary-memory reservation reused by a stream."""
+
+    def __init__(self, reservation: Any | None) -> None:
+        self._reservation = reservation
+        self._capacity = 0
+        self._closed = False
+
+    @classmethod
+    async def create(cls) -> ReusableJSONParseWorkspace:
+        request_lease = get_request_admission_lease()
+        reservation = (
+            await request_lease.reserve_temporary_response_bytes(0)
+            if request_lease is not None
+            else None
+        )
+        return cls(reservation)
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
+
+    async def ensure(self, required_bytes: int) -> int:
+        required_bytes = int(required_bytes)
+        if required_bytes < 0:
+            raise ValueError("required_bytes cannot be negative")
+        if self._closed:
+            raise RuntimeError("JSON parse workspace is closed")
+        if required_bytes <= self._capacity:
+            return self._capacity
+        reservation = self._reservation
+        if reservation is not None:
+            await reservation.reserve(required_bytes - self._capacity)
+        self._capacity = required_bytes
+        return self._capacity
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        reservation = self._reservation
+        self._reservation = None
+        if reservation is not None:
+            await reservation.release()
+
+
 async def _finish_owner_cleanup_despite_cancellation(task: asyncio.Task[Any]) -> None:
     while not task.done():
         try:
@@ -102,6 +148,25 @@ class OwnedJSONValue:
             raise RuntimeError("owned JSON value is closed")
         return self._value
 
+    @property
+    def can_close_nowait(self) -> bool:
+        return bool(
+            not self._closed
+            and not self._closing
+            and self._reservation is None
+            and self._close_task is None
+            and not self._lock.locked()
+        )
+
+    def close_nowait(self) -> bool:
+        if not self.can_close_nowait:
+            return False
+        self._closing = True
+        self._value = None
+        self._closed = True
+        self._closing = False
+        return True
+
     def take_reservation(self):
         """Atomically transfer the live graph charge exactly once.
 
@@ -120,6 +185,10 @@ class OwnedJSONValue:
         return reservation
 
     async def aclose(self) -> None:
+        if self._closed:
+            return
+        if self.close_nowait():
+            return
         if self._close_task is None:
             # Establish exact-once cleanup synchronously, before cancellation
             # can strike the first lock acquisition.
@@ -160,6 +229,8 @@ async def parse_owned_json_value(
     *,
     max_estimated_bytes: int = DEFAULT_JSON_PARSE_MAX_ESTIMATED_BYTES,
     allow_invalid: bool = False,
+    workspace: ReusableJSONParseWorkspace | None = None,
+    workspace_extra_bytes: int = 0,
 ) -> OwnedJSONValue:
     """Parse untrusted JSON and return explicit, transferable ownership."""
 
@@ -204,14 +275,22 @@ async def parse_owned_json_value(
             )
         )
 
-    request_lease = get_request_admission_lease()
-    reservation = (
-        await request_lease.reserve_temporary_response_bytes(
-            estimate.estimated_bytes
+    if workspace_extra_bytes < 0:
+        raise ValueError("workspace_extra_bytes cannot be negative")
+    if workspace is not None:
+        await workspace.ensure(
+            workspace_extra_bytes + estimate.estimated_bytes
         )
-        if request_lease is not None
-        else None
-    )
+        reservation = None
+    else:
+        request_lease = get_request_admission_lease()
+        reservation = (
+            await request_lease.reserve_temporary_response_bytes(
+                estimate.estimated_bytes
+            )
+            if request_lease is not None
+            else None
+        )
     try:
         parse_payload = payload.tobytes() if payload_is_memoryview else payload
         try:

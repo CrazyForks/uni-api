@@ -9,6 +9,7 @@ from uni_api.admission import (
     reset_request_admission_lease,
 )
 from uni_api.admission.json_parsing import (
+    ReusableJSONParseWorkspace,
     parse_owned_json_value,
     parsed_json_value,
     run_json_cpu,
@@ -90,5 +91,55 @@ def test_owned_json_close_is_cancellation_safe_while_lock_is_contended():
         assert controller.snapshot()["reserved_response_bytes"] == 0
         reset_request_admission_lease(token)
         await lease.release()
+
+    asyncio.run(scenario())
+
+
+def test_reusable_json_workspace_holds_high_water_and_releases_once():
+    async def scenario():
+        controller = RequestAdmissionController(
+            capacity=1,
+            waiter_limit=0,
+            wait_timeout_seconds=1,
+            max_body_bytes=1024,
+            body_budget_bytes=4 * 1024 * 1024,
+            max_response_bytes=4 * 1024 * 1024,
+        )
+        lease = await controller.acquire()
+        token = bind_request_admission_lease(lease)
+        workspace = await ReusableJSONParseWorkspace.create()
+        try:
+            first = await parse_owned_json_value(
+                b'{"value":"first"}',
+                workspace=workspace,
+                workspace_extra_bytes=4096,
+            )
+            first_capacity = workspace.capacity
+            assert first_capacity > 4096
+            assert controller.snapshot()["reserved_response_bytes"] == (
+                first_capacity
+            )
+            await first.aclose()
+            assert first._close_task is None
+            assert controller.snapshot()["reserved_response_bytes"] == (
+                first_capacity
+            )
+
+            second = await parse_owned_json_value(
+                b'{"value":1}',
+                workspace=workspace,
+                workspace_extra_bytes=1024,
+            )
+            await second.aclose()
+            assert second._close_task is None
+            assert workspace.capacity == first_capacity
+            assert controller.snapshot()["reserved_response_bytes"] == (
+                first_capacity
+            )
+        finally:
+            await workspace.aclose()
+            assert controller.snapshot()["reserved_response_bytes"] == 0
+            reset_request_admission_lease(token)
+            await lease.release()
 
     asyncio.run(scenario())

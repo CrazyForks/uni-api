@@ -27,6 +27,7 @@ from uni_api.streaming.cleanup import (
     force_close_response_httpcore_stream_chain_safely,
 )
 from uni_api.streaming.sse import IncrementalSSEParser, SSEIncompleteEventError
+from uni_api.streaming.usage import stream_usage_snapshot
 import uni_api.runtime as runtime
 from uni_api.observability import responses_stream as responses_stream_observability
 
@@ -154,6 +155,23 @@ def test_oaix_terminal_flush_marker_produces_hash_bound_exact_hop_observation():
     assert len(observations) == 1
     assert observations[0]["request_id"] == "request-hop-1"
     assert observations[0]["terminal_wire_sha256"] == wire_sha256
+
+
+def test_complete_event_preserves_transport_receive_timestamp():
+    tracker, _current_info = _tracker()
+    received_at = datetime(2026, 7, 24, 12, 34, 56, tzinfo=timezone.utc)
+    terminal = (
+        "event: response.completed\n"
+        'data: {"type":"response.completed",'
+        '"response":{"status":"completed"}}'
+    )
+
+    tracker.observe_complete_event(terminal, received_at=received_at)
+
+    assert tracker.facts["last_event_received_at"] == received_at.isoformat()
+    assert tracker.facts["declared_terminal_received_at"] == (
+        received_at.isoformat()
+    )
 
 
 def test_oaix_terminal_flush_marker_rejects_hash_mismatch_without_metric():
@@ -803,6 +821,231 @@ def test_downstream_terminal_is_recorded_only_after_asgi_send_returns():
     assert tracker.facts["downstream_terminal_asgi_write_completed"] is True
     assert tracker.facts["downstream_final_body_completed"] is True
     assert current_info["usage_seen"] is True
+
+
+class _MetadataBypassParser:
+    pending_bytes = 0
+
+    def feed(self, _chunk):
+        raise AssertionError("metadata-complete SSE must not be framed twice")
+
+    def finish(self):
+        return []
+
+    def discard(self):
+        return None
+
+
+def test_complete_stream_metadata_bypasses_downstream_sse_parser():
+    tracker, current_info = _tracker()
+    _observe_completed_terminal(tracker)
+    usage = {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+    snapshot = stream_usage_snapshot(usage)
+    assert snapshot is not None
+    sent = []
+
+    async def body():
+        yield ObservedStreamChunk(
+            _completed_event(),
+            event_type="response.completed",
+            semantic_outcome="completed",
+            sse_metadata_complete=True,
+            usage_snapshot=snapshot,
+        )
+
+    async def send(message):
+        sent.append(message)
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def run():
+        response = LoggingStreamingResponse(
+            body(),
+            media_type="text/event-stream",
+            current_info=current_info,
+        )
+        response._usage_sse_parser = _MetadataBypassParser()
+        await response(
+            {"type": "http", "method": "POST", "path": "/v1/responses"},
+            receive,
+            send,
+        )
+
+    asyncio.run(run())
+    wire = b"".join(
+        message.get("body", b"")
+        for message in sent
+        if message.get("type") == "http.response.body"
+    )
+    assert wire == _completed_event()
+    assert current_info["prompt_tokens"] == 1
+    assert current_info["completion_tokens"] == 2
+    assert current_info["total_tokens"] == 3
+    assert current_info["usage_seen"] is True
+    assert tracker.facts["downstream_usage_observer_status"] == "completed"
+    assert tracker.facts["downstream_terminal_asgi_write_completed"] is True
+
+
+def test_stream_metadata_respects_disabled_usage_observation():
+    tracker, current_info = _tracker()
+    _observe_completed_terminal(tracker)
+    snapshot = stream_usage_snapshot(
+        {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+    )
+    assert snapshot is not None
+    sent = []
+
+    async def body():
+        yield ObservedStreamChunk(
+            _completed_event(),
+            event_type="response.completed",
+            semantic_outcome="completed",
+            sse_metadata_complete=True,
+            usage_snapshot=snapshot,
+        )
+
+    async def send(message):
+        sent.append(message)
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def run():
+        response = LoggingStreamingResponse(
+            body(),
+            media_type="text/event-stream",
+            current_info=current_info,
+            observe_usage=False,
+        )
+        await response(
+            {"type": "http", "method": "POST", "path": "/v1/responses"},
+            receive,
+            send,
+        )
+
+    asyncio.run(run())
+    wire = b"".join(
+        message.get("body", b"")
+        for message in sent
+        if message.get("type") == "http.response.body"
+    )
+    assert wire == _completed_event()
+    assert "prompt_tokens" not in current_info
+    assert "completion_tokens" not in current_info
+    assert "total_tokens" not in current_info
+    assert tracker.facts["downstream_usage_observer_status"] == (
+        "not_applicable"
+    )
+    assert tracker.facts["downstream_usage_observer_reason"] == (
+        "disabled_by_policy"
+    )
+
+
+def test_segmented_stream_metadata_preserves_boundary_without_reparse():
+    tracker, current_info = _tracker()
+    _observe_completed_terminal(tracker)
+    event = _completed_event()
+    split_at = len(event) // 2
+    snapshot = stream_usage_snapshot(
+        {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+    )
+    assert snapshot is not None
+    sent = []
+
+    async def body():
+        yield ObservedStreamChunk(
+            event[:split_at],
+            event_type="response.completed",
+            semantic_outcome="completed",
+            final_event_segment=False,
+            sse_metadata_complete=True,
+        )
+        yield ObservedStreamChunk(
+            event[split_at:],
+            event_type="response.completed",
+            semantic_outcome="completed",
+            final_event_segment=True,
+            sse_metadata_complete=True,
+            usage_snapshot=snapshot,
+        )
+
+    async def send(message):
+        sent.append(message)
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def run():
+        response = LoggingStreamingResponse(
+            body(),
+            media_type="text/event-stream",
+            current_info=current_info,
+        )
+        response._usage_sse_parser = _MetadataBypassParser()
+        await response(
+            {"type": "http", "method": "POST", "path": "/v1/responses"},
+            receive,
+            send,
+        )
+
+    asyncio.run(run())
+    wire = b"".join(
+        message.get("body", b"")
+        for message in sent
+        if message.get("type") == "http.response.body"
+    )
+    assert wire == event
+    assert current_info["usage_seen"] is True
+    assert tracker.facts["downstream_terminal_asgi_write_completed"] is True
+
+
+def test_incomplete_segmented_metadata_preserves_usage_observer_failure():
+    _tracker_instance, current_info = _tracker()
+    event_prefix = _completed_event()[:37]
+    sent = []
+
+    async def body():
+        yield ObservedStreamChunk(
+            event_prefix,
+            event_type="response.completed",
+            semantic_outcome="completed",
+            final_event_segment=False,
+            sse_metadata_complete=True,
+        )
+
+    async def send(message):
+        sent.append(message)
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def run():
+        response = LoggingStreamingResponse(
+            body(),
+            media_type="text/event-stream",
+            current_info=current_info,
+        )
+        response._usage_sse_parser = _MetadataBypassParser()
+        await response(
+            {"type": "http", "method": "POST", "path": "/v1/responses"},
+            receive,
+            send,
+        )
+
+    asyncio.run(run())
+    wire = b"".join(
+        message.get("body", b"")
+        for message in sent
+        if message.get("type") == "http.response.body"
+    )
+    assert wire == event_prefix
+    assert current_info["usage_parse_error"] == "SSEIncompleteEventError"
+    diagnostics = current_info["responses_stream_diagnostics"]
+    assert diagnostics["downstream_usage_observer_status"] == "disabled"
+    assert diagnostics["downstream_usage_observer_error_type"] == (
+        "SSEIncompleteEventError"
+    )
 
 
 def test_failed_terminal_asgi_send_does_not_claim_downstream_terminal():

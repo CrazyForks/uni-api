@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 
 from uni_api.admission import RequestAdmissionController
@@ -7,6 +8,7 @@ from uni_api.middleware.admission import RequestAdmissionMiddleware
 from uni_api.middleware.idempotency import (
     IdempotencyMiddleware,
     InMemoryIdempotencyCoordinator,
+    _request_identities,
 )
 from uni_api.middleware.request_decompression import (
     RequestBodyDecompressionMiddleware,
@@ -98,6 +100,74 @@ def _coordinator(**overrides) -> InMemoryIdempotencyCoordinator:
     }
     settings.update(overrides)
     return InMemoryIdempotencyCoordinator(**settings)
+
+
+def test_incremental_request_identity_matches_legacy_wire_identity():
+    scope = _scope(authorization="Bearer client-a")
+    scope["method"] = "p\N{LATIN SMALL LETTER O WITH DIAERESIS}st"
+    scope["path"] = "/v1/r\N{LATIN SMALL LETTER E WITH ACUTE}sponses"
+    scope["query_string"] = b"cursor=a%00b"
+    scope["headers"].extend(
+        [
+            (b"x-api-key", b"secondary-key"),
+            (b"content-type", b"charset=utf-8"),
+            (b"content-encoding", b"zstd"),
+        ]
+    )
+    key = "logical-request-1"
+    body = (b'{}\x00{"input":"payload"}' * 4096)
+
+    record_key, request_hash, key_fingerprint = _request_identities(
+        scope,
+        key,
+        body,
+    )
+
+    headers: dict[str, list[str]] = {}
+    for name, value in scope["headers"]:
+        headers.setdefault(name.decode("latin-1").lower(), []).append(
+            value.decode("latin-1")
+        )
+    joined_headers = {
+        name: "\n".join(values) for name, values in headers.items()
+    }
+    method = str(scope["method"]).upper()
+    path = str(scope["path"])
+    query = bytes(scope["query_string"])
+    credential = "\n".join(
+        joined_headers.get(name, "")
+        for name in ("authorization", "x-api-key")
+    )
+    credential_hash = hashlib.sha256(credential.encode("utf-8")).hexdigest()
+    expected_record_key = hashlib.sha256(
+        b"\x00".join(
+            (
+                method.encode("ascii", errors="replace"),
+                path.encode("utf-8"),
+                query,
+                credential_hash.encode("ascii"),
+                key.encode("ascii"),
+            )
+        )
+    ).hexdigest()
+    expected_request_hash = hashlib.sha256(
+        b"\x00".join(
+            (
+                method.encode("ascii", errors="replace"),
+                path.encode("utf-8"),
+                query,
+                joined_headers["content-type"].encode("latin-1"),
+                joined_headers["content-encoding"].encode("latin-1"),
+                body,
+            )
+        )
+    ).hexdigest()
+
+    assert record_key == expected_record_key
+    assert request_hash == expected_request_hash
+    assert key_fingerprint == hashlib.sha256(key.encode("ascii")).hexdigest()[
+        :16
+    ]
 
 
 def test_explicit_key_executes_once_and_replays_completed_response():

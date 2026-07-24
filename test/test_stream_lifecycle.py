@@ -371,6 +371,56 @@ def test_logging_segments_large_body_and_preserves_explicit_content_length():
     asyncio.run(scenario())
 
 
+def test_downstream_writer_reuses_one_task_and_preserves_per_frame_backpressure():
+    async def scenario():
+        timeline = []
+        sent = []
+        writer_tasks = set()
+
+        async def body():
+            timeline.append("yield:a")
+            yield b"a"
+            timeline.append("yield:b")
+            yield b"b"
+            timeline.append("body:done")
+
+        async def send(message):
+            task = asyncio.current_task()
+            assert task is not None
+            writer_tasks.add(task)
+            sent.append(dict(message))
+            if (
+                message["type"] == "http.response.body"
+                and message.get("more_body")
+                and message.get("body")
+            ):
+                timeline.append(f"send:{message['body'].decode('ascii')}")
+
+        response = LoggingStreamingResponse(
+            body(),
+            media_type="text/event-stream",
+            current_info={"start_time": 0},
+            observe_usage=False,
+        )
+        await response(_scope(), _never_receive, send)
+
+        assert timeline == [
+            "yield:a",
+            "send:a",
+            "yield:b",
+            "send:b",
+            "body:done",
+        ]
+        assert len(writer_tasks) == 1
+        assert [
+            message.get("body", b"")
+            for message in sent
+            if message["type"] == "http.response.body"
+        ] == [b"a", b"b", b""]
+
+    asyncio.run(scenario())
+
+
 def test_logging_stream_drops_previous_chunk_before_waiting_for_next_item():
     async def scenario():
         waiting_for_next = asyncio.Event()

@@ -751,31 +751,35 @@ def _request_identities(
     method = str(scope.get("method") or "").upper()
     path = str(scope.get("path") or "")
     query = bytes(scope.get("query_string") or b"")
+    method_bytes = method.encode("ascii", errors="replace")
+    path_bytes = path.encode("utf-8")
+    idempotency_key_bytes = idempotency_key.encode("ascii")
     key_scope = b"\x00".join(
         (
-            method.encode("ascii", errors="replace"),
-            path.encode("utf-8"),
+            method_bytes,
+            path_bytes,
             query,
             credential_hash.encode("ascii"),
-            idempotency_key.encode("ascii"),
+            idempotency_key_bytes,
         )
     )
     record_key = hashlib.sha256(key_scope).hexdigest()
 
-    request_identity = b"\x00".join(
-        (
-            method.encode("ascii", errors="replace"),
-            path.encode("utf-8"),
-            query,
-            headers.get("content-type", "").encode("latin-1"),
-            headers.get("content-encoding", "").encode("latin-1"),
-            body,
-        )
-    )
-    request_hash = hashlib.sha256(request_identity).hexdigest()
-    key_fingerprint = hashlib.sha256(
-        idempotency_key.encode("ascii")
-    ).hexdigest()[:16]
+    # Hash the same NUL-delimited identity incrementally.  Joining here copied
+    # the entire request body a second time on every idempotent request.
+    request_digest = hashlib.sha256()
+    request_digest.update(method_bytes)
+    for identity_part in (
+        path_bytes,
+        query,
+        headers.get("content-type", "").encode("latin-1"),
+        headers.get("content-encoding", "").encode("latin-1"),
+        body,
+    ):
+        request_digest.update(b"\x00")
+        request_digest.update(identity_part)
+    request_hash = request_digest.hexdigest()
+    key_fingerprint = hashlib.sha256(idempotency_key_bytes).hexdigest()[:16]
     return record_key, request_hash, key_fingerprint
 
 

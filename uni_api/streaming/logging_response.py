@@ -211,6 +211,107 @@ async def await_with_hard_deadline(
     )
 
 
+class _HardDeadlineASGIWriter:
+    """Serialize ASGI writes through one detachable task per response.
+
+    A separate task is still required for the hard-deadline contract: an ASGI
+    adapter may suppress cancellation while blocked in a socket write.  Reuse
+    that task for the whole response instead of allocating a task and an
+    ``asyncio.wait`` waiter for every SSE frame.
+    """
+
+    def __init__(
+        self,
+        send: Send,
+        *,
+        timeout: float,
+        label: str,
+    ) -> None:
+        self._send = send
+        self._timeout = timeout
+        self._label = label
+        self._queue: asyncio.Queue[
+            tuple[dict[str, Any], asyncio.Future[None]] | None
+        ] = asyncio.Queue(maxsize=1)
+        self._task = asyncio.create_task(
+            self._run(),
+            name="uni-api-downstream-asgi-writer",
+        )
+        self._closed = False
+        self._aborted = False
+
+    async def _run(self) -> None:
+        while True:
+            item = await self._queue.get()
+            if item is None:
+                return
+            message, completion = item
+            try:
+                await self._send(message)
+            except asyncio.CancelledError:
+                if not completion.done():
+                    completion.cancel()
+                return
+            except BaseException as exc:
+                if not completion.done():
+                    completion.set_exception(exc)
+                return
+            if completion.done():
+                # The caller timed out or was cancelled while the underlying
+                # adapter ignored cancellation.  Do not leave a detached
+                # writer waiting forever for another queue item.
+                return
+            completion.set_result(None)
+
+    @staticmethod
+    def _expire(completion: asyncio.Future[None], message: str) -> None:
+        if not completion.done():
+            completion.set_exception(asyncio.TimeoutError(message))
+
+    async def write(self, message: dict[str, Any]) -> None:
+        if self._closed:
+            raise RuntimeError("downstream ASGI writer is closed")
+        if self._task.done():
+            self._task.result()
+            raise RuntimeError("downstream ASGI writer stopped unexpectedly")
+
+        loop = asyncio.get_running_loop()
+        completion: asyncio.Future[None] = loop.create_future()
+        deadline = loop.call_later(
+            self._timeout,
+            self._expire,
+            completion,
+            f"{self._label} exceeded {self._timeout:g} seconds",
+        )
+        self._queue.put_nowait((message, completion))
+        try:
+            await completion
+        except BaseException:
+            self._aborted = True
+            await _cancel_or_bound_detach(self._task, label=self._label)
+            raise
+        finally:
+            deadline.cancel()
+
+    async def close(self) -> asyncio.CancelledError | None:
+        if self._closed:
+            return None
+        self._closed = True
+        if self._aborted:
+            return None
+        if not self._task.done():
+            self._queue.put_nowait(None)
+
+        pending_cancel: asyncio.CancelledError | None = None
+        while not self._task.done():
+            try:
+                await asyncio.shield(self._task)
+            except asyncio.CancelledError as exc:
+                pending_cancel = pending_cancel or exc
+        self._task.result()
+        return pending_cancel
+
+
 class LoggingStreamingResponse(Response):
     """A streaming response whose observability lifetime matches the ASGI body.
 
@@ -311,6 +412,7 @@ class LoggingStreamingResponse(Response):
         self._finalized = False
         self._finalize_lock = asyncio.Lock()
         self._stream_task: Optional[asyncio.Task] = None
+        self._downstream_writer: _HardDeadlineASGIWriter | None = None
         diagnostics = self.current_info.get("responses_stream_diagnostics")
         if isinstance(diagnostics, dict):
             diagnostics["downstream_usage_observer_status"] = (
@@ -833,11 +935,14 @@ class LoggingStreamingResponse(Response):
 
     async def _send_with_deadline(self, send: Send, message: dict[str, Any]) -> None:
         try:
-            await _await_with_hard_deadline(
-                send(message),
-                timeout=self._downstream_write_timeout_seconds,
-                label="downstream ASGI write",
-            )
+            if self._downstream_writer is None:
+                await _await_with_hard_deadline(
+                    send(message),
+                    timeout=self._downstream_write_timeout_seconds,
+                    label="downstream ASGI write",
+                )
+            else:
+                await self._downstream_writer.write(message)
         except asyncio.TimeoutError as exc:
             raise DownstreamWriteTimeout(
                 "downstream write exceeded "
@@ -987,6 +1092,11 @@ class LoggingStreamingResponse(Response):
         should_send_final_body = True
         pending_cancel: asyncio.CancelledError | None = None
         disconnect_listener: Optional[asyncio.Task] = None
+        self._downstream_writer = _HardDeadlineASGIWriter(
+            send,
+            timeout=self._downstream_write_timeout_seconds,
+            label="downstream ASGI write",
+        )
         try:
             diagnostics = self.current_info.get("responses_stream_diagnostics")
             if isinstance(diagnostics, dict):
@@ -1243,6 +1353,12 @@ class LoggingStreamingResponse(Response):
                             or "prior_stream_failure"
                         )
                     )
+
+            downstream_writer = self._downstream_writer
+            self._downstream_writer = None
+            if downstream_writer is not None:
+                writer_cancel = await downstream_writer.close()
+                pending_cancel = pending_cancel or writer_cancel
 
             finalize_cancel = await self._finalize_once()
             pending_cancel = pending_cancel or finalize_cancel
